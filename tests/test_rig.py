@@ -1,8 +1,8 @@
 """Tests for stigmergy.rig (SPEC.md §3 `provision` station, §3 rig object,
-§6 bead work-order contract).
+§6 ticket work-order contract).
 
-Design decision under test: the rig's bead + loop-state store is a
-loop-owned, self-contained SQLite database (`beads.db`, stdlib `sqlite3`)
+Design decision under test: the rig's ticket + loop-state store is a
+loop-owned, self-contained SQLite database (`tickets.db`, stdlib `sqlite3`)
 — never the `bd` issue tracker. `create_rig` scaffolds the full rig
 directory tree, validates the charter BEFORE creating anything, and is
 all-or-nothing: any failure (invalid charter, failed git clone) leaves no
@@ -80,7 +80,7 @@ def test_create_rig_produces_full_directory_structure(tmp_path: Path) -> None:
     assert rig_root == base_dir / "shipyard"
     assert (rig_root / "charter.toml").is_file()
     assert (rig_root / "models.toml").is_file()
-    assert (rig_root / "beads.db").is_file()
+    assert (rig_root / "tickets.db").is_file()
     assert (rig_root / "repo").is_dir()
     assert (rig_root / "repo" / ".git").is_dir()
     assert (rig_root / "context").is_dir()
@@ -142,7 +142,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
     source_charter = load_charter(charter_path, env={})
     rig_root = create_rig(charter_path, base_dir=base_dir)
 
-    store = RigStore(rig_root / "beads.db")
+    store = RigStore(rig_root / "tickets.db")
     try:
         assert store.get_meta("schema_version") == "1"
         assert store.get_meta("stigmergy_version") == __version__
@@ -210,14 +210,14 @@ def test_repo_clone_failure_cleans_up_partial_rig(tmp_path: Path) -> None:
     assert not (base_dir / "shipyard").exists()
 
 
-# --- case 6: RigStore add_bead / get_bead round-trip ------------------------
+# --- case 6: RigStore add_ticket / get_ticket round-trip ------------------------
 
 
-def test_rigstore_add_and_get_bead_round_trips(tmp_path: Path) -> None:
-    store = RigStore.create(tmp_path / "beads.db")
+def test_rigstore_add_and_get_ticket_round_trips(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
     try:
-        store.add_bead(
-            id="bead-1",
+        store.add_ticket(
+            id="ticket-1",
             title="Do the thing",
             goal="Ship the feature end to end.",
             required_reading=["context/architecture.md", "repo/src/foo.py"],
@@ -229,75 +229,78 @@ def test_rigstore_add_and_get_bead_round_trips(tmp_path: Path) -> None:
             lane_hint="default",
         )
 
-        bead = store.get_bead("bead-1")
-        assert bead is not None
-        assert bead["id"] == "bead-1"
-        assert bead["title"] == "Do the thing"
-        assert bead["goal"] == "Ship the feature end to end."
-        assert bead["required_reading"] == ["context/architecture.md", "repo/src/foo.py"]
-        assert bead["target_scope"] == ["src/foo.py", "tests/test_foo.py"]
-        assert bead["work_product"] == "A passing implementation of foo()."
-        assert bead["acceptance_criteria"] == [
+        ticket = store.get_ticket("ticket-1")
+        assert ticket is not None
+        assert ticket["id"] == "ticket-1"
+        assert ticket["title"] == "Do the thing"
+        assert ticket["goal"] == "Ship the feature end to end."
+        assert ticket["required_reading"] == ["context/architecture.md", "repo/src/foo.py"]
+        assert ticket["target_scope"] == ["src/foo.py", "tests/test_foo.py"]
+        assert ticket["work_product"] == "A passing implementation of foo()."
+        assert ticket["acceptance_criteria"] == [
             "foo() returns 42",
             "foo() raises on negative input",
         ]
-        assert bead["tier1_checks"] == {"named": ["pytest", "lint"], "paths": ["tests/test_foo.py"]}
-        assert bead["difficulty"] == "medium"
-        assert bead["lane_hint"] == "default"
+        assert ticket["tier1_checks"] == {
+            "named": ["pytest", "lint"],
+            "paths": ["tests/test_foo.py"],
+        }
+        assert ticket["difficulty"] == "medium"
+        assert ticket["lane_hint"] == "default"
 
         # defaults
-        assert bead["approved"] == 0
-        assert bead["state"] == "pool"
-        assert bead["attempts_used"] == 0
-        assert bead["integration_failures"] == 0
-        assert bead["rubric_only"] == 0
+        assert ticket["approved"] == 0
+        assert ticket["state"] == "pool"
+        assert ticket["attempts_used"] == 0
+        assert ticket["integration_failures"] == 0
+        assert ticket["rubric_only"] == 0
     finally:
         store.close()
 
 
-def test_rigstore_get_bead_missing_returns_none(tmp_path: Path) -> None:
-    store = RigStore.create(tmp_path / "beads.db")
+def test_rigstore_get_ticket_missing_returns_none(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
     try:
-        assert store.get_bead("nonexistent") is None
+        assert store.get_ticket("nonexistent") is None
     finally:
         store.close()
 
 
-# --- case 7: add_dep / deps_of + list_beads(state=) filter ------------------
+# --- case 7: add_dep / deps_of + list_tickets(state=) filter ------------------
 
 
 def test_rigstore_add_dep_and_deps_of_round_trip(tmp_path: Path) -> None:
-    store = RigStore.create(tmp_path / "beads.db")
+    store = RigStore.create(tmp_path / "tickets.db")
     try:
-        store.add_bead(id="bead-a", title="A")
-        store.add_bead(id="bead-b", title="B")
-        store.add_bead(id="bead-c", title="C")
+        store.add_ticket(id="ticket-a", title="A")
+        store.add_ticket(id="ticket-b", title="B")
+        store.add_ticket(id="ticket-c", title="C")
 
-        store.add_dep("bead-c", "bead-a")
-        store.add_dep("bead-c", "bead-b")
+        store.add_dep("ticket-c", "ticket-a")
+        store.add_dep("ticket-c", "ticket-b")
 
-        deps = store.deps_of("bead-c")
-        assert sorted(deps) == ["bead-a", "bead-b"]
-        assert store.deps_of("bead-a") == []
+        deps = store.deps_of("ticket-c")
+        assert sorted(deps) == ["ticket-a", "ticket-b"]
+        assert store.deps_of("ticket-a") == []
     finally:
         store.close()
 
 
-def test_rigstore_list_beads_filters_by_state(tmp_path: Path) -> None:
-    store = RigStore.create(tmp_path / "beads.db")
+def test_rigstore_list_tickets_filters_by_state(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
     try:
-        store.add_bead(id="bead-pool", title="pool one")
-        store.add_bead(id="bead-claimed", title="claimed one", state="claimed")
-        store.add_bead(id="bead-landed", title="landed one", state="landed")
+        store.add_ticket(id="ticket-pool", title="pool one")
+        store.add_ticket(id="ticket-claimed", title="claimed one", state="claimed")
+        store.add_ticket(id="ticket-landed", title="landed one", state="landed")
 
-        pool_beads = store.list_beads(state="pool")
-        assert [b["id"] for b in pool_beads] == ["bead-pool"]
+        pool_tickets = store.list_tickets(state="pool")
+        assert [b["id"] for b in pool_tickets] == ["ticket-pool"]
 
-        claimed_beads = store.list_beads(state="claimed")
-        assert [b["id"] for b in claimed_beads] == ["bead-claimed"]
+        claimed_tickets = store.list_tickets(state="claimed")
+        assert [b["id"] for b in claimed_tickets] == ["ticket-claimed"]
 
-        all_beads = store.list_beads()
-        assert {b["id"] for b in all_beads} == {"bead-pool", "bead-claimed", "bead-landed"}
+        all_tickets = store.list_tickets()
+        assert {b["id"] for b in all_tickets} == {"ticket-pool", "ticket-claimed", "ticket-landed"}
     finally:
         store.close()
 
@@ -313,7 +316,7 @@ def test_cli_rig_new_valid_charter_returns_zero(tmp_path: Path) -> None:
     exit_code = main(["rig", "new", "--charter", str(charter_path), "--path", str(base_dir)])
 
     assert exit_code == 0
-    assert (base_dir / "shipyard" / "beads.db").is_file()
+    assert (base_dir / "shipyard" / "tickets.db").is_file()
 
 
 def test_cli_rig_new_bad_charter_path_returns_nonzero(tmp_path: Path) -> None:
@@ -339,8 +342,8 @@ def test_main_bare_invocation_returns_zero() -> None:
 # --- case 9: DB isolation — plain stdlib sqlite3, no bd/dolt ----------------
 
 
-def test_beads_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
-    """Open beads.db fresh in a second stdlib sqlite3 connection (independent
+def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
+    """Open tickets.db fresh in a second stdlib sqlite3 connection (independent
     of RigStore) and read a rig_meta value straight out of the file — the
     rig's data plane is a portable SQLite file, not an external DB service."""
     repo = make_local_repo(tmp_path)
@@ -348,7 +351,7 @@ def test_beads_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
     base_dir = tmp_path / "rigs"
 
     rig_root = create_rig(charter_path, base_dir=base_dir)
-    db_path = rig_root / "beads.db"
+    db_path = rig_root / "tickets.db"
     assert db_path.is_file()
 
     conn = sqlite3.connect(db_path)
@@ -359,6 +362,6 @@ def test_beads_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        assert {"beads", "bead_deps", "rig_meta"} <= tables
+        assert {"tickets", "ticket_deps", "rig_meta"} <= tables
     finally:
         conn.close()

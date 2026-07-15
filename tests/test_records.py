@@ -48,7 +48,7 @@ def common_fields(**overrides: Any) -> dict[str, Any]:
     """A complete, valid set of SPEC §8 common fields; override as needed."""
     base: dict[str, Any] = {
         "rig": "shipyard",
-        "bead": "workspace-e2uh.8",
+        "ticket": "workspace-e2uh.8",
         "dispatch_id": "dispatch-0001",
         "attempt": 1,
         "attempt_kind": "initial",

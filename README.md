@@ -20,9 +20,9 @@ to create a rig if that path already exists, and cleans up any
 partially-created rig directory on failure (invalid charter, failed repo
 clone, etc.) — rig creation is all-or-nothing.
 
-**Bead store: self-contained SQLite, not `bd`/dolt (resolves spec-gap
-#8).** Each rig owns a single `beads.db` SQLite file (stdlib `sqlite3`) as
-its bead + loop-state store — deliberately *not* the `bd` issue tracker.
+**Ticket store: self-contained SQLite, not `bd`/dolt (resolves spec-gap
+#8).** Each rig owns a single `tickets.db` SQLite file (stdlib `sqlite3`) as
+its ticket + loop-state store — deliberately *not* the `bd` issue tracker.
 This buys isolation by structure (the whole rig, including its data
 plane, is one portable directory you can copy, back up, or ship
 elsewhere), schema freedom for loop-only metadata (leases, attempts,
@@ -31,7 +31,7 @@ zero external service dependency. Spec-gap #8 asked which `bd`
 binary/version a rig should pin — that question is now moot: there is no
 `bd` dependency to pin. The store's own schema is versioned instead, via
 a `schema_version` key in the `rig_meta` table (starts at `"1"`); future
-beads that extend the schema bump that value rather than requiring a
+tickets that extend the schema bump that value rather than requiring a
 migration story shared with an external tool.
 
 License: AGPL-3.0-or-later (see LICENSE).

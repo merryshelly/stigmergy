@@ -96,7 +96,7 @@ ATTEMPT_KINDS: frozenset[str] = frozenset(
 # `event_type` and `ts` which get their own dedicated handling below.
 _REQUIRED_COMMON_FIELDS: tuple[str, ...] = (
     "rig",
-    "bead",
+    "ticket",
     "dispatch_id",
     "attempt",
     "attempt_kind",
@@ -435,7 +435,7 @@ def _build_cv_row(dispatch_id: str, events: list[dict[str, Any]]) -> dict[str, A
 
     `final_outcome` is deliberately *not* a SPEC §8 common field — the
     state-machine/verdict schema (SPEC §9) that would define a canonical
-    "outcome" enum is a later bead. Rather than invent one here and risk
+    "outcome" enum is a later ticket. Rather than invent one here and risk
     colliding with it, this takes the `event_type` of the last event seen
     for the dispatch (in on-disk order) as a provisional summary signal —
     a CV-projection convenience, not part of the sealed event contract.
@@ -463,7 +463,7 @@ def _build_cv_row(dispatch_id: str, events: list[dict[str, Any]]) -> dict[str, A
     last = events[-1]
     return {
         "dispatch_id": dispatch_id,
-        "bead": first.get("bead"),
+        "ticket": first.get("ticket"),
         "rung": first.get("rung"),
         "model": first.get("model"),
         "event_count": len(events),

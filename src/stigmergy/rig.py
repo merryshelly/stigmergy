@@ -1,12 +1,12 @@
-"""Rig scaffold + bead store (SPEC.md §3 `provision` station, §6 bead contract).
+"""Rig scaffold + ticket store (SPEC.md §3 `provision` station, §6 ticket contract).
 
 A **rig** is the unit of tenancy and portability (SPEC.md §3 Objects): a
 self-contained directory owning its own charter, model registry, repo
 clone, curated context, event records, worker images, and per-dispatch
 clones. This module implements `provision` — the deterministic mechanism
-that creates that directory structure and its bead/loop-state store.
+that creates that directory structure and its ticket/loop-state store.
 
-**Design decision (bead .7):** the bead + loop-state store is a
+**Design decision (ticket .7):** the ticket + loop-state store is a
 loop-owned SQLite database (stdlib `sqlite3`), not the `bd` issue tracker.
 This buys isolation-by-structure (one self-contained file travels with the
 rig), schema freedom for loop-only metadata (leases, attempts, rungs), and
@@ -34,10 +34,10 @@ from typing import Any
 from stigmergy import __version__
 from stigmergy.charter import Charter, CharterError, load_charter
 
-# --- schema (SPEC.md §3 rig definition, §6 bead work-order contract) -------
+# --- schema (SPEC.md §3 rig definition, §6 ticket work-order contract) -------
 
 _SCHEMA_SQL = """
-CREATE TABLE beads (
+CREATE TABLE tickets (
   id                   TEXT PRIMARY KEY,
   title                TEXT NOT NULL,
   goal                 TEXT,
@@ -62,10 +62,10 @@ CREATE TABLE beads (
   created_at           REAL NOT NULL,
   updated_at           REAL NOT NULL
 );
-CREATE TABLE bead_deps (
-  bead_id        TEXT NOT NULL,
-  blocks_bead_id TEXT NOT NULL,
-  PRIMARY KEY (bead_id, blocks_bead_id)
+CREATE TABLE ticket_deps (
+  ticket_id        TEXT NOT NULL,
+  blocks_ticket_id TEXT NOT NULL,
+  PRIMARY KEY (ticket_id, blocks_ticket_id)
 );
 CREATE TABLE rig_meta (
   key   TEXT PRIMARY KEY,
@@ -73,10 +73,10 @@ CREATE TABLE rig_meta (
 );
 """
 
-# Columns settable through add_bead() beyond the required id/title (which
+# Columns settable through add_ticket() beyond the required id/title (which
 # have their own keyword-only parameters). created_at/updated_at are
 # stamped internally and are not caller-settable.
-_BEAD_OPTIONAL_FIELDS = {
+_TICKET_OPTIONAL_FIELDS = {
     "goal",
     "required_reading",
     "target_scope",
@@ -100,7 +100,7 @@ _BEAD_OPTIONAL_FIELDS = {
 
 # Columns whose Python value is a list/dict, transparently JSON-encoded on
 # write and decoded on read (SPEC.md §6.2/§6.3/§6.5/§6.6).
-_JSON_BEAD_FIELDS = {
+_JSON_TICKET_FIELDS = {
     "required_reading",
     "target_scope",
     "acceptance_criteria",
@@ -113,12 +113,12 @@ class RigError(Exception):
 
 
 class RigStore:
-    """SQLite-backed bead + loop-state store for one rig (v0 schema).
+    """SQLite-backed ticket + loop-state store for one rig (v0 schema).
 
     Not `bd`, not dolt — a plain, self-contained ``sqlite3`` file so the
-    rig stays a single portable directory. Downstream beads (.15/.16)
+    rig stays a single portable directory. Downstream tickets (.15/.16)
     extend this schema for leases, gating, and event-plane integration;
-    this is the minimal v0 surface: bead CRUD, dependency edges, and a
+    this is the minimal v0 surface: ticket CRUD, dependency edges, and a
     key/value ``rig_meta`` table.
     """
 
@@ -126,9 +126,9 @@ class RigStore:
         self.db_path = Path(db_path)
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        # `bead_deps` declares no explicit FOREIGN KEY constraint in the v0
+        # `ticket_deps` declares no explicit FOREIGN KEY constraint in the v0
         # schema, so this pragma enforces nothing yet — it's set now so
-        # later beads that add real FK constraints get enforcement for
+        # later tickets that add real FK constraints get enforcement for
         # free without an extra migration step.
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
@@ -141,8 +141,8 @@ class RigStore:
         store._conn.commit()
         return store
 
-    def add_bead(self, *, id: str, title: str, **fields: Any) -> None:
-        """Insert a work-order bead (SPEC.md §6).
+    def add_ticket(self, *, id: str, title: str, **fields: Any) -> None:
+        """Insert a work-order ticket (SPEC.md §6).
 
         ``id``/``title`` are required. Remaining columns are optional
         keyword arguments; list/dict-valued fields (``required_reading``,
@@ -150,15 +150,15 @@ class RigStore:
         JSON-encoded transparently — callers pass Python values, not raw
         JSON strings. ``created_at``/``updated_at`` are stamped here.
         """
-        unknown = set(fields) - _BEAD_OPTIONAL_FIELDS
+        unknown = set(fields) - _TICKET_OPTIONAL_FIELDS
         if unknown:
-            raise ValueError(f"unknown bead field(s): {sorted(unknown)}")
+            raise ValueError(f"unknown ticket field(s): {sorted(unknown)}")
 
         now = time.time()
         columns = ["id", "title", "created_at", "updated_at"]
         values: list[Any] = [id, title, now, now]
         for key, value in fields.items():
-            if key in _JSON_BEAD_FIELDS and value is not None:
+            if key in _JSON_TICKET_FIELDS and value is not None:
                 value = json.dumps(value)
             columns.append(key)
             values.append(value)
@@ -166,42 +166,42 @@ class RigStore:
         col_sql = ", ".join(columns)
         placeholders = ", ".join("?" for _ in columns)
         self._conn.execute(
-            f"INSERT INTO beads ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+            f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
             values,
         )
         self._conn.commit()
 
-    def get_bead(self, bead_id: str) -> dict[str, Any] | None:
-        """Fetch one bead by id, or ``None`` if absent. JSON fields decode to lists/dicts."""
-        row = self._conn.execute("SELECT * FROM beads WHERE id = ?", (bead_id,)).fetchone()
+    def get_ticket(self, ticket_id: str) -> dict[str, Any] | None:
+        """Fetch one ticket by id, or ``None`` if absent. JSON fields decode to lists/dicts."""
+        row = self._conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if row is None:
             return None
-        return self._row_to_bead(row)
+        return self._row_to_ticket(row)
 
-    def list_beads(self, *, state: str | None = None) -> list[dict[str, Any]]:
-        """List beads, optionally filtered by ``state``, ordered by creation time."""
+    def list_tickets(self, *, state: str | None = None) -> list[dict[str, Any]]:
+        """List tickets, optionally filtered by ``state``, ordered by creation time."""
         if state is None:
-            rows = self._conn.execute("SELECT * FROM beads ORDER BY created_at").fetchall()
+            rows = self._conn.execute("SELECT * FROM tickets ORDER BY created_at").fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM beads WHERE state = ? ORDER BY created_at", (state,)
+                "SELECT * FROM tickets WHERE state = ? ORDER BY created_at", (state,)
             ).fetchall()
-        return [self._row_to_bead(row) for row in rows]
+        return [self._row_to_ticket(row) for row in rows]
 
-    def add_dep(self, bead_id: str, blocks_bead_id: str) -> None:
-        """Record that ``bead_id`` is blocked-by (must land after) ``blocks_bead_id``."""
+    def add_dep(self, ticket_id: str, blocks_ticket_id: str) -> None:
+        """Record that ``ticket_id`` is blocked-by (must land after) ``blocks_ticket_id``."""
         self._conn.execute(
-            "INSERT INTO bead_deps (bead_id, blocks_bead_id) VALUES (?, ?)",
-            (bead_id, blocks_bead_id),
+            "INSERT INTO ticket_deps (ticket_id, blocks_ticket_id) VALUES (?, ?)",
+            (ticket_id, blocks_ticket_id),
         )
         self._conn.commit()
 
-    def deps_of(self, bead_id: str) -> list[str]:
-        """Return the predecessor bead ids that block ``bead_id``."""
+    def deps_of(self, ticket_id: str) -> list[str]:
+        """Return the predecessor ticket ids that block ``ticket_id``."""
         rows = self._conn.execute(
-            "SELECT blocks_bead_id FROM bead_deps WHERE bead_id = ?", (bead_id,)
+            "SELECT blocks_ticket_id FROM ticket_deps WHERE ticket_id = ?", (ticket_id,)
         ).fetchall()
-        return [row["blocks_bead_id"] for row in rows]
+        return [row["blocks_ticket_id"] for row in rows]
 
     def set_meta(self, key: str, value: str) -> None:
         """Set (or overwrite) a `rig_meta` key/value pair."""
@@ -229,12 +229,12 @@ class RigStore:
         finally:
             self._conn.close()
 
-    def _row_to_bead(self, row: sqlite3.Row) -> dict[str, Any]:
-        bead = dict(row)
-        for key in _JSON_BEAD_FIELDS:
-            if bead.get(key) is not None:
-                bead[key] = json.loads(bead[key])
-        return bead
+    def _row_to_ticket(self, row: sqlite3.Row) -> dict[str, Any]:
+        ticket = dict(row)
+        for key in _JSON_TICKET_FIELDS:
+            if ticket.get(key) is not None:
+                ticket[key] = json.loads(ticket[key])
+        return ticket
 
 
 # --- provision: rig scaffold -----------------------------------------------
@@ -314,11 +314,11 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
     images_dir.mkdir(parents=True)
     (images_dir / "Containerfile").write_text(
         "# stub Containerfile for the rig worker image.\n"
-        "# Populated by a later bead: pinned base-image digest, no-secret build\n"
+        "# Populated by a later ticket: pinned base-image digest, no-secret build\n"
         "# through the `registries` egress group (SPEC.md §3 provision, §4).\n"
     )
 
-    store = RigStore.create(rig_root / "beads.db")
+    store = RigStore.create(rig_root / "tickets.db")
     try:
         store.set_meta("schema_version", "1")
         store.set_meta("stigmergy_version", __version__)

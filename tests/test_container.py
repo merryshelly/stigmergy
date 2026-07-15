@@ -1,6 +1,6 @@
 """Adversarial tests for the hardened worker container profile (SPEC.md §4).
 
-These tests are the security specification for bead .10. They are authored by
+These tests are the security specification for ticket .10. They are authored by
 the orchestrator, not the implementor: a hardened profile that a worker could
 trivially escape is worse than none, so the *assertions* here — which flags are
 mandatory, which are forbidden, and what the container can actually reach — are
@@ -134,7 +134,7 @@ def test_argv_timeout_present(tmp_path):
 
 
 def test_argv_network_none_by_default(tmp_path):
-    # .10 baseline is no network; the egress bead (.11) overrides with the
+    # .10 baseline is no network; the egress ticket (.11) overrides with the
     # internal netns routed through the proxy. Default must never be open.
     assert "--network=none" in _argv(tmp_path)
 

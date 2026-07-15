@@ -70,7 +70,7 @@ DEFAULT_CHARTER: dict[str, Any] = {
         "budgets": {"dispatches": 50, "usd": 25.0, "gate_calls": 30},
         "dispatch_limits": {"output_tokens": 200000, "driver_turns": 100},
         "retries": {"attempts_per_rung": 3, "integration_failures": 2, "flake_reruns": 2},
-        "cadences": {"staging_quiescent_beads": 3, "staging_max_wait_seconds": 7200},
+        "cadences": {"staging_quiescent_tickets": 3, "staging_max_wait_seconds": 7200},
         "timers": {
             "poll_seconds": 15,
             "dispatch_timeout_seconds": 3600,
@@ -113,7 +113,7 @@ _KNOWN_CONCURRENCY_KEYS = {"workers"}
 _KNOWN_BUDGETS_KEYS = {"dispatches", "usd", "gate_calls"}
 _KNOWN_DISPATCH_LIMITS_KEYS = {"output_tokens", "driver_turns"}
 _KNOWN_RETRIES_KEYS = {"attempts_per_rung", "integration_failures", "flake_reruns"}
-_KNOWN_CADENCES_KEYS = {"staging_quiescent_beads", "staging_max_wait_seconds"}
+_KNOWN_CADENCES_KEYS = {"staging_quiescent_tickets", "staging_max_wait_seconds"}
 # loop.timers is intentionally open-ended: any key is legal as long as it is
 # `_seconds`-suffixed (rule 6) — there is no fixed key set for this section.
 _KNOWN_PROMPTS_KEYS = {"dir"}

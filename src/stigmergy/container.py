@@ -54,7 +54,7 @@ class ContainerProfile:
     ``work_clone`` and ``task_pack`` are stored exactly as given (``Path``
     or ``str``); :func:`build_run_argv` resolves them to absolute paths at
     argv-construction time. ``network`` defaults to ``"none"`` — the .10
-    baseline is no network at all; the egress bead (.11) is the only thing
+    baseline is no network at all; the egress ticket (.11) is the only thing
     that overrides it, with the internal netns routed through the proxy.
     """
 

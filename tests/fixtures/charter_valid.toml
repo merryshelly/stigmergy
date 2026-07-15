@@ -34,7 +34,7 @@ attempts_per_rung = 3
 integration_failures = 2
 flake_reruns = 2
 [loop.cadences]
-staging_quiescent_beads = 3
+staging_quiescent_tickets = 3
 staging_max_wait_seconds = 7200
 [loop.timers]
 poll_seconds = 15
