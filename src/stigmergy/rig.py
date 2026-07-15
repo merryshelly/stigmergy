@@ -188,6 +188,46 @@ class RigStore:
             ).fetchall()
         return [self._row_to_ticket(row) for row in rows]
 
+    def update_ticket(self, ticket_id: str, **fields: Any) -> None:
+        """Update one or more columns on an existing ticket (SPEC.md §9
+        state machine + leases; ticket .15).
+
+        ``fields`` uses the same column allowlist and JSON-encoding rules
+        as :meth:`add_ticket` (list/dict-valued fields are transparently
+        JSON-encoded). ``updated_at`` is always bumped to ``time.time()``,
+        even if the caller didn't ask for any other change. Raises
+        :class:`ValueError` if ``fields`` is empty, names an unknown
+        column, or ``ticket_id`` doesn't exist — a typo'd id or a no-op
+        call never silently does nothing.
+        """
+        if not fields:
+            raise ValueError("update_ticket requires at least one field to update")
+        unknown = set(fields) - _TICKET_OPTIONAL_FIELDS
+        if unknown:
+            raise ValueError(f"unknown ticket field(s): {sorted(unknown)}")
+
+        now = time.time()
+        columns = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if key in _JSON_TICKET_FIELDS and value is not None:
+                value = json.dumps(value)
+            columns.append(key)
+            values.append(value)
+        columns.append("updated_at")
+        values.append(now)
+
+        set_sql = ", ".join(f"{col} = ?" for col in columns)
+        values.append(ticket_id)
+        cursor = self._conn.execute(
+            f"UPDATE tickets SET {set_sql} WHERE id = ?",  # noqa: S608
+            values,
+        )
+        if cursor.rowcount == 0:
+            self._conn.rollback()
+            raise ValueError(f"no such ticket: {ticket_id!r}")
+        self._conn.commit()
+
     def add_dep(self, ticket_id: str, blocks_ticket_id: str) -> None:
         """Record that ``ticket_id`` is blocked-by (must land after) ``blocks_ticket_id``."""
         self._conn.execute(
