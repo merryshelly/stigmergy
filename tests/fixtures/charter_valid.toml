@@ -1,0 +1,83 @@
+# Minimal valid charter fixture for tests/test_charter.py.
+# Three-rung step-up ladder (cheap -> default -> exquisite) with an opus
+# critic — the exquisite rung is also opus, so this fixture is expected to
+# trigger the D11 same-model/same-family WARNING (never an error).
+
+[rig]
+name = "shipyard"
+repo = "path-or-url"
+image = "stigmergy-worker:py312"
+
+[tiers]
+dispatch_base = "staging"
+
+[checks.pytest]
+cmd = "pytest -x -q"
+[checks.lint]
+cmd = "ruff check ."
+
+[gates]
+attempt = ["lint", "pytest"]
+staging = ["lint", "pytest"]
+
+[loop.concurrency]
+workers = 1
+[loop.budgets]
+dispatches = 50
+usd = 25.0
+gate_calls = 30
+[loop.dispatch_limits]
+output_tokens = 200000
+driver_turns = 100
+[loop.retries]
+attempts_per_rung = 3
+integration_failures = 2
+flake_reruns = 2
+[loop.cadences]
+staging_quiescent_beads = 3
+staging_max_wait_seconds = 7200
+[loop.timers]
+poll_seconds = 15
+dispatch_timeout_seconds = 3600
+lease_ttl_seconds = 4500
+
+[prompts]
+dir = "prompts/"
+
+[lanes.cheap]
+selector = { label = "local-ok" }
+driver = "claude-code"
+model = "haiku"
+prompt = "code01"
+egress = ["inference", "registries"]
+
+[lanes.default]
+driver = "claude-code"
+model = "sonnet"
+prompt = "code01"
+egress = ["inference", "registries"]
+
+[lanes.exquisite]
+entry = false
+driver = "claude-code"
+model = "opus"
+prompt = "code01"
+egress = ["inference", "registries"]
+
+[stepup]
+ladder = ["cheap", "default", "exquisite"]
+
+[roles.critic]
+model = "opus"
+temperature = 0.0
+
+[models]
+registry = "models.toml"
+
+[egress.inference]
+hosts = ["api.anthropic.com", "generativelanguage.googleapis.com", "10.0.20.104:8000"]
+[egress.registries]
+hosts = ["pypi.org", "files.pythonhosted.org"]
+
+[notify]
+ntfy_topic = "stigmergy"
