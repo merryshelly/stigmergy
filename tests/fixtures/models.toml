@@ -1,0 +1,46 @@
+# Illustrative model registry fixture for tests/test_registry.py.
+# Values here are plausible placeholders for testing shape/behavior only —
+# NOT production prices. Real values are SB-approved later at dogfood
+# (SPEC.md §5, §4).
+
+[haiku]
+provider = "anthropic"
+family = "claude"
+version = "haiku-3-5-20241022"
+pricing = "metered"
+input_usd_per_mtok = 0.8
+output_usd_per_mtok = 4.0
+
+[sonnet]
+provider = "anthropic"
+family = "claude"
+version = "sonnet-4-5-20250514"
+pricing = "metered"
+input_usd_per_mtok = 3.0
+output_usd_per_mtok = 15.0
+cached_usd_per_mtok = 0.3
+
+[opus]
+provider = "anthropic"
+family = "claude"
+version = "opus-4-1-20250805"
+pricing = "metered"
+input_usd_per_mtok = 15.0
+output_usd_per_mtok = 75.0
+reasoning_usd_per_mtok = 15.0
+
+[local-qwen]
+provider = "local"
+family = "qwen"
+version = "qwen2.5-coder-32b"
+pricing = "local"
+marginal_usd = 0.0
+approved = true
+
+[claude-max-sub]
+provider = "anthropic"
+family = "claude"
+version = "claude-code-subscription"
+pricing = "subscription"
+marginal_usd = 0.0
+quota = "5x-plan-weekly-hours"
