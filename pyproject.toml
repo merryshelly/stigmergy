@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stigmergy"
+version = "0.0.0"
+description = "Deterministic orchestration harness — LLM cognition confined to judgment stations."
+requires-python = ">=3.12"
+license = "AGPL-3.0-or-later"
+
+[project.scripts]
+stigmergy = "stigmergy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
