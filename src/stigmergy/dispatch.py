@@ -52,6 +52,7 @@ boundary, mirrors `.13`'s own boundary against `.charter`/`.registry`).
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import shutil
 import sqlite3
@@ -110,7 +111,18 @@ class LaneSelection:
 class DispatchPlan:
     """The fully prepared output of :func:`prepare_dispatch` — everything
     `.22`'s daemon loop needs to hand straight to
-    :func:`stigmergy.drivers.claude_code.spawn` unmodified."""
+    :func:`stigmergy.drivers.claude_code.spawn` unmodified.
+
+    ``prompt_artifact_hash`` (bead .22 build spec §2, a small additive
+    extension to this already-shipped module — mirrors how `.13`
+    additively extended `container.py` and `.21` additively extended
+    `rig.py`): ``sha256(prompt_template.encode()).hexdigest()``, identical
+    mechanism to :class:`stigmergy.critic.Critic`'s own
+    ``self.prompt_artifact_hash``. This is a REQUIRED field with no
+    default — the SPEC §4 prompt-artifact invariant must never be allowed
+    to silently default to an empty string on the DISPATCH event `.22`
+    builds from this plan.
+    """
 
     dispatch_id: str  # == worker_name
     worker_name: str
@@ -120,6 +132,7 @@ class DispatchPlan:
     model_cfg: claude_code.ModelConfig
     budgets: claude_code.Budgets
     capability: Capability
+    prompt_artifact_hash: str
 
 
 def _load_wordlist() -> list[str]:
@@ -495,6 +508,7 @@ def prepare_dispatch(
 
     prompt_path = prompts_dir / lane.prompt
     prompt_template = prompt_path.read_text(encoding="utf-8")
+    prompt_artifact_hash = hashlib.sha256(prompt_template.encode()).hexdigest()
     assemble_task_pack(
         ticket_row,
         context_root=context_root,
@@ -528,4 +542,5 @@ def prepare_dispatch(
         model_cfg=model_cfg,
         budgets=budgets,
         capability=capability,
+        prompt_artifact_hash=prompt_artifact_hash,
     )

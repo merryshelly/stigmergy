@@ -578,6 +578,26 @@ def test_case18_prepare_dispatch_quota_invariant(tmp_path: Path) -> None:
         store.close()
 
 
+def test_case18b_prepare_dispatch_sets_prompt_artifact_hash(tmp_path: Path) -> None:
+    """bead .22 build spec §2 additive extension: `DispatchPlan.
+    prompt_artifact_hash` is `sha256(prompt_template.encode()).hexdigest()`
+    — a non-empty, required field, never silently defaulted to `""`."""
+    import hashlib
+
+    _charter, plan, store, _cap_store = _prepare_test_dispatch(tmp_path)
+    try:
+        prompt_template = (
+            "Goal:\n$goal\n\nAcceptance criteria:\n$acceptance_criteria\n"
+            "Tier 1 checks:\n$tier1_checks\n"
+        )
+        expected = hashlib.sha256(prompt_template.encode()).hexdigest()
+        assert plan.prompt_artifact_hash == expected
+        assert isinstance(plan.prompt_artifact_hash, str)
+        assert plan.prompt_artifact_hash != ""
+    finally:
+        store.close()
+
+
 def test_case19_work_clone_and_task_pack_satisfy_spawn_contract(tmp_path: Path) -> None:
     _charter, plan, store, _cap_store = _prepare_test_dispatch(tmp_path)
     try:

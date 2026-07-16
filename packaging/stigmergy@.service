@@ -1,0 +1,95 @@
+# stigmergy@.service — systemd user-service template for the Stigmergy loop
+# daemon (bead .22 build spec §5; SPEC.md §2/§9: "Daemon = deterministic
+# Python program under systemd (unit file, Restart=on-failure); daemon
+# heartbeat for status surface").
+#
+# Instantiate per rig: `systemctl --user enable --now stigmergy@<rigname>.service`
+# — the instance specifier `%i` here is the RIG NAME (matching the
+# `stigmergy@<rigname>.service` naming convention named in the build spec),
+# NOT a numeric uid. That distinction is exactly why the podman-env choice
+# below is written the way it is.
+#
+# --- Podman env resolution — documented choice (build spec §5) -------------
+# Rootless podman needs XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS pointed at
+# the invoking user's own runtime dir + session bus so cgroup v2 delegation
+# is actually honored (else podman silently falls back to cgroupfs and the
+# resource limits in container.py's argv become theater — see
+# src/stigmergy/container.py's `worker_env()` docstring). Every
+# podman-invoking call path already in this codebase (`checks.run_check`,
+# `drivers.claude_code.spawn`, `container.build_image`) goes through
+# `worker_env()`, which recomputes both vars FRESH via `os.getuid()` at call
+# time regardless of the parent process's own environment — so this unit's
+# own `Environment=` lines are a belt-and-suspenders default for anything
+# that inspects the *service's* ambient environment directly (systemd's own
+# journal/status tooling, a future non-podman collaborator, an operator's
+# `systemctl --user show-environment` debugging session), not the only thing
+# standing between the daemon and a working rootless podman.
+#
+# Because `%i` here is the RIG NAME, an earlier candidate wording of
+# `Environment=XDG_RUNTIME_DIR=/run/user/%i` would be WRONG whenever the rig
+# name is not coincidentally equal to the invoking user's numeric uid (i.e.
+# always, in practice) — it would resolve to a nonexistent path. Two
+# alternatives were considered:
+#
+#   (a) a wrapper script that shells out to `id -u` and re-execs the real
+#       daemon with a hand-built env, or
+#   (b) systemd's own `%t` specifier.
+#
+# This unit takes (b): `%t` is normatively defined (systemd.unit(5),
+# "Specifiers") to resolve to `$XDG_RUNTIME_DIR` when the unit is loaded by
+# a *user* systemd manager (and to `/run` for the system manager) — i.e. it
+# is ALREADY the correct per-invoking-user runtime root, computed by
+# systemd itself, with no uid arithmetic needed anywhere in this file and no
+# risk of colliding with `%i`'s rig-name meaning. This is why the unit below
+# is installed as a **systemd --user** unit (the only sane way to run
+# rootless podman under systemd cgroup delegation in the first place — a
+# system-wide unit would need its own, more invasive uid-mapping story) —
+# `WantedBy=default.target` in `[Install]` matches a user-manager target, not
+# `multi-user.target`. (a) was rejected as unnecessary indirection once (b)
+# was confirmed to do exactly what's needed with a single specifier.
+#
+# Operator setup: `loginctl enable-linger <user>` so the user's systemd
+# instance (and this daemon) keeps running across logout — otherwise a
+# user-manager unit stops the moment the last session for that user ends.
+
+[Unit]
+Description=Stigmergy loop daemon for rig %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# See the podman-env note above: %t resolves to $XDG_RUNTIME_DIR under a
+# user manager, which is exactly the directory rootless podman/cgroup v2
+# delegation needs — no uid arithmetic, no dependence on %i.
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+
+# Placeholder ExecStart: bead .22's file list (src/stigmergy/daemon.py,
+# packaging/stigmergy@.service, tests/test_daemon.py) does not include CLI
+# wiring, and src/stigmergy/cli.py has no `daemon run` subcommand yet as of
+# this bead — see the sub report's residuals list. This invocation names
+# the expected shape (a rig-scoped `stigmergy daemon run --rig <name>`
+# subcommand that constructs a `stigmergy.daemon.Daemon` from the named
+# rig's on-disk charter/stores and calls `.run_forever()`) for whichever
+# later bead wires the CLI entry point up.
+ExecStart=/usr/bin/env python3 -m stigmergy.cli daemon run --rig %i
+
+Restart=on-failure
+RestartSec=5
+
+# HALT_EXIT_CODE (daemon.py) — matches the module constant exactly. systemd
+# must NOT auto-restart a daemon that just halted loudly for cause (the
+# circuit breaker, bead .22 build spec §3): an operator must look at it and
+# restart deliberately, not have it silently spin back up into the same
+# infra storm.
+RestartPreventExitStatus=3
+
+# No network namespace changes, no elevated privileges requested here — the
+# daemon process itself is a plain Python program; all real containment
+# happens per-dispatch inside container.py's hardened `podman run` profile,
+# not at this unit's level.
+
+[Install]
+WantedBy=default.target
