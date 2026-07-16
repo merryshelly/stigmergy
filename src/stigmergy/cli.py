@@ -22,7 +22,9 @@ from stigmergy import checks
 from stigmergy.charter import Charter, CharterError
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
+from stigmergy.critic_client import make_critic_client
 from stigmergy.daemon import Daemon, DaemonError
+from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
 from stigmergy.records import RecordPlane
 from stigmergy.registry import UnbudgetableError
@@ -119,8 +121,8 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     """Wire every real collaborator a `Daemon` needs from an already-
     resolved rig (bead `.27` build spec §2.1). Egress/relay stay at
     `Daemon`'s own `.22`-era placeholder defaults (out of scope, `.25`'s
-    job); the critic client is an explicit, loud placeholder (§3.3 —
-    tracked as bead `.36`)."""
+    job); the critic client is now real (bead `.36`) -- see the inline
+    comment above its construction below."""
     charter, registry, store = resolved.charter, resolved.registry, resolved.store
     rig_paths = resolved.rig_paths
     records_dir = rig_paths["records_dir"]
@@ -145,9 +147,13 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
 
     checker_image = charter.raw["rig"]["image"]  # v0: same image for worker + checker
     critic_cfg = charter.raw["roles"]["critic"]
+    # bead .36: the critic client is now real (direct Anthropic Messages call,
+    # SPEC §7) -- any client-side/provider failure surfaces as CriticInfraError,
+    # never a silent wrong gate verdict (critic.py's own fail-closed discipline).
+    critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
     critic = Critic.from_prompt_file(
         rig_paths["prompts_dir"] / "critic01",  # hardcoded filename -- see §3.7 note
-        client=_unwired_critic_client,
+        client=make_critic_client(key_provider=critic_key_provider, registry=registry),
         model=critic_cfg["model"],
         decoding_params={"temperature": critic_cfg["temperature"]},
     )
@@ -197,19 +203,10 @@ def _make_steering_of(
     return steering_of
 
 
-def _unwired_critic_client(prompt: str, *, model: str, **decoding_params: Any) -> Any:
-    """v0 placeholder (§3.3): raises unconditionally. `Critic.judge()` converts ANY
-    client exception into `CriticInfraError` (never crashes the daemon) -- a weave
-    that runs before the real client is wired surfaces as an ordinary critic-infra
-    trip (visible via the circuit breaker / halt notification), never a silent wrong
-    gate verdict. Tracked as bead `.36` -- replace this callable's caller (the
-    `Critic.from_prompt_file(...)` call in `_build_daemon`) once `.36` lands; nothing
-    else in this module should need to change."""
-    raise NotImplementedError(
-        "stigmergy: real critic API client not yet wired (tracked as bead .36) -- "
-        "weave/gate calls surface as critic-infra trips until a real "
-        "provider-calling client is injected here"
-    )
+# The dedicated dogfood 1Password item for the critic's real Anthropic key
+# (item id `oknaudituuajtuw3cnv4dra7s4`, field `credential`) -- per bead .31's
+# comment, do NOT source the critic key from any other vault item.
+_CRITIC_KEY_REF = "op://shelly/API Credential - stigmergy rig 00/credential"
 
 
 _DEFAULT_NTFY_SERVER = "https://ntfy.sh"

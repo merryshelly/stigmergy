@@ -22,7 +22,6 @@ from stigmergy.cli import (
     _DEFAULT_PROTECTED_PATHS,
     _build_daemon,
     _make_steering_of,
-    _unwired_critic_client,
     main,
 )
 from stigmergy.container import PodmanContainerReaper
@@ -95,9 +94,13 @@ def test_main_daemon_run_builds_real_daemon(tmp_path: Path, monkeypatch) -> None
         assert isinstance(daemon, Daemon)
         # Real, non-placeholder collaborators where it matters:
         assert isinstance(daemon._container_reaper, PodmanContainerReaper)
-        # The critic is wired with the loud placeholder client (bead .36),
-        # NOT a silently-wrong stub.
-        assert daemon._weaver.critic._client is _unwired_critic_client
+        # The critic is wired with the REAL provider-calling client (bead .36),
+        # NOT a silently-wrong stub. It's a make_critic_client closure; its own
+        # request/response + fail-closed behavior is covered in
+        # test_critic_client.py. Daemon construction must NOT shell out to
+        # 1Password (make_op_key_provider is lazy) -- reaching this assertion
+        # here without any op/network access is itself that regression guard.
+        assert callable(daemon._weaver.critic._client)
         assert daemon._weaver.critic.model == "opus"  # charter [roles.critic].model
     finally:
         daemon._store.close()
@@ -196,25 +199,23 @@ def test_make_steering_of_matches_derive_steering(tmp_path: Path) -> None:
         resolved.store.close()
 
 
-# --- case 18: _unwired_critic_client always raises NotImplementedError -------
+# --- case 18: any raising critic client surfaces as CriticInfraError ---------
 
 
-def test_unwired_critic_client_always_raises() -> None:
-    with pytest.raises(NotImplementedError):
-        _unwired_critic_client("prompt", model="opus", temperature=0.0)
-    with pytest.raises(NotImplementedError):
-        _unwired_critic_client("prompt", model="sonnet")
+def test_raising_critic_client_surfaces_as_infra_error() -> None:
+    """A critic client that raises must surface as a critic-INFRA trip
+    (non-crashing), never a raw exception and never a silent gate verdict —
+    proved against the REAL Critic.judge(). (bead .36 removed the old
+    _unwired_critic_client placeholder; the real provider-calling client's own
+    fail-closed paths — transport error, malformed/missing verdict — are
+    covered in test_critic_client.py. This preserves the invariant that ANY
+    client exception is infra, independent of which client is wired.)"""
 
+    def raising_client(prompt: str, *, model: str, **decoding_params: object) -> object:
+        raise RuntimeError("provider unreachable")
 
-# --- case 19: unwired client surfaces as CriticInfraError via Critic.judge --
-
-
-def test_unwired_critic_surfaces_as_infra_error() -> None:
-    """The loud placeholder must surface as a critic-INFRA trip (non-crashing),
-    never a raw NotImplementedError and never a silent gate verdict — proved
-    against the REAL Critic.judge()."""
     critic = Critic(
-        client=_unwired_critic_client,
+        client=raising_client,
         model="opus",
         decoding_params={"temperature": 0.0},
         template="judge the artifact",
