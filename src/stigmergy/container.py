@@ -9,10 +9,13 @@ the mechanical enforcement of the containment contract:
   retained, read-only rootfs, cgroup limits, a whole-cgroup timeout, and
   **exactly** the normative mount table (SPEC §4): the per-dispatch clone at
   `/work` (rw), a size-capped scratch tmpfs at `/scratch` (rw), the task pack
-  at `/task` (ro), nothing else. The charter cannot relax this in v0 — there
-  is no code path here that takes a caller override for the forbidden flags
-  (`--privileged`, `--cap-add*`, `seccomp=unconfined`, any `--*=host`
-  namespace share); they simply never get emitted.
+  at `/task` (ro), nothing else — unless the egress ticket's (.11) optional
+  `egress_socket` is given, in which case exactly one more bind is appended:
+  the dispatch's egress-proxy unix socket at `/run/egress.sock` (rw). The
+  charter cannot relax this in v0 — there is no code path here that takes a
+  caller override for the forbidden flags (`--privileged`, `--cap-add*`,
+  `seccomp=unconfined`, any `--*=host` namespace share); they simply never
+  get emitted.
 - :func:`worker_env` returns the environment rootless podman needs to talk
   to the user's systemd/dbus instance so cgroup v2 limits are actually
   enforced (else podman silently falls back to cgroupfs and the limits in
@@ -56,6 +59,11 @@ class ContainerProfile:
     argv-construction time. ``network`` defaults to ``"none"`` — the .10
     baseline is no network at all; the egress ticket (.11) is the only thing
     that overrides it, with the internal netns routed through the proxy.
+
+    The egress ticket (.11) does not add a field here — its socket path is
+    passed as :func:`build_run_argv`'s separate ``egress_socket`` keyword,
+    not stored on the profile, since it is a per-invocation mount detail
+    (the dispatch's runtime-dir socket path), not a durable profile knob.
     """
 
     image: str
@@ -77,7 +85,12 @@ def _require_pinned(image: str) -> None:
         )
 
 
-def build_run_argv(profile: ContainerProfile, *, command: list[str]) -> list[str]:
+def build_run_argv(
+    profile: ContainerProfile,
+    *,
+    command: list[str],
+    egress_socket: str | Path | None = None,
+) -> list[str]:
     """Render ``profile`` into an exact `podman run` argv (SPEC §4).
 
     Emits precisely the mandatory hardening flags, precisely the normative
@@ -87,6 +100,14 @@ def build_run_argv(profile: ContainerProfile, *, command: list[str]) -> list[str
     `--cap-add*`, `seccomp=unconfined`, or any host-namespace share — the
     charter cannot relax this in v0, so there is no parameter that could
     smuggle one in.
+
+    ``egress_socket`` (bead .11) is the ONE additional mount this function
+    can ever add: when given, exactly one more `--volume=` bind is appended
+    — ``--volume=<egress_socket>:/run/egress.sock:rw`` — the dispatch's
+    egress-proxy unix socket, the worker's sole path out of its
+    `--network=none` cage. Nothing else about the argv changes. Left at its
+    default ``None``, the returned argv is byte-identical to the pre-.11
+    argv (regression guard: existing callers/tests are unaffected).
     """
     _require_pinned(profile.image)
 
@@ -108,9 +129,11 @@ def build_run_argv(profile: ContainerProfile, *, command: list[str]) -> list[str
         f"--volume={work}:/work:rw",
         f"--volume={task}:/task:ro",
         f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev",
-        profile.image,
-        *command,
     ]
+    if egress_socket is not None:
+        argv.append(f"--volume={egress_socket}:/run/egress.sock:rw")
+    argv.append(profile.image)
+    argv.extend(command)
     return argv
 
 
