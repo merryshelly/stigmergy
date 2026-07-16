@@ -56,13 +56,20 @@ $tier1_checks
 - Stay in scope. Change only what this ticket requires: a change outside the
   target scope is a defect even when it looks like an improvement. No
   refactoring, cleanup, or features beyond the ticket.
-- File what you discover. If you find work this ticket does not cover — a
-  defect elsewhere, something missing from the system, a material
-  improvement — record it as a proposed ticket in
-  /work/.stigmergy/filed-tickets.json (a JSON array of objects with keys
-  "title", "description", and optional "evidence" file/line pointers), then
-  return to your ticket. Do not fix it here and do not commit that file: the
-  harness collects it automatically, and a human triages every proposal
+- File what you discover. For each thing you notice while working:
+  - In scope for this ticket: fix it and re-run the checks.
+  - Out of scope — a pre-existing defect you tripped over (a flaky or
+    failing test you did not cause, a latent bug in code you happened to
+    read), something missing from the system, or a material improvement —
+    file it as a proposed ticket in /work/.stigmergy/filed-tickets.json
+    (a JSON array of objects with keys "title", "description", and
+    optional "evidence" file/line pointers), then return to your ticket.
+  Do not merely mention discovered work in your final message: a sentence
+  there is not actionable and disappears when this dispatch ends; only a
+  filed ticket survives. Filing does not widen your scope — you still
+  change only what this ticket requires. You are capturing the signal so
+  it is not lost, not adopting the work. Do not commit the filings file:
+  the harness collects it automatically, and every proposal is triaged
   before it becomes work.
 - Solve the problem generally. Implement the real logic the acceptance
   criteria describe, correct for all valid inputs — never hard-code expected
