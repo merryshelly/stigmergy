@@ -317,6 +317,76 @@ def _deny_status(reason: str) -> int:
     return 429 if reason.startswith(_QUOTA_REASON_PREFIX) else 401
 
 
+@dataclass(frozen=True)
+class UpstreamRequest:
+    """The result of a successful :func:`prepare_upstream` call: a
+    :class:`RelayRequest` with the capability header REMOVED and the real
+    provider key injected under the same header name, ready to hand to a
+    forwarder. ``token`` is carried alongside (not embedded in the request)
+    so the caller can meter the *original* capability after the response
+    comes back — the request itself no longer carries the capability token
+    anywhere."""
+
+    request: RelayRequest
+    token: str
+
+
+@dataclass(frozen=True)
+class DenyResponse:
+    """The result of a failed :func:`prepare_upstream` call: a synthesized
+    deny outcome, carrying no request/token — the forward path is
+    structurally unreachable from this branch (bead .31 build spec case 4).
+    ``status`` is 401 for a missing/unknown/revoked capability, 429 for any
+    ``quota-*`` reason; ``reason`` is ``"missing-capability"`` or one of
+    :class:`CapabilityDenied`'s fixed reason vocabulary."""
+
+    status: int
+    reason: str
+
+
+def prepare_upstream(
+    relay: CredentialRelay, request: RelayRequest
+) -> UpstreamRequest | DenyResponse:
+    """The single authorize+inject authority shared by :meth:`CredentialRelay.handle`
+    (synchronous, full-body) and the live streaming transport
+    (``relay_transport.serve_relay``, bead .31).
+
+    Reuses ``relay``'s own internals (``_find_header``, ``_store.authorize``,
+    ``_key_provider``, ``_capability_header``) so both callers observe
+    IDENTICAL fail-closed behaviour: a missing capability header or a denied
+    capability returns a :class:`DenyResponse` and calls neither
+    ``relay._forwarder`` NOR ``relay._key_provider`` — the real key is never
+    even fetched on a deny path. Only on success is ``key_provider()``
+    invoked and an :class:`UpstreamRequest` built: headers copied from
+    ``request``, the capability header removed (case-insensitively), the
+    real key injected under ``relay._capability_header``; method/path/body
+    pass through unchanged.
+    """
+    token = _find_header(request.headers, relay._capability_header)
+    if token is None:
+        return DenyResponse(status=401, reason="missing-capability")
+
+    try:
+        relay._store.authorize(token)
+    except CapabilityDenied as exc:
+        return DenyResponse(status=_deny_status(exc.reason), reason=exc.reason)
+
+    real_key = relay._key_provider()
+    upstream_headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() != relay._capability_header.lower()
+    }
+    upstream_headers[relay._capability_header] = real_key
+    upstream_request = RelayRequest(
+        method=request.method,
+        path=request.path,
+        headers=upstream_headers,
+        body=request.body,
+    )
+    return UpstreamRequest(request=upstream_request, token=token)
+
+
 class CredentialRelay:
     """Terminates the worker's inference request, swaps its capability
     token for the real provider key toward upstream, and never lets the
@@ -369,31 +439,17 @@ class CredentialRelay:
            ``charge``'s default ``calls=1``).
         6. Return the forwarder's response AS-IS toward the worker — the
            real key is never added to anything returned here.
+
+        As of bead .31, this delegates the authorize+inject decision to the
+        module-level :func:`prepare_upstream` (the single authority shared
+        with the live streaming transport) — behaviour is unchanged, this
+        is a pure refactor.
         """
-        token = _find_header(request.headers, self._capability_header)
-        if token is None:
-            return RelayResponse(status=401, headers={}, body=b"")
+        prepared = prepare_upstream(self, request)
+        if isinstance(prepared, DenyResponse):
+            return RelayResponse(status=prepared.status, headers={}, body=b"")
 
-        try:
-            self._store.authorize(token)
-        except CapabilityDenied as exc:
-            return RelayResponse(status=_deny_status(exc.reason), headers={}, body=b"")
-
-        real_key = self._key_provider()
-        upstream_headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() != self._capability_header.lower()
-        }
-        upstream_headers[self._capability_header] = real_key
-        upstream_request = RelayRequest(
-            method=request.method,
-            path=request.path,
-            headers=upstream_headers,
-            body=request.body,
-        )
-
-        response = self._forwarder(upstream_request)
+        response = self._forwarder(prepared.request)
 
         usage = self._usage_extractor(response)
         output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
@@ -401,7 +457,7 @@ class CredentialRelay:
             output_tokens < 0
         ):
             output_tokens = 0
-        self._store.charge(token, output_tokens=output_tokens)
+        self._store.charge(prepared.token, output_tokens=output_tokens)
 
         return response
 
