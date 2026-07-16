@@ -15,7 +15,10 @@ the mechanical enforcement of the containment contract:
   charter cannot relax this in v0 — there is no code path here that takes a
   caller override for the forbidden flags (`--privileged`, `--cap-add*`,
   `seccomp=unconfined`, any `--*=host` namespace share); they simply never
-  get emitted.
+  get emitted. Bead .13's optional `env` mapping is the only way env vars
+  ever reach the worker — one `--env=KEY=VALUE` token per entry, sorted by
+  key, appended right before the image ref; `env=None` (default) leaves the
+  argv byte-identical to before.
 - :func:`worker_env` returns the environment rootless podman needs to talk
   to the user's systemd/dbus instance so cgroup v2 limits are actually
   enforced (else podman silently falls back to cgroupfs and the limits in
@@ -38,6 +41,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,11 +89,26 @@ def _require_pinned(image: str) -> None:
         )
 
 
+def _require_valid_env_keys(env: Mapping[str, str]) -> None:
+    """Raise :class:`ContainerError` if any key in ``env`` is empty or
+    contains ``=`` (bead .13 build spec §0.2) — cheap defense against a
+    malformed mapping silently producing a garbled `--env=` flag. Checked
+    BEFORE any argv token is appended, so a rejected call never leaks a
+    partial argv list."""
+    for key in env:
+        if not key or "=" in key:
+            raise ContainerError(
+                f"env key {key!r} is invalid — keys must be non-empty and "
+                "contain no '=' (bead .13 build spec §0.2)"
+            )
+
+
 def build_run_argv(
     profile: ContainerProfile,
     *,
     command: list[str],
     egress_socket: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Render ``profile`` into an exact `podman run` argv (SPEC §4).
 
@@ -108,8 +127,25 @@ def build_run_argv(
     `--network=none` cage. Nothing else about the argv changes. Left at its
     default ``None``, the returned argv is byte-identical to the pre-.11
     argv (regression guard: existing callers/tests are unaffected).
+
+    ``env`` (bead .13 build spec §0.2) is the ONE way env vars ever reach
+    the worker — no `--env-host` is ever emitted, so the worker's env is
+    exactly whatever the image sets plus exactly these caller-supplied
+    entries. When given, one `--env=KEY=VALUE` token is emitted per entry,
+    **sorted by key** (determinism), appended immediately before the image
+    ref — after the ``egress_socket`` volume (if any), the same "last thing
+    before the image" slot that append already uses. Each key is validated
+    (non-empty, no `=`) — see :func:`_require_valid_env_keys` — raising
+    :class:`ContainerError` before any token is appended. Values are passed
+    through verbatim as ONE argv token each; no shell is ever involved
+    anywhere in this module, so no value-side escaping question exists.
+    Left at its default ``None``, the returned argv is byte-identical to
+    the pre-.13 argv (regression guard, exactly the discipline
+    ``egress_socket=None`` already gets).
     """
     _require_pinned(profile.image)
+    if env is not None:
+        _require_valid_env_keys(env)
 
     work = str(Path(profile.work_clone).resolve())
     task = str(Path(profile.task_pack).resolve())
@@ -132,6 +168,9 @@ def build_run_argv(
     ]
     if egress_socket is not None:
         argv.append(f"--volume={egress_socket}:/run/egress.sock:rw")
+    if env is not None:
+        for key in sorted(env):
+            argv.append(f"--env={key}={env[key]}")
     argv.append(profile.image)
     argv.extend(command)
     return argv
