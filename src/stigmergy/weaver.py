@@ -1,0 +1,953 @@
+"""The `weave` station — isolated candidate, bundle apply, CAS land, journal
+(SPEC.md §3 `weave` station, §6 "Protection asymmetry", §9 "Weave triggers"
++ "Crash recovery", §10 AC6/AC8/AC9).
+
+**The weaver is the single serialized writer to `staging`** (SPEC §3): every
+parked ticket is gated one at a time, in creation order, through an
+ISOLATED candidate clone that the worker never saw — the worker's bundle is
+object data applied to a tree it has no shared `.git` metadata with, so a
+hook seeded anywhere in that bundle (or in the candidate's own `.git/
+hooks/`) can never execute (`core.hooksPath=/dev/null` on every loop-side
+git invocation, set both per-command and persisted on the candidate clone
+— belt and suspenders, SPEC §4/§10 AC6). This closes the git-hook RCE: the
+weaver, not the worker, is the only thing that ever writes `refs/heads/
+staging`, and it does so only via a compare-and-swap `update-ref` pinned to
+the OID it observed at the start of this ticket's gate.
+
+**Gate-then-land is the whole point** (SPEC §10 AC8): a bundle must (1)
+apply cleanly onto an isolated candidate, (2) pass a full fresh re-run of
+every check on the *integrated* tree (FLAKY/ERROR count as red, never
+silently green), and (3) clear a critic verdict (`Verdict.lands()`, outcome
+MET only — severity never gates) before `staging` moves at all. Any one of
+those failing dies at its own station with its own :class:`~stigmergy.
+statemachine.FailureClass` and the ticket never reaches the CAS step. A
+critic-call failure (:class:`~stigmergy.critic.CriticInfraError`) is INFRA,
+never a rejection (SPEC §9): the bundle simply goes back to `parked`, no
+GATE rejection event is ever written.
+
+**CAS land, not force-land** (SPEC §9): the weaver re-reads the live
+`staging` tip immediately before landing and only proceeds if it still
+equals the OID pinned at this ticket's gate-begin; the actual mechanism is
+`git update-ref refs/heads/staging <candidate> <pinned>` — the old-value
+argument IS the compare-and-swap, so a concurrent move (another process,
+an operator, a resumed weave) makes git itself refuse the update. On a
+lost race the weaver aborts cleanly: nothing is force-landed over the
+winner, the ticket returns to `parked` to be re-gated on a later weave.
+
+**Journal + idempotent resolve() (SPEC §9/§10 AC9).** A durable, append-
+only, fsync'd JSONL file records each ticket's weave phases: `begin` (with
+the pinned OID) → zero or more intermediate phases → `complete`. The
+critical invariant for crash recovery is that the candidate's OID is
+journaled (`applied` phase) the moment the candidate commit exists — well
+before the CAS is even attempted — so that no matter where a crash lands
+after that point (including the genuinely ambiguous window *after*
+`update-ref` has already succeeded but *before* the daemon manages to write
+`complete`), :meth:`Weaver.resolve` can reconcile by asking git itself
+which world it woke up in: if `staging`'s live tip already equals the
+journaled candidate OID, the land already committed — resolve only needs
+to finish the ticket-state bookkeeping (never re-attempt the CAS, never
+re-write the GATE/INTEGRATION/DISPOSITION events already written before
+the crash). Otherwise the land never committed and the ticket goes back to
+`parked`, `staging` untouched. `resolve()` is safe to call repeatedly: once
+the journal's tail is sealed `complete`, a second call recomputes the same
+answer and mutates nothing.
+
+`Weaver` satisfies :class:`stigmergy.recover.WeaveJournalResolver` — a
+`Weaver` instance is passed straight into :func:`stigmergy.recover.recover`.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from stigmergy.checks import CheckOutcome, CheckResult
+from stigmergy.critic import CriticInfraError
+from stigmergy.records import EventType, RecordPlane, make_event
+from stigmergy.statemachine import (
+    GATED,
+    LANDED,
+    PARKED,
+    REJECTED,
+    FailureClass,
+    record_disposition,
+    transition,
+)
+from stigmergy.verdicts import Verdict
+
+# The fixed refspec convention a parked ticket's bundle is expected to carry
+# (a documented convention this module owns, since a bundle is just object
+# data — see module docstring / class docstring for the rationale). Only
+# THIS exact ref is ever fetched from a worker bundle; any other ref the
+# bundle happens to carry (including a maliciously-included
+# `refs/heads/staging`, SPEC §10 AC6) is never requested and therefore
+# never reaches any local ref, staging's included.
+_BUNDLE_REF = "refs/heads/work"
+
+# The local branch name the weaver builds each candidate on, inside the
+# candidate clone. Deliberately distinct from `staging` so there is never
+# any ambiguity with a same-named ref a hostile bundle might carry.
+_CANDIDATE_BRANCH = "weave-candidate"
+
+# The ref namespace used to stage a candidate's tip inside `staging_repo`'s
+# object store immediately before the CAS `update-ref` (fetched in BY
+# BRANCH NAME from the candidate clone — never by raw OID, which local
+# transports refuse to serve without `uploadpack.allow*SHA1InWant`).
+_INCOMING_REF_PREFIX = "refs/weaver/incoming"
+
+_JOURNAL_MODE = 0o600
+
+# SPEC §8: common fields required on every event; the ones this module
+# always declares as true zero for its own non-LLM (INTEGRATION/
+# DISPOSITION) events — a weave bookkeeping event spends nothing.
+_ZERO_TOKENS: dict[str, int] = {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
+
+# The ctx_of() contract: every key a caller-supplied ctx dict must carry so
+# GATE/INTEGRATION events (and record_disposition's own ctx fields) can be
+# built without ever silently defaulting an identity field.
+_CTX_FIELDS: tuple[str, ...] = (
+    "rig",
+    "dispatch_id",
+    "attempt",
+    "attempt_kind",
+    "rung",
+    "worker",
+    "charter_hash",
+    "approval_hash",
+    "image_digest",
+    "model",
+    "model_version",
+    "price_table_version",
+    "tokens",
+    "computed_usd",
+    "wall_time_seconds",
+)
+
+
+class WeaverError(Exception):
+    """Raised on a weaver-side failure that is a bug/misconfiguration, not
+    a normal gate outcome: a git plumbing command failing unexpectedly, or
+    `weave()` being invoked while a previous weave is still unresolved
+    (SPEC §9: the weaver is a single serialized writer — it must never
+    start fresh work on top of an interrupted, un-recovered journal)."""
+
+
+@dataclass(frozen=True)
+class WeaveResult:
+    """The outcome of gating one parked ticket (SPEC §1.1).
+
+    ``outcome`` is one of ``"landed"``, ``"integration-conflict"``,
+    ``"integration-regression"``, ``"rejected"``, ``"infra"``.
+    ``failure_class`` is ``None`` iff ``outcome == "landed"``; otherwise it
+    is the :class:`~stigmergy.statemachine.FailureClass` the loop (.22)
+    applies retry counters from. A CAS-lost-race (concurrent `staging`
+    move) is reported as ``"infra"``/`FailureClass.INFRA` — the design
+    doc's enumerated outcome vocabulary has no dedicated "cas-abort" value,
+    and INFRA's semantics (no rung attempt burned, ticket returns to
+    `parked` to retry, never recorded as a rejection) are the closest
+    fit; ``detail`` distinguishes it from a genuine critic-infra failure
+    in the human-readable trail.
+    """
+
+    ticket: str
+    outcome: str
+    landed_oid: str | None
+    failure_class: FailureClass | None
+    verdict: Verdict | None
+    check_results: list[CheckResult] | None
+    flagged_for_human: bool
+    detail: str
+
+
+class Weaver:
+    """The `weave` station: gate-then-land parked tickets one at a time,
+    serialized, onto `staging` (SPEC §3/§9/§10 AC6/AC8/AC9).
+
+    ``store`` / ``record_plane``: the rig's ticket store and event log.
+    ``staging_repo``: the loop-owned repo whose `staging` branch is the
+    integration target (a bare repo is recommended — see module docstring
+    and tests — but nothing here requires it; the weaver only ever reads
+    `refs/heads/staging` and moves it via CAS `update-ref`, never checks
+    it out). ``run_checks_fn``: injected, `checks.run_checks`-shaped
+    callable (tests inject a fake; production wires the real runner).
+    ``critic``: a :class:`stigmergy.critic.Critic` (or any object exposing
+    a duck-typed `.judge(artifact, rubric_items)`; tests may wrap it in a
+    call-counting spy). ``checker_image`` / ``flake_reruns``: passed
+    through to ``run_checks_fn`` verbatim. ``protected_paths``: glob
+    patterns (SPEC §6 "Protection asymmetry") — a bundle diff touching any
+    of these sets `flagged_for_human=True` and is recorded, but does not
+    by itself block landing in v0. ``journal_path``: the durable, append-
+    only weave journal file (fsync'd JSONL; see module docstring).
+    ``ctx_of``: optional ``ticket_id -> dict`` supplying the SPEC §8
+    common-field identity context for this ticket's dispatch (see
+    :data:`_CTX_FIELDS` for the exact required keys) — tests pass a simple
+    stub; if omitted, a conservative all-zero/None default is used (see
+    :meth:`_default_ctx`).
+
+    **Bundle convention** (documented here since the design doc leaves the
+    exact bundle-location/ref-name convention to the implementation): a
+    parked ticket's work product is a `git bundle` file whose path is
+    ``ticket_row["work_product"]``, carrying (at minimum) a
+    ``refs/heads/work`` ref pointing at the tip commit(s) to integrate.
+    Only that one, fixed, explicitly-named ref is ever fetched from a
+    bundle — any other ref the bundle happens to carry (including a
+    maliciously-included `refs/heads/staging`, SPEC §10 AC6 case 9) is
+    never requested and therefore never adopted anywhere, `staging`
+    included.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: Any,
+        record_plane: RecordPlane,
+        staging_repo: str | Path,
+        run_checks_fn: Any,
+        critic: Any,
+        checker_image: str,
+        flake_reruns: int,
+        protected_paths: list[str],
+        journal_path: str | Path,
+        ctx_of: Any = None,
+    ) -> None:
+        self.store = store
+        self.record_plane = record_plane
+        self.staging_repo = Path(staging_repo)
+        self.run_checks_fn = run_checks_fn
+        self.critic = critic
+        self.checker_image = checker_image
+        self.flake_reruns = flake_reruns
+        self.protected_paths = list(protected_paths)
+        self.journal_path = Path(journal_path)
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ctx_of = ctx_of
+
+    # -- WeaveJournalResolver protocol (recover.py) ------------------------
+
+    def in_progress(self) -> bool:
+        """True iff the journal's last entry is not a sealed `complete` —
+        i.e. some ticket's weave was interrupted mid-flight (SPEC §9)."""
+        lines = self._read_journal()
+        if not lines:
+            return False
+        return lines[-1].get("phase") != "complete"
+
+    def resolve(self) -> str:
+        """Reconcile the interrupted weave (SPEC §9/§10 AC9): "landed" or
+        "rolled-back". Safe to call repeatedly — see module docstring.
+
+        Reconciles the JOURNAL to REALITY rather than trusting the
+        journal's own last-recorded phase: the land itself is a single
+        atomic `update-ref` CAS, so the only fact that can decide whether
+        it committed before a crash is git's own live `staging` tip.
+        """
+        group = self._last_group()
+        if not group:
+            return "rolled-back"
+
+        ticket_id = group[0].get("ticket")
+        dispatch_id = group[0].get("dispatch_id")
+        pinned_oid = group[0].get("pinned_oid")
+        candidate_oid = None
+        for entry in group:
+            if entry.get("candidate_oid"):
+                candidate_oid = entry["candidate_oid"]
+
+        already_complete = group[-1].get("phase") == "complete"
+
+        landed = False
+        if candidate_oid is not None:
+            live_tip = self._rev_parse(self.staging_repo, "refs/heads/staging")
+            landed = live_tip == candidate_oid
+
+        outcome = "landed" if landed else "rolled-back"
+
+        if not already_complete:
+            row = self.store.get_ticket(ticket_id) if ticket_id is not None else None
+            if row is not None:
+                state = row.get("state")
+                # Only fix ticket STATE + seal the journal — never
+                # re-attempt the CAS, never backfill the GATE/INTEGRATION/
+                # DISPOSITION events a completed-before-crash land already
+                # wrote (or, for a rolled-back land, never invent events
+                # for work that never happened). See module docstring.
+                if landed and state == GATED:
+                    transition(self.store, ticket_id, LANDED, expected_from=GATED)
+                elif not landed and state == GATED:
+                    transition(self.store, ticket_id, PARKED, expected_from=GATED)
+            self._journal_append(
+                ticket=ticket_id,
+                dispatch_id=dispatch_id,
+                phase="complete",
+                pinned_oid=pinned_oid,
+                candidate_oid=candidate_oid,
+                resolved_as=outcome,
+            )
+        return outcome
+
+    # -- weave() ------------------------------------------------------------
+
+    def weave(self, *, now: float) -> list[WeaveResult]:
+        """Gate every currently-parked ticket, one at a time, in creation
+        order (SPEC §9 "Weave triggers": *when* to call this is the loop's
+        job via `staging_quiescent_tickets`/queue-drained/`
+        staging_max_wait_seconds`; this processes whatever is parked right
+        now). Fails closed if a previous weave is still unresolved — the
+        weaver is a single serialized writer and must never lay fresh work
+        on top of an un-recovered journal (call `resolve()` via `recover()`
+        first).
+        """
+        if self.in_progress():
+            raise WeaverError(
+                "weave() refused: a previous weave is still unresolved — "
+                "call recover()/resolve() first"
+            )
+
+        results: list[WeaveResult] = []
+        for ticket_row in self.store.list_tickets(state=PARKED):
+            results.append(self._weave_one(ticket_row["id"], now=now))
+        return results
+
+    # -- per-ticket weave sequence -------------------------------------------
+
+    def _weave_one(self, ticket_id: str, *, now: float) -> WeaveResult:
+        transition(self.store, ticket_id, GATED, expected_from=PARKED)
+        ticket_row = self.store.get_ticket(ticket_id)
+        ctx = self._ctx(ticket_row)
+        dispatch_id = ctx["dispatch_id"]
+
+        pinned_oid = self._rev_parse(self.staging_repo, "refs/heads/staging")
+        self._journal_append(
+            ticket=ticket_id,
+            dispatch_id=dispatch_id,
+            phase="begin",
+            pinned_oid=pinned_oid,
+            candidate_oid=None,
+            ts=now,
+        )
+
+        candidate_dir = self._clone_candidate(pinned_oid)
+        try:
+            applied, candidate_oid = self._apply_bundle(candidate_dir, ticket_row, pinned_oid)
+            if not applied:
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=None,
+                    phase="conflict",
+                    outcome="integration-conflict",
+                    failure_class=FailureClass.INTEGRATION_CONFLICT,
+                    disposition="rejected",
+                    reason="integration-conflict",
+                    verdict=None,
+                    check_results=None,
+                    flagged=False,
+                    detail="bundle did not apply cleanly onto the isolated candidate",
+                    now=now,
+                )
+
+            self._journal_append(
+                ticket=ticket_id,
+                dispatch_id=dispatch_id,
+                phase="applied",
+                pinned_oid=pinned_oid,
+                candidate_oid=candidate_oid,
+                ts=now,
+            )
+            # Record-plane INTEGRATION "apply" event (SPEC §1.0: "INTEGRATION
+            # (apply/land/abort)") — written unconditionally once a
+            # candidate exists, independent of what happens at checks/gate
+            # next.
+            self._append_integration_event(
+                ctx, phase="apply", pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+            )
+
+            touched = self._protected_paths_touched(candidate_dir, pinned_oid, candidate_oid)
+            flagged = bool(touched)
+
+            checks = self._all_checks(ticket_row)
+            check_results = self.run_checks_fn(
+                checks,
+                candidate_dir,
+                image=self.checker_image,
+                flake_reruns=self.flake_reruns,
+            )
+            if any(r.outcome != CheckOutcome.PASS for r in check_results):
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=candidate_oid,
+                    phase="checks-red",
+                    outcome="integration-regression",
+                    failure_class=FailureClass.INTEGRATION_REGRESSION,
+                    disposition="rejected",
+                    reason="integration-regression",
+                    verdict=None,
+                    check_results=check_results,
+                    flagged=flagged,
+                    touched=touched,
+                    detail="full check re-run on the integrated candidate was not all-PASS",
+                    now=now,
+                )
+
+            artifact = self._build_artifact(ticket_id, candidate_dir, pinned_oid, candidate_oid)
+            rubric_items = self._rubric_items(ticket_row)
+
+            try:
+                verdict, gate_fields = self.critic.judge(artifact, rubric_items)
+            except CriticInfraError:
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=candidate_oid,
+                    phase="gate-infra",
+                    outcome="infra",
+                    failure_class=FailureClass.INFRA,
+                    disposition="parked",
+                    reason="critic-infra",
+                    verdict=None,
+                    check_results=check_results,
+                    flagged=flagged,
+                    touched=touched,
+                    detail="critic call failed — infra, never a rejection; work stays parked",
+                    now=now,
+                )
+
+            self._append_gate_event(ctx, verdict=verdict, gate_fields=gate_fields, now=now)
+
+            if not verdict.lands():
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=candidate_oid,
+                    phase="gate-rejected",
+                    outcome="rejected",
+                    failure_class=FailureClass.REJECTED,
+                    disposition="rejected",
+                    reason="gate-unmet",
+                    verdict=verdict,
+                    check_results=check_results,
+                    flagged=flagged,
+                    touched=touched,
+                    detail="critic verdict was UNMET",
+                    now=now,
+                )
+
+            # -- CAS land (SPEC §9/§10 AC8) --------------------------------
+            live_tip = self._rev_parse(self.staging_repo, "refs/heads/staging")
+            if live_tip != pinned_oid:
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=candidate_oid,
+                    phase="abort",
+                    outcome="infra",
+                    failure_class=FailureClass.INFRA,
+                    disposition="parked",
+                    reason="concurrent-staging-move",
+                    verdict=verdict,
+                    check_results=check_results,
+                    flagged=flagged,
+                    touched=touched,
+                    detail="CAS aborted cleanly: staging moved concurrently; candidate NOT landed",
+                    now=now,
+                )
+
+            self._fetch_candidate_into_staging(candidate_dir, ticket_id)
+            update_ref = self._git(
+                self.staging_repo,
+                ["update-ref", "refs/heads/staging", candidate_oid, pinned_oid],
+                check=False,
+            )
+            if update_ref.returncode != 0:
+                # Lost the race between our own re-read above and the
+                # update-ref call itself — still a clean CAS abort.
+                return self._die(
+                    ticket_id=ticket_id,
+                    dispatch_id=dispatch_id,
+                    ctx=ctx,
+                    pinned_oid=pinned_oid,
+                    candidate_oid=candidate_oid,
+                    phase="abort",
+                    outcome="infra",
+                    failure_class=FailureClass.INFRA,
+                    disposition="parked",
+                    reason="concurrent-staging-move",
+                    verdict=verdict,
+                    check_results=check_results,
+                    flagged=flagged,
+                    touched=touched,
+                    detail="CAS update-ref refused: staging moved concurrently",
+                    now=now,
+                )
+
+            transition(self.store, ticket_id, LANDED, expected_from=GATED)
+            self._append_integration_event(
+                ctx, phase="land", pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+            )
+            reason = self._combine_reason(None, touched)
+            record_disposition(
+                self.record_plane,
+                ctx={**ctx, "ticket": ticket_id},
+                disposition="landed",
+                attempt_kind=ctx["attempt_kind"],
+                reason=reason,
+            )
+            self._journal_append(
+                ticket=ticket_id,
+                dispatch_id=dispatch_id,
+                phase="complete",
+                pinned_oid=pinned_oid,
+                candidate_oid=candidate_oid,
+                resolved_as="landed",
+                ts=now,
+            )
+            return WeaveResult(
+                ticket=ticket_id,
+                outcome="landed",
+                landed_oid=candidate_oid,
+                failure_class=None,
+                verdict=verdict,
+                check_results=check_results,
+                flagged_for_human=flagged,
+                detail="critic MET; CAS land succeeded",
+            )
+        finally:
+            self._cleanup_candidate(candidate_dir)
+
+    def _die(
+        self,
+        *,
+        ticket_id: str,
+        dispatch_id: Any,
+        ctx: dict[str, Any],
+        pinned_oid: str,
+        candidate_oid: str | None,
+        phase: str,
+        outcome: str,
+        failure_class: FailureClass,
+        disposition: str,
+        reason: str,
+        verdict: Verdict | None,
+        check_results: list[CheckResult] | None,
+        flagged: bool,
+        detail: str,
+        now: float,
+        touched: list[str] | None = None,
+    ) -> WeaveResult:
+        """Shared tail for every non-landing outcome: journal the phase,
+        transition to the resting state, write the DISPOSITION event (plus
+        a record-plane INTEGRATION event for `phase in {"abort",
+        "gate-infra"}` only). Reconciling SPEC §1.0's "INTEGRATION (apply/
+        land/abort)" summary against §1.3 step 7's explicit "journal an
+        INTEGRATION 'gate-infra' entry (no GATE rejection event)" line: §1.3
+        is the detailed normative sequence and separately calls out
+        `gate-infra` as its own INTEGRATION entry (distinct from the plain
+        `conflict`/`checks-red`/`gate-rejected` journal phases, which §1.3
+        does NOT ask for a record-plane INTEGRATION event of their own —
+        only the weave journal phase + the DISPOSITION event). See module/
+        weave-design notes: this is a deliberate resolution of that
+        wording gap, not an accident. Seals the journal `complete` at the
+        end. `disposition in {"rejected", "parked"}` maps to
+        `REJECTED`/`PARKED` respectively (both legal `GATED->*` edges,
+        SPEC §9).
+        """
+        self._journal_append(
+            ticket=ticket_id,
+            dispatch_id=dispatch_id,
+            phase=phase,
+            pinned_oid=pinned_oid,
+            candidate_oid=candidate_oid,
+            ts=now,
+        )
+        to_state = REJECTED if disposition == "rejected" else PARKED
+        transition(self.store, ticket_id, to_state, expected_from=GATED)
+        if phase in ("abort", "gate-infra"):
+            self._append_integration_event(
+                ctx, phase=phase, pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+            )
+        combined_reason = self._combine_reason(reason, touched)
+        record_disposition(
+            self.record_plane,
+            ctx={**ctx, "ticket": ticket_id},
+            disposition=disposition,
+            attempt_kind=ctx["attempt_kind"],
+            reason=combined_reason,
+        )
+        self._journal_append(
+            ticket=ticket_id,
+            dispatch_id=dispatch_id,
+            phase="complete",
+            pinned_oid=pinned_oid,
+            candidate_oid=candidate_oid,
+            resolved_as="rolled-back",
+            ts=now,
+        )
+        return WeaveResult(
+            ticket=ticket_id,
+            outcome=outcome,
+            landed_oid=None,
+            failure_class=failure_class,
+            verdict=verdict,
+            check_results=check_results,
+            flagged_for_human=flagged,
+            detail=detail,
+        )
+
+    @staticmethod
+    def _combine_reason(reason: str | None, touched: list[str] | None) -> str | None:
+        """Blend the base disposition reason with the protection-asymmetry
+        flag (SPEC §6) onto the SAME disposition event, rather than firing
+        a second, premature `record_disposition` call before the ticket's
+        final outcome is known (see class docstring / weaver design notes:
+        this is a deliberate reading of an underspecified point in the
+        design doc)."""
+        if not touched:
+            return reason
+        flag = f"protected-path-touched:{','.join(sorted(touched))}"
+        return flag if reason is None else f"{reason};{flag}"
+
+    # -- context / checks / rubric -------------------------------------------
+
+    def _ctx(self, ticket_row: dict[str, Any]) -> dict[str, Any]:
+        ctx = self.ctx_of(ticket_row["id"]) if self.ctx_of is not None else None
+        if ctx is None:
+            ctx = self._default_ctx(ticket_row)
+        missing = [f for f in _CTX_FIELDS if f not in ctx]
+        if missing:
+            raise WeaverError(f"ctx_of()'s returned dict is missing field(s): {missing}")
+        result = dict(ctx)
+        result["ticket"] = ticket_row["id"]
+        return result
+
+    @staticmethod
+    def _default_ctx(ticket_row: dict[str, Any]) -> dict[str, Any]:
+        """A conservative, all-zero/None fallback context for identity
+        fields, used only when the caller passes no ``ctx_of`` at all."""
+        return {
+            "rig": None,
+            "dispatch_id": ticket_row.get("lease_dispatch_id"),
+            "attempt": ticket_row.get("attempts_used") or 0,
+            "attempt_kind": "initial",
+            "rung": ticket_row.get("current_rung") or "cheap",
+            "worker": ticket_row.get("lease_owner"),
+            "charter_hash": None,
+            "approval_hash": ticket_row.get("approval_hash"),
+            "image_digest": None,
+            "model": None,
+            "model_version": None,
+            "price_table_version": None,
+            "tokens": dict(_ZERO_TOKENS),
+            "computed_usd": 0.0,
+            "wall_time_seconds": 0.0,
+        }
+
+    @staticmethod
+    def _all_checks(ticket_row: dict[str, Any]) -> dict[str, str]:
+        """The name->command checks to re-run on the integrated candidate.
+
+        Convention for this module: ``ticket_row["tier1_checks"]`` is a
+        flat ``dict[str, str]`` (name -> shell command) — a simpler shape
+        than other tickets' fixtures use for the same JSON column, but
+        each test module is free to assign its own meaning to a generic
+        column; this one is internally consistent within this module and
+        its tests. Falls back to a single trivial check if absent so
+        ``run_checks_fn`` always has something to iterate.
+        """
+        checks = ticket_row.get("tier1_checks")
+        if isinstance(checks, dict) and checks:
+            return checks
+        return {"tests": "true"}
+
+    @staticmethod
+    def _rubric_items(ticket_row: dict[str, Any]) -> list[str]:
+        criteria = ticket_row.get("acceptance_criteria")
+        return criteria if isinstance(criteria, list) else []
+
+    def _build_artifact(
+        self, ticket_id: str, candidate_dir: Path, pinned_oid: str, candidate_oid: str
+    ) -> str:
+        diff = self._git(candidate_dir, ["diff", pinned_oid, candidate_oid]).stdout
+        return f"ticket: {ticket_id}\ncandidate: {candidate_oid}\n\n{diff}"
+
+    # -- git plumbing ---------------------------------------------------------
+
+    def _clone_candidate(self, pinned_oid: str) -> Path:
+        """Build an ISOLATED candidate clone (never a shared worktree) at
+        ``pinned_oid`` — a fresh repo that fetches only the `staging`
+        branch's history from ``staging_repo`` and never shares `.git`
+        metadata with it. Hooks are disabled from the very first command:
+        both per-invocation (``-c core.hooksPath=/dev/null``, applied by
+        every :meth:`_git` call unconditionally) and persisted on the new
+        repo's own config (defense in depth, SPEC §10 AC6).
+
+        Uses `init` + `fetch` (by branch NAME, into a distinctly-namespaced
+        remote-tracking ref) + `checkout -B`, rather than `git clone`
+        directly — this works uniformly whether ``staging_repo`` is bare
+        or non-bare, and whether or not its `HEAD` is a sensible symbolic
+        ref (a bare integration repo need carry no checked-out branch at
+        all); `git clone`'s own hook-seeding step (via a caller's
+        `GIT_TEMPLATE_DIR`) still applies here exactly as it would to a
+        plain `clone`, which is what the AC6 test relies on.
+        """
+        candidate_dir = Path(tempfile.mkdtemp(prefix="stigmergy-weave-"))
+        self._git(candidate_dir, ["init", "--quiet"])
+        self._git(candidate_dir, ["config", "core.hooksPath", "/dev/null"])
+        self._git(
+            candidate_dir,
+            [
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--",
+                str(self.staging_repo),
+                "refs/heads/staging:refs/remotes/origin/staging",
+            ],
+        )
+        self._git(
+            candidate_dir,
+            ["checkout", "--quiet", "-B", _CANDIDATE_BRANCH, pinned_oid],
+        )
+        return candidate_dir
+
+    @staticmethod
+    def _cleanup_candidate(candidate_dir: Path | None) -> None:
+        if candidate_dir is None:
+            return
+        import shutil
+
+        shutil.rmtree(candidate_dir, ignore_errors=True)
+
+    def _apply_bundle(
+        self, candidate_dir: Path, ticket_row: dict[str, Any], pinned_oid: str
+    ) -> tuple[bool, str | None]:
+        """Fetch ONLY :data:`_BUNDLE_REF` from the ticket's bundle and
+        merge it onto the candidate (SPEC §10 AC6 case 9: any other ref
+        the bundle carries — including a malicious `refs/heads/staging` —
+        is never requested and never reaches any local ref). Returns
+        ``(applied, candidate_oid)``; ``applied is False`` covers a
+        missing bundle, a missing/unfetchable ref, a merge conflict, and a
+        would-be no-op merge (nothing new to integrate)."""
+        bundle_path = ticket_row.get("work_product")
+        if not bundle_path:
+            return False, None
+
+        incoming_ref = f"{_INCOMING_REF_PREFIX}-bundle"
+        fetch = self._git(
+            candidate_dir,
+            [
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--",
+                str(bundle_path),
+                f"{_BUNDLE_REF}:{incoming_ref}",
+            ],
+            check=False,
+        )
+        if fetch.returncode != 0:
+            return False, None
+
+        merge = self._git(
+            candidate_dir,
+            [
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "--quiet",
+                incoming_ref,
+                "-m",
+                f"weave: integrate {ticket_row['id']}",
+            ],
+            check=False,
+        )
+        if merge.returncode != 0:
+            self._git(candidate_dir, ["merge", "--abort"], check=False)
+            return False, None
+
+        candidate_oid = self._rev_parse(candidate_dir, _CANDIDATE_BRANCH)
+        if candidate_oid == pinned_oid:
+            # Nothing new was actually integrated -- treat as a conflict
+            # rather than risk an ambiguous candidate_oid == pinned_oid
+            # comparison later (in resolve()'s crash-recovery reconciliation).
+            return False, None
+        return True, candidate_oid
+
+    def _protected_paths_touched(
+        self, candidate_dir: Path, pinned_oid: str, candidate_oid: str
+    ) -> list[str]:
+        diff = self._git(
+            candidate_dir, ["diff", "--name-only", pinned_oid, candidate_oid]
+        ).stdout
+        changed = [line.strip() for line in diff.splitlines() if line.strip()]
+        return [
+            path
+            for path in changed
+            if any(
+                fnmatch.fnmatch(path, pattern) or path == pattern
+                for pattern in self.protected_paths
+            )
+        ]
+
+    def _fetch_candidate_into_staging(self, candidate_dir: Path, ticket_id: str) -> None:
+        """Import the candidate's objects into ``staging_repo`` by
+        fetching the candidate's own branch BY NAME (never by raw OID —
+        local transports refuse to serve an unadvertised SHA without
+        `uploadpack.allow*SHA1InWant`) into a distinctly-namespaced local
+        ref, ahead of the actual CAS `update-ref`."""
+        target_ref = f"{_INCOMING_REF_PREFIX}/{ticket_id}"
+        self._git(
+            self.staging_repo,
+            [
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--",
+                str(candidate_dir),
+                f"{_CANDIDATE_BRANCH}:{target_ref}",
+            ],
+        )
+
+    def _rev_parse(self, repo: Path, ref: str) -> str:
+        return self._git(repo, ["rev-parse", ref]).stdout.strip()
+
+    def _git(
+        self, repo: Path | None, args: list[str], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one loop-side git command, ALWAYS with hooks disabled
+        (`-c core.hooksPath=/dev/null`, SPEC §10 AC6 defense in depth).
+        Inherits the ambient process environment (never stripped) — this
+        is host-touching plumbing over trusted repos/paths, not a
+        container boundary; the untrusted input this module defends
+        against is bundle/tree CONTENT, never the daemon's own env.
+        """
+        argv = ["git"]
+        if repo is not None:
+            argv += ["-C", str(repo)]
+        # `-c core.hooksPath=/dev/null` (SPEC §10 AC6, always). The
+        # committer identity config is harmless noise for read-only/
+        # ref-plumbing commands but required for the merge commits this
+        # module creates on the candidate clone — set unconditionally
+        # rather than threading a separate "needs an identity" flag
+        # through every call site.
+        argv += [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.email=weaver@stigmergy.invalid",
+            "-c",
+            "user.name=stigmergy-weaver",
+            *args,
+        ]
+        result = subprocess.run(  # noqa: S603
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            raise WeaverError(
+                f"git {' '.join(args)} failed (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return result
+
+    # -- record-plane event helpers -------------------------------------------
+
+    def _append_integration_event(
+        self,
+        ctx: dict[str, Any],
+        *,
+        phase: str,
+        pinned_oid: str | None,
+        candidate_oid: str | None,
+        now: float,
+    ) -> None:
+        fields = {key: ctx.get(key) for key in _CTX_FIELDS}
+        fields["ticket"] = ctx["ticket"]
+        fields["tokens"] = dict(_ZERO_TOKENS)
+        fields["computed_usd"] = 0.0
+        fields["wall_time_seconds"] = 0.0
+        fields["phase"] = phase
+        fields["pinned_oid"] = pinned_oid
+        fields["candidate_oid"] = candidate_oid
+        fields["ts"] = now
+        event = make_event(EventType.INTEGRATION, **fields)
+        self.record_plane.append(event)
+
+    def _append_gate_event(
+        self, ctx: dict[str, Any], *, verdict: Verdict, gate_fields: dict[str, Any], now: float
+    ) -> None:
+        fields = {key: ctx.get(key) for key in _CTX_FIELDS}
+        fields["ticket"] = ctx["ticket"]
+        fields["decoding_params"] = gate_fields["decoding_params"]
+        fields["prompt_artifact_hash"] = gate_fields["prompt_artifact_hash"]
+        fields["model"] = gate_fields.get("model", ctx.get("model"))
+        fields["outcome"] = verdict.outcome.value
+        fields["tier"] = verdict.tier
+        fields["reason"] = verdict.reason
+        fields["severity"] = verdict.severity.value
+        fields["ts"] = now
+        event = make_event(EventType.GATE, **fields)
+        self.record_plane.append(event)
+
+    # -- journal --------------------------------------------------------------
+
+    def _journal_append(self, **fields: Any) -> None:
+        fields.setdefault("ts", time.time())
+        line = json.dumps(fields, sort_keys=True, default=str)
+        fd = os.open(self.journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _JOURNAL_MODE)
+        try:
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        finally:
+            os.chmod(self.journal_path, _JOURNAL_MODE)
+
+    def _read_journal(self) -> list[dict[str, Any]]:
+        if not self.journal_path.exists():
+            return []
+        lines: list[dict[str, Any]] = []
+        with open(self.journal_path, encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    lines.append(parsed)
+        return lines
+
+    def _last_group(self) -> list[dict[str, Any]] | None:
+        """The journal lines for the most recently begun ticket (from its
+        last `begin` line to the end of the file) — by construction, one
+        ticket's cycle always fully seals `complete` before the next
+        ticket's `begin` is appended, so at most this last group can ever
+        be incomplete."""
+        lines = self._read_journal()
+        if not lines:
+            return None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].get("phase") == "begin":
+                return lines[i:]
+        return None
