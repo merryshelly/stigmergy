@@ -155,7 +155,9 @@ def _default_rng_factory() -> Callable[[], str]:
 # --- §0.2 lane selection -----------------------------------------------
 
 
-def select_lane(charter: Charter, ticket_row: dict[str, Any]) -> LaneSelection:
+def select_lane(
+    charter: Charter, ticket_row: dict[str, Any], *, rung: str | None = None
+) -> LaneSelection:
     """Select the lane to dispatch on (bead .21 build spec §0.2).
 
     Iterates ``charter.raw["lanes"]`` in file order (TOML insertion order
@@ -176,8 +178,31 @@ def select_lane(charter: Charter, ticket_row: dict[str, Any]) -> LaneSelection:
     lanes at all (should be structurally impossible given charter
     validation, but this fails loud rather than raising `KeyError` if it
     ever happens).
+
+    ``rung`` (bead .28): an EXPLICIT override naming a specific lane by its
+    charter key. When given (non-None), that lane is returned directly —
+    including ``entry=false`` step-up-only rungs, and bypassing selector /
+    ``lane_hint`` matching entirely — so a ticket that has structurally
+    stepped up (statemachine sets ``current_rung`` to the next rung's lane
+    name, e.g. ``"exquisite"``) actually dispatches on it. Raises
+    :class:`DispatchError` if ``rung`` names no such lane. When ``rung`` is
+    ``None`` (the default) behavior is byte-identical to pre-.28 lane_hint-
+    only selection — this MUST stay true: :func:`stigmergy.steering.derive_steering`
+    calls the plain, no-rung form, and its approval/steering hash must never
+    be perturbed by a step-up (the frozen .35 invariant; see
+    tests/test_steering.py case 8).
     """
     lanes = charter.raw.get("lanes") or {}
+
+    if rung is not None:
+        cfg = lanes.get(rung)
+        if cfg is None:
+            raise DispatchError(
+                f"rung override {rung!r} names no lane in the charter's "
+                "[lanes] — cannot dispatch a step-up rung that does not exist"
+            )
+        return _build_lane_selection(rung, cfg)
+
     lane_hint = ticket_row.get("lane_hint")
 
     fallthrough_name: str | None = None
@@ -494,7 +519,7 @@ def prepare_dispatch(
     this function itself were interrupted partway through (see module
     docstring §0.1 on `.22`'s prepare->spawn->revoke `finally` contract).
     """
-    lane = select_lane(charter, ticket_row)
+    lane = select_lane(charter, ticket_row, rung=ticket_row.get("current_rung"))
 
     worker_name = generate_worker_name(store, "worker", lane.model, lane.prompt)
     dispatch_id = worker_name

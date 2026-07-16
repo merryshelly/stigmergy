@@ -633,3 +633,121 @@ def test_case20_prepare_dispatch_mints_capability_exactly_once(tmp_path: Path) -
         assert cap_store.mint_calls == 1
     finally:
         store.close()
+
+
+# ==========================================================================
+# Explicit rung override (bead .28) — select_lane / prepare_dispatch must be
+# able to dispatch a stepped-up (entry=false) rung named by current_rung,
+# WITHOUT changing the plain lane_hint-only default path (the frozen .35
+# constraint: derive_steering keeps calling select_lane(charter, ticket_row)
+# with no rung, and must never see current_rung).
+# ==========================================================================
+
+
+def _ladder_charter() -> Charter:
+    return _lanes_charter(
+        {
+            "cheap": _lane(model="haiku", selector={"label": "local-ok"}),
+            "default": _lane(model="sonnet"),
+            "exquisite": _lane(model="opus", entry=False),
+        }
+    )
+
+
+def test_rung_override_selects_entry_false_lane() -> None:
+    """THE .28 fix: an explicit rung reaches a step-up-only (entry=false)
+    lane that select_lane's default path can never select."""
+    selection = select_lane(_ladder_charter(), {"lane_hint": None}, rung="exquisite")
+    assert selection.name == "exquisite"
+    assert selection.model == "opus"
+
+
+def test_rung_override_takes_precedence_over_lane_hint() -> None:
+    # lane_hint alone would pick "cheap"; the explicit rung wins.
+    selection = select_lane(_ladder_charter(), {"lane_hint": "local-ok"}, rung="exquisite")
+    assert selection.name == "exquisite"
+
+
+def test_rung_override_selects_entry_lane_by_name() -> None:
+    # Names an entry lane directly, bypassing selector-label matching.
+    selection = select_lane(_ladder_charter(), {}, rung="cheap")
+    assert selection.name == "cheap"
+    assert selection.model == "haiku"
+
+
+def test_rung_none_or_absent_preserves_lane_hint_behavior() -> None:
+    """Regression / the frozen constraint: rung=None (and absent rung) behave
+    EXACTLY as pre-.28 — lane_hint-only, entry=false lanes never reachable."""
+    charter = _ladder_charter()
+    assert select_lane(charter, {"lane_hint": "local-ok"}, rung=None).name == "cheap"
+    assert select_lane(charter, {"lane_hint": "local-ok"}).name == "cheap"
+    assert select_lane(charter, {"lane_hint": None}, rung=None).name == "default"
+    assert select_lane(charter, {}).name == "default"
+
+
+def test_rung_override_unknown_lane_raises() -> None:
+    with pytest.raises(DispatchError):
+        select_lane(_ladder_charter(), {}, rung="ghost-rung")
+
+
+def _prepare_with_rung(tmp_path: Path, current_rung):
+    """Minimal prepare_dispatch setup (mirrors _prepare_test_dispatch) with a
+    caller-controlled current_rung."""
+    charter = make_full_charter(tmp_path)  # lanes: cheap/default/exquisite(entry=false)
+    rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
+    store = RigStore.create(tmp_path / "tickets.db")
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    clones_root = tmp_path / "clones"
+    prompts_dir = tmp_path / "prompts_dir"
+    prompts_dir.mkdir()
+    (prompts_dir / "code01").write_text(
+        "Goal:\n$goal\n\nAcceptance criteria:\n$acceptance_criteria\n"
+        "Tier 1 checks:\n$tier1_checks\n"
+    )
+    ticket_row = {
+        "id": "ticket-1",
+        "title": "Do the thing",
+        "goal": "Implement the feature end to end.",
+        "required_reading": [],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "lane_hint": None,
+        "current_rung": current_rung,
+    }
+    plan = prepare_dispatch(
+        charter=charter,
+        ticket_row=ticket_row,
+        store=store,
+        capability_store=CapabilityStore(),
+        rig_repo=rig_repo,
+        context_root=context_root,
+        clones_root=clones_root,
+        prompts_dir=prompts_dir,
+        relay_base_url="http://relay.local:9999",
+        image=PINNED_IMAGE,
+    )
+    return plan, store
+
+
+def test_prepare_dispatch_dispatches_on_stepped_up_rung(tmp_path: Path) -> None:
+    """End-to-end: a ticket that has stepped up (current_rung='exquisite',
+    an entry=false lane) actually dispatches on the exquisite lane — the
+    bug this bead fixes was that it silently fell back to the entry lane."""
+    plan, store = _prepare_with_rung(tmp_path, "exquisite")
+    try:
+        assert plan.lane.name == "exquisite"
+        assert plan.lane.model == "opus"
+    finally:
+        store.close()
+
+
+def test_prepare_dispatch_first_dispatch_uses_entry_lane(tmp_path: Path) -> None:
+    """Regression: current_rung=None (first dispatch) still resolves via the
+    plain lane_hint path — here, the selector-less entry fallthrough."""
+    plan, store = _prepare_with_rung(tmp_path, None)
+    try:
+        assert plan.lane.name == "default"
+    finally:
+        store.close()
