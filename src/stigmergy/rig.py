@@ -71,6 +71,10 @@ CREATE TABLE rig_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE worker_names (
+  name       TEXT PRIMARY KEY,
+  created_at REAL NOT NULL
+);
 """
 
 # Columns settable through add_ticket() beyond the required id/title (which
@@ -243,6 +247,33 @@ class RigStore:
         ).fetchall()
         return [row["blocks_ticket_id"] for row in rows]
 
+    def insert_worker_name(self, name: str) -> None:
+        """Reserve ``name`` in the rig-wide `worker_names` set (bead .21
+        build spec §0.5). Raises `sqlite3.IntegrityError` on a primary-key
+        collision — callers (`dispatch.generate_worker_name`) are
+        responsible for catching that and retrying with a fresh nonce;
+        this method does not swallow it, only rolls back the failed
+        insert's transaction first so the connection is left clean (a
+        collision here must never leave a dangling uncommitted write
+        behind).
+        """
+        try:
+            self._conn.execute(
+                "INSERT INTO worker_names (name, created_at) VALUES (?, ?)",
+                (name, time.time()),
+            )
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
+
+    def worker_name_exists(self, name: str) -> bool:
+        """True iff ``name`` has already been reserved in `worker_names`."""
+        row = self._conn.execute(
+            "SELECT 1 FROM worker_names WHERE name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
     def set_meta(self, key: str, value: str) -> None:
         """Set (or overwrite) a `rig_meta` key/value pair."""
         self._conn.execute(
@@ -360,7 +391,7 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
 
     store = RigStore.create(rig_root / "tickets.db")
     try:
-        store.set_meta("schema_version", "1")
+        store.set_meta("schema_version", "2")
         store.set_meta("stigmergy_version", __version__)
         store.set_meta("charter_hash", charter.resolved_hash)
         store.set_meta("rig_name", charter.raw["rig"]["name"])

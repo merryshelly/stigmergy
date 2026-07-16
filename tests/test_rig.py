@@ -144,7 +144,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
 
     store = RigStore(rig_root / "tickets.db")
     try:
-        assert store.get_meta("schema_version") == "1"
+        assert store.get_meta("schema_version") == "2"
         assert store.get_meta("stigmergy_version") == __version__
         charter_hash = store.get_meta("charter_hash")
         assert charter_hash
@@ -357,11 +357,11 @@ def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute("SELECT value FROM rig_meta WHERE key = 'schema_version'").fetchall()
-        assert rows == [("1",)]
+        assert rows == [("2",)]
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        assert {"tickets", "ticket_deps", "rig_meta"} <= tables
+        assert {"tickets", "ticket_deps", "rig_meta", "worker_names"} <= tables
     finally:
         conn.close()
