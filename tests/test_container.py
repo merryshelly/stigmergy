@@ -20,14 +20,18 @@ these tokens so the security surface is asserted by identity, not by fuzzy match
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+import uuid
 
 import pytest
 
 from stigmergy.container import (
+    DISPATCH_ID_LABEL_KEY,
     ContainerError,
     ContainerProfile,
+    PodmanContainerReaper,
     build_image,
     build_run_argv,
     worker_env,
@@ -90,7 +94,18 @@ def _profile(tmp_path, **overrides):
 
 
 def _argv(tmp_path, command=None, **overrides):
-    return build_run_argv(_profile(tmp_path, **overrides), command=command or ["true"])
+    # build_run_argv-only kwargs (not ContainerProfile fields) are split out
+    # here so callers can pass e.g. dispatch_id=/egress_socket=/env= without
+    # ContainerProfile(**kwargs) choking on an unexpected keyword — every
+    # existing call site only ever passes ContainerProfile fields, so this
+    # split is purely additive and does not change any existing test.
+    build_kwargs = {}
+    for key in ("egress_socket", "env", "dispatch_id"):
+        if key in overrides:
+            build_kwargs[key] = overrides.pop(key)
+    return build_run_argv(
+        _profile(tmp_path, **overrides), command=command or ["true"], **build_kwargs
+    )
 
 
 # --------------------------------------------------------------------------
@@ -372,3 +387,351 @@ def test_live_concurrent_workload_unaffected_by_limited_container(tmp_path, pinn
 
     assert good_result.returncode == 0
     assert "healthy" in good_result.stdout
+
+
+# --------------------------------------------------------------------------
+# Bead .34 Part A: dispatch_id labeling (build_run_argv). Cases 1-7.
+# --------------------------------------------------------------------------
+
+
+def test_dispatch_id_none_leaves_argv_unchanged(tmp_path):
+    # Case 1: dispatch_id=None (the default) is byte-identical to the
+    # pre-.34 argv — the same regression-guard discipline egress_socket=None
+    # and env=None already get. Two separate assertions: (a) explicit
+    # dispatch_id=None matches the param-omitted call, AND (b) neither
+    # contains any --label= token at all — (a) alone cannot catch a bug
+    # that corrupts both call sites identically (e.g. always emitting the
+    # label regardless of dispatch_id), so (b) is the real byte-identity
+    # claim against the pre-.34 baseline.
+    with_none = _argv(tmp_path, dispatch_id=None)
+    without_param = _argv(tmp_path)
+    assert with_none == without_param
+    assert not any(a.startswith("--label=") for a in with_none)
+    assert not any(a.startswith("--label=") for a in without_param)
+
+
+def test_dispatch_id_valid_adds_label_at_frozen_position(tmp_path):
+    # Case 2: a valid dispatch_id appends exactly one --label= token,
+    # immediately after --network=... and immediately before the first
+    # --volume=... token. Freeze the literal index/adjacency, not just
+    # "present somewhere".
+    argv = _argv(tmp_path, dispatch_id="crimson-otter-basalt")
+    label_token = f"--label={DISPATCH_ID_LABEL_KEY}=crimson-otter-basalt"
+    assert label_token in argv
+
+    network_index = next(i for i, a in enumerate(argv) if a.startswith("--network="))
+    assert argv[network_index + 1] == label_token
+    assert argv[network_index + 2].startswith("--volume=")
+
+    first_volume_index = next(i for i, a in enumerate(argv) if a.startswith("--volume="))
+    assert first_volume_index == network_index + 2
+
+
+def test_dispatch_id_empty_raises(tmp_path):
+    # Case 3
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, dispatch_id="")
+
+
+def test_dispatch_id_with_equals_raises(tmp_path):
+    # Case 4
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, dispatch_id="a=b")
+
+
+def test_dispatch_id_with_space_raises(tmp_path):
+    # Case 5
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, dispatch_id="a b")
+
+
+def test_dispatch_id_with_comma_raises(tmp_path):
+    # Case 6
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, dispatch_id="a,b")
+
+
+def test_dispatch_id_combined_with_egress_socket_and_env_no_interference(tmp_path):
+    # Case 7: all three additive params given together — all three tokens
+    # present, no interference. Frozen relative order: --label (network-
+    # adjacent, before all volumes) -> egress-socket volume -> env tokens
+    # (env's own already-documented "last thing before the image" slot).
+    sock = tmp_path / "egress.sock"
+    env = {"ANTHROPIC_API_KEY": "tok", "ANTHROPIC_BASE_URL": "http://x"}
+    argv = _argv(
+        tmp_path,
+        dispatch_id="crimson-otter-basalt",
+        egress_socket=sock,
+        env=env,
+    )
+    label_token = f"--label={DISPATCH_ID_LABEL_KEY}=crimson-otter-basalt"
+    egress_token = f"--volume={sock}:/run/egress.sock:rw"
+    env_token_1 = "--env=ANTHROPIC_API_KEY=tok"
+    env_token_2 = "--env=ANTHROPIC_BASE_URL=http://x"
+
+    assert label_token in argv
+    assert egress_token in argv
+    assert env_token_1 in argv
+    assert env_token_2 in argv
+
+    assert argv.index(label_token) < argv.index(egress_token) < argv.index(env_token_1)
+    assert argv.index(env_token_1) < argv.index(env_token_2)
+
+    # label still immediately precedes the first --volume= token, even
+    # with egress_socket/env also present.
+    network_index = next(i for i, a in enumerate(argv) if a.startswith("--network="))
+    assert argv[network_index + 1] == label_token
+    first_volume_index = next(i for i, a in enumerate(argv) if a.startswith("--volume="))
+    assert first_volume_index == network_index + 2
+
+
+# --------------------------------------------------------------------------
+# Bead .34 Part C: PodmanContainerReaper, fake run_fn (no real podman).
+# Cases 9-19.
+# --------------------------------------------------------------------------
+
+
+class _FakeCompletedProcess:
+    """Minimal CompletedProcess-like stand-in — duck-typed, only the
+    attributes PodmanContainerReaper actually reads."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _ScriptedRunFn:
+    """Deterministic fake `run_fn`: returns scripted results in call order,
+    records every argv it was called with."""
+
+    def __init__(self, results: list[_FakeCompletedProcess]):
+        self._results = list(results)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> _FakeCompletedProcess:
+        self.calls.append(argv)
+        return self._results[len(self.calls) - 1]
+
+
+def test_list_running_returns_sorted_deduplicated_ids():
+    # Case 9
+    stdout = json.dumps(
+        [
+            {"Labels": {DISPATCH_ID_LABEL_KEY: "zeta-1"}},
+            {"Labels": {DISPATCH_ID_LABEL_KEY: "alpha-2"}},
+        ]
+    )
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout=stdout)])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    result = reaper.list_running()
+    assert result == ["alpha-2", "zeta-1"]
+
+
+def test_list_running_empty_array_returns_empty_list():
+    # Case 10
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout="[]")])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    assert reaper.list_running() == []
+
+
+def test_list_running_skips_entries_missing_labels_or_dispatch_id():
+    # Case 11: one entry missing Labels entirely, one with Labels={} (no
+    # dispatch_id key) -- both skipped, no raise; any other valid entry in
+    # the same batch is still returned.
+    stdout = json.dumps(
+        [
+            {"Id": "no-labels-key"},
+            {"Id": "empty-labels", "Labels": {}},
+            {"Id": "valid", "Labels": {DISPATCH_ID_LABEL_KEY: "still-here"}},
+        ]
+    )
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout=stdout)])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    assert reaper.list_running() == ["still-here"]
+
+
+def test_list_running_nonzero_returncode_raises():
+    # Case 12
+    run_fn = _ScriptedRunFn(
+        [_FakeCompletedProcess(returncode=1, stdout="", stderr="boom")]
+    )
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    with pytest.raises(ContainerError):
+        reaper.list_running()
+
+
+def test_list_running_unparseable_json_raises():
+    # Case 13
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout="not json")])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    with pytest.raises(ContainerError):
+        reaper.list_running()
+
+
+def test_list_running_exact_argv():
+    # Case 14: freeze the exact argv passed to run_fn.
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout="[]")])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    reaper.list_running()
+    assert run_fn.calls == [
+        ["podman", "ps", "--filter", f"label={DISPATCH_ID_LABEL_KEY}", "--format", "json"]
+    ]
+
+
+def test_reap_zero_ids_is_silent_noop_single_call():
+    # Case 15: lookup returns zero ids -> run_fn called exactly once (the
+    # lookup), no second call, no exception.
+    run_fn = _ScriptedRunFn([_FakeCompletedProcess(returncode=0, stdout="")])
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    reaper.reap("disp-none")
+    assert len(run_fn.calls) == 1
+    assert run_fn.calls[0] == [
+        "podman",
+        "ps",
+        "-a",
+        "-q",
+        "--filter",
+        f"label={DISPATCH_ID_LABEL_KEY}=disp-none",
+    ]
+
+
+def test_reap_one_id_completes_and_calls_rm_in_order():
+    # Case 16
+    run_fn = _ScriptedRunFn(
+        [
+            _FakeCompletedProcess(returncode=0, stdout="abc123\n"),
+            _FakeCompletedProcess(returncode=0, stdout=""),
+        ]
+    )
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    reaper.reap("disp-1")
+    assert run_fn.calls == [
+        [
+            "podman",
+            "ps",
+            "-a",
+            "-q",
+            "--filter",
+            f"label={DISPATCH_ID_LABEL_KEY}=disp-1",
+        ],
+        ["podman", "rm", "-f", "--ignore", "abc123"],
+    ]
+
+
+def test_reap_two_ids_single_rm_call_with_both_ids_in_order():
+    # Case 17: defensive multi-match -- the single rm call includes both
+    # ids, in lookup-returned order.
+    run_fn = _ScriptedRunFn(
+        [
+            _FakeCompletedProcess(returncode=0, stdout="id-one\nid-two\n"),
+            _FakeCompletedProcess(returncode=0, stdout=""),
+        ]
+    )
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    reaper.reap("disp-multi")
+    assert run_fn.calls[1] == ["podman", "rm", "-f", "--ignore", "id-one", "id-two"]
+
+
+def test_reap_lookup_nonzero_returncode_raises_rm_never_called():
+    # Case 18
+    run_fn = _ScriptedRunFn(
+        [_FakeCompletedProcess(returncode=1, stdout="", stderr="lookup failed")]
+    )
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    with pytest.raises(ContainerError):
+        reaper.reap("disp-bad-lookup")
+    assert len(run_fn.calls) == 1
+
+
+def test_reap_rm_nonzero_returncode_raises():
+    # Case 19
+    run_fn = _ScriptedRunFn(
+        [
+            _FakeCompletedProcess(returncode=0, stdout="abc123\n"),
+            _FakeCompletedProcess(returncode=1, stdout="", stderr="rm failed"),
+        ]
+    )
+    reaper = PodmanContainerReaper(run_fn=run_fn)
+    with pytest.raises(ContainerError):
+        reaper.reap("disp-bad-rm")
+
+
+# --------------------------------------------------------------------------
+# Bead .34 live tests: real PodmanContainerReaper against real podman.
+# Cases 20-21.
+# --------------------------------------------------------------------------
+
+
+def _run_detached_live(profile, command, dispatch_id, timeout=30):
+    """Launch a real, detached (backgrounded) worker container carrying
+    ``dispatch_id``'s label, using the SAME frozen build_run_argv() the
+    reaper's label convention depends on. build_run_argv's argv is frozen
+    (no --detach token can be added to it), so a launch-only COPY is built
+    here with --detach inserted right after "run" -- the reaper itself
+    only ever sees the real, unmodified label token this produces."""
+    base_argv = build_run_argv(profile, command=command, dispatch_id=dispatch_id)
+    launch_argv = [*base_argv[:2], "--detach", *base_argv[2:]]
+    return subprocess.run(
+        launch_argv,
+        env={**worker_env()},
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@requires_podman
+def test_live_reaper_lists_and_reaps_a_real_container(tmp_path, pinned_live_image):
+    # Case 20: spawn one real, long-running container carrying a fixed
+    # test dispatch_id; confirm a real PodmanContainerReaper().list_running()
+    # (default run_fn, real podman) includes it; reap() it; confirm a
+    # follow-up list_running() no longer shows it.
+    dispatch_id = f"bead34-livetest-{uuid.uuid4().hex[:12]}"
+    profile = _profile(tmp_path, image=pinned_live_image, timeout_seconds=120)
+    reaper = PodmanContainerReaper()
+    try:
+        launch = _run_detached_live(profile, ["sleep", "30"], dispatch_id)
+        assert launch.returncode == 0, launch.stderr
+
+        running = reaper.list_running()
+        assert dispatch_id in running
+
+        reaper.reap(dispatch_id)
+
+        running_after = reaper.list_running()
+        assert dispatch_id not in running_after
+    finally:
+        # Defensive host cleanup: never leave a live container behind even
+        # if an assertion above failed mid-test.
+        reaper.reap(dispatch_id)
+
+
+@requires_podman
+def test_live_reap_second_call_on_already_removed_id_is_noop(tmp_path, pinned_live_image):
+    # Case 21: live idempotence -- calling reap() a second time on an
+    # already-removed dispatch_id does NOT raise (silent no-op, the same
+    # code path as the fake-run_fn case 15, now proven against real
+    # podman). Written as its own independent, self-contained test (own
+    # freshly spawned+reaped container) rather than chaining off case 20's
+    # leftover state, so it does not depend on pytest's execution order —
+    # see sub-report for this deliberate deviation from the spec's literal
+    # "reuse case 20's id" phrasing.
+    dispatch_id = f"bead34-livetest-{uuid.uuid4().hex[:12]}"
+    profile = _profile(tmp_path, image=pinned_live_image, timeout_seconds=120)
+    reaper = PodmanContainerReaper()
+    try:
+        launch = _run_detached_live(profile, ["sleep", "30"], dispatch_id)
+        assert launch.returncode == 0, launch.stderr
+
+        assert dispatch_id in reaper.list_running()
+
+        reaper.reap(dispatch_id)
+        assert dispatch_id not in reaper.list_running()
+
+        # Second reap on the now-already-removed id: silent no-op, no raise.
+        reaper.reap(dispatch_id)
+        assert dispatch_id not in reaper.list_running()
+    finally:
+        reaper.reap(dispatch_id)

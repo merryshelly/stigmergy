@@ -18,7 +18,11 @@ the mechanical enforcement of the containment contract:
   get emitted. Bead .13's optional `env` mapping is the only way env vars
   ever reach the worker — one `--env=KEY=VALUE` token per entry, sorted by
   key, appended right before the image ref; `env=None` (default) leaves the
-  argv byte-identical to before.
+  argv byte-identical to before. Bead .34's optional `dispatch_id` tags the
+  container with the `DISPATCH_ID_LABEL_KEY` label (SPEC §9 crash recovery)
+  — one `--label=stigmergy.dispatch_id=<value>` token, inserted immediately
+  after `--network=...` and before the first `--volume=...`; `dispatch_id=
+  None` (default) leaves the argv byte-identical to before.
 - :func:`worker_env` returns the environment rootless podman needs to talk
   to the user's systemd/dbus instance so cgroup v2 limits are actually
   enforced (else podman silently falls back to cgroupfs and the limits in
@@ -30,6 +34,13 @@ the mechanical enforcement of the containment contract:
   the Containerfile *before* any `podman build` runs (so the reject path
   needs no podman at all), then a no-secret build, returning the built
   image's resolved digest.
+- :class:`PodmanContainerReaper` (bead .34, SPEC §9 crash recovery) is the
+  real `stigmergy.recover.ContainerReaper` implementation: `list_running()`
+  maps every running, `DISPATCH_ID_LABEL_KEY`-labeled container back to its
+  `dispatch_id` via `podman ps --filter label=... --format json`; `reap()`
+  looks up (any state, `-a`) then removes every matching container in one
+  `podman rm -f --ignore ...` call — idempotent, silent no-op when nothing
+  matches.
 
 **Supply-chain rule (SPEC §3/§4):** :class:`ContainerProfile.image` and every
 `FROM` base in a built Containerfile must be digest-pinned (`@sha256:...`).
@@ -38,14 +49,22 @@ A `:tag` reference is rejected — tags are mutable, digests are not.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 _DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}")
+
+# Bead .34 (SPEC §4 worker containment, §9 crash recovery): the label key a
+# running worker container is tagged with so a real `ContainerReaper`
+# (`PodmanContainerReaper`, below) can map a running podman container back
+# to the `dispatch_id` that spawned it. `recover.py`'s `ContainerReaper`
+# Protocol has no real implementation without this convention.
+DISPATCH_ID_LABEL_KEY = "stigmergy.dispatch_id"
 
 
 class ContainerError(Exception):
@@ -103,12 +122,34 @@ def _require_valid_env_keys(env: Mapping[str, str]) -> None:
             )
 
 
+def _require_valid_dispatch_id(dispatch_id: str | None) -> None:
+    """Raise :class:`ContainerError` if ``dispatch_id`` is not ``None`` and
+    is invalid (bead .34 build spec §Part A) — cheap defense against a
+    malformed value producing a garbled `--label=` flag or smuggling an
+    extra token into it. Checked BEFORE any argv token is appended, so a
+    rejected call never leaks a partial argv list. Names which specific
+    constraint failed in the raised message."""
+    if dispatch_id is None:
+        return
+    if not dispatch_id:
+        raise ContainerError("dispatch_id is invalid — must not be empty")
+    if "=" in dispatch_id:
+        raise ContainerError(f"dispatch_id {dispatch_id!r} is invalid — must not contain '='")
+    if any(ch.isspace() for ch in dispatch_id):
+        raise ContainerError(
+            f"dispatch_id {dispatch_id!r} is invalid — must not contain whitespace"
+        )
+    if "," in dispatch_id:
+        raise ContainerError(f"dispatch_id {dispatch_id!r} is invalid — must not contain ','")
+
+
 def build_run_argv(
     profile: ContainerProfile,
     *,
     command: list[str],
     egress_socket: str | Path | None = None,
     env: Mapping[str, str] | None = None,
+    dispatch_id: str | None = None,
 ) -> list[str]:
     """Render ``profile`` into an exact `podman run` argv (SPEC §4).
 
@@ -142,10 +183,27 @@ def build_run_argv(
     Left at its default ``None``, the returned argv is byte-identical to
     the pre-.13 argv (regression guard, exactly the discipline
     ``egress_socket=None`` already gets).
+
+    ``dispatch_id`` (bead .34 build spec, Part A) tags the container so a
+    real :class:`ContainerReaper` (:class:`PodmanContainerReaper`, this
+    module) can map a running podman container back to the dispatch that
+    spawned it (SPEC §9 crash recovery). When given, exactly one more argv
+    token is emitted — ``f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}"``
+    — inserted immediately after the `--network=...` token and immediately
+    before the first `--volume=...` token (frozen position — every other
+    additive token, `egress_socket`'s volume and `env`'s `--env=` tokens,
+    stays in its own already-documented slot, unaffected). ``dispatch_id``
+    is validated (non-empty, no `=`, no whitespace, no `,`) — see
+    :func:`_require_valid_dispatch_id` — raising :class:`ContainerError`
+    before any token is appended. Left at its default ``None``, the
+    returned argv is byte-identical to the pre-.34 argv (regression guard,
+    exactly the discipline ``egress_socket=None``/``env=None`` already
+    get).
     """
     _require_pinned(profile.image)
     if env is not None:
         _require_valid_env_keys(env)
+    _require_valid_dispatch_id(dispatch_id)
 
     work = str(Path(profile.work_clone).resolve())
     task = str(Path(profile.task_pack).resolve())
@@ -162,10 +220,12 @@ def build_run_argv(
         f"--cpus={profile.cpus}",
         f"--timeout={profile.timeout_seconds}",
         f"--network={profile.network}",
-        f"--volume={work}:/work:rw",
-        f"--volume={task}:/task:ro",
-        f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev",
     ]
+    if dispatch_id is not None:
+        argv.append(f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}")
+    argv.append(f"--volume={work}:/work:rw")
+    argv.append(f"--volume={task}:/task:ro")
+    argv.append(f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev")
     if egress_socket is not None:
         argv.append(f"--volume={egress_socket}:/run/egress.sock:rw")
     if env is not None:
@@ -192,6 +252,121 @@ def worker_env() -> dict[str, str]:
     env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
     env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
     return env
+
+
+def _default_podman_run_fn(argv: list[str]) -> subprocess.CompletedProcess:
+    """The real subprocess seam for :class:`PodmanContainerReaper`: one
+    `subprocess.run` call using :func:`worker_env` (bead .34 build spec,
+    Part C) — the same rootless cgroup-delegation environment every other
+    podman invocation in this module requires. Never raises on a nonzero
+    exit (`check=False`) — callers inspect `.returncode` themselves."""
+    return subprocess.run(  # noqa: S603
+        argv,
+        env=worker_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class PodmanContainerReaper:
+    """Real `stigmergy.recover.ContainerReaper` implementation (SPEC §9
+    crash recovery; bead .34 build spec, Part C). Protocol duck-typed, not
+    inherited — mirrors `recover.py`'s own injection-seam discipline.
+
+    Maps a running/lingering podman container back to the `dispatch_id` it
+    was spawned for via the :data:`DISPATCH_ID_LABEL_KEY` label that
+    :func:`build_run_argv` (bead .34, Part A) now stamps onto every
+    dispatch's container. Every subprocess call goes through an injected
+    ``run_fn`` seam (default: :func:`_default_podman_run_fn`) so tests
+    never shell out to real podman except in the explicitly-marked
+    `@requires_podman` live test.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_fn: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+    ) -> None:
+        self._run_fn = run_fn if run_fn is not None else _default_podman_run_fn
+
+    def list_running(self) -> list[str]:
+        """Return the `dispatch_id`s of every currently-RUNNING (never
+        `-a`) worker container — matches the `ContainerReaper` Protocol's
+        "currently-running" contract exactly.
+
+        Raises :class:`ContainerError` if the `podman ps` call itself
+        fails (nonzero return code) or its `stdout` is not parseable JSON.
+        An empty result (`[]`) is not an error. Any entry missing/malformed
+        `Labels`/the dispatch-id label is skipped defensively (should not
+        happen given the filter) rather than raised on. Returns the
+        sorted, deduplicated list.
+        """
+        result = self._run_fn(
+            ["podman", "ps", "--filter", f"label={DISPATCH_ID_LABEL_KEY}", "--format", "json"]
+        )
+        if result.returncode != 0:
+            raise ContainerError(
+                f"podman ps (list_running) failed with exit {result.returncode}: {result.stderr}"
+            )
+        try:
+            entries = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ContainerError(
+                f"podman ps (list_running) returned unparseable JSON: {exc}"
+            ) from exc
+
+        dispatch_ids: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            labels = entry.get("Labels", {})
+            if not isinstance(labels, dict):
+                continue
+            value = labels.get(DISPATCH_ID_LABEL_KEY)
+            if isinstance(value, str) and value:
+                dispatch_ids.add(value)
+        return sorted(dispatch_ids)
+
+    def reap(self, dispatch_id: str) -> None:
+        """Kill and remove every container (ANY state — `created`,
+        `paused`, `stopping`, `running` — a non-running container is still
+        a double-dispatch risk) tagged with ``dispatch_id``.
+
+        Step 1 (lookup): zero matches is a silent no-op — idempotent,
+        `run_fn` is invoked exactly once, `rm` is never called. Raises
+        :class:`ContainerError` if the lookup call itself fails.
+
+        Step 2 (only if step 1 found >=1 id): removes ALL matched ids in
+        ONE `podman rm -f --ignore ...` invocation (in lookup-returned
+        order) — `--ignore` makes a benign `--rm`-flag auto-removal race
+        between the lookup and this call exit 0 rather than a fatal error.
+        Raises :class:`ContainerError` if this call fails.
+        """
+        lookup = self._run_fn(
+            [
+                "podman",
+                "ps",
+                "-a",
+                "-q",
+                "--filter",
+                f"label={DISPATCH_ID_LABEL_KEY}={dispatch_id}",
+            ]
+        )
+        if lookup.returncode != 0:
+            raise ContainerError(
+                f"podman ps (reap lookup) failed with exit {lookup.returncode}: {lookup.stderr}"
+            )
+
+        ids = [line for line in lookup.stdout.splitlines() if line.strip()]
+        if not ids:
+            return
+
+        removal = self._run_fn(["podman", "rm", "-f", "--ignore", *ids])
+        if removal.returncode != 0:
+            raise ContainerError(
+                f"podman rm (reap) failed with exit {removal.returncode}: {removal.stderr}"
+            )
 
 
 _FROM_RE = re.compile(r"^\s*FROM\s+(.+)$", re.IGNORECASE)

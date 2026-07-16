@@ -549,6 +549,27 @@ def test_spawn_argv_never_contains_capability_token_in_prompt_position(tmp_path)
 
 
 # ==========================================================================
+# Bead .34 build spec: build_run_argv(dispatch_id=...) threaded through
+# spawn(). Case 8 (frozen case list, Part B).
+# ==========================================================================
+
+
+def test_spawn_argv_contains_dispatch_id_label_from_capability(tmp_path):
+    # spawn()'s build_run_argv(...) call gains dispatch_id=capability.
+    # dispatch_id -- the captured argv contains --label=stigmergy.
+    # dispatch_id=<capability.dispatch_id> with the SAME value as the
+    # Capability passed into spawn().
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    cap = _capability(dispatch_id="disp-bead34-xyz")
+    runner = CapturingRunOne(stdout=_success_json())
+    spawn(pack, work, _model_cfg(), cap, _budgets(), run_one=runner)
+
+    argv, _env, _timeout = runner.calls[0]
+    assert f"--label=stigmergy.dispatch_id={cap.dispatch_id}" in argv
+
+
+# ==========================================================================
 # Bundle creation (bead .13 build spec §0.6, AC6 git-metadata isolation).
 # Cases 27-31.
 # ==========================================================================

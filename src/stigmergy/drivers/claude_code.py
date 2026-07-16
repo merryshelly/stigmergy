@@ -442,7 +442,11 @@ def spawn(
     # ContainerError here (unpinned image) propagates uncaught — see
     # docstring above.
     argv = build_run_argv(
-        profile, command=command, egress_socket=model_cfg.egress_socket, env=cred_env
+        profile,
+        command=command,
+        egress_socket=model_cfg.egress_socket,
+        env=cred_env,
+        dispatch_id=capability.dispatch_id,
     )
 
     executor: RunOne = run_one if run_one is not None else _default_run_one
