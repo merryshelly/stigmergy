@@ -4,7 +4,12 @@ Human triage approval signs a **content hash over the ticket's inputs**,
 split into two groups with deliberately different mutability rules:
 
 - **STEERING fields** (human-signed judgment inputs): ticket text, checks,
-  rubric, lane, prompt bytes, context set. Any mutation of a steering
+  rubric, target scope, lane, prompt bytes, context set. (``target_scope``
+  was ratified 2026-07-16 as a 7th signed field beyond the original six:
+  a post-approval change to a worker's declared file scope now forces
+  re-approval. ``steering.derive_steering`` is the single authoritative
+  producer of this dict, used identically at approval time and at the
+  live eligibility re-check.) Any mutation of a steering
   field atomically invalidates approval — the ticket leaves the eligible
   pool until a human re-approves it. This is the mechanism, not a policy
   the loop could talk itself out of: the stored `approval_hash` is over
