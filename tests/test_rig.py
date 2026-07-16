@@ -19,9 +19,11 @@ from pathlib import Path
 import pytest
 
 from stigmergy import __version__
-from stigmergy.charter import CharterError, load_charter
+from stigmergy.charter import Charter, CharterError, load_charter
 from stigmergy.cli import main
-from stigmergy.rig import RigError, RigStore, create_rig
+from stigmergy.daemon import _REQUIRED_RIG_PATH_KEYS
+from stigmergy.registry import Registry, UnbudgetableError
+from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VALID_CHARTER_PATH = FIXTURES / "charter_valid.toml"
@@ -365,3 +367,308 @@ def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
         assert {"tickets", "ticket_deps", "rig_meta", "worker_names"} <= tables
     finally:
         conn.close()
+
+
+# ==========================================================================
+# resolve_rig / ResolvedRig  (bead .27 build spec §1, frozen case list §4
+# cases 1-12) — the read-side inverse of create_rig.
+#
+# Fail-closed / error-path cases scaffold a rig dir directly (no git clone):
+# resolve_rig never validates repo-ness, so the four artifacts it gates on
+# (rig_root dir + charter.toml + models.toml + tickets.db) are all it needs.
+# The happy-path / prompts-readback cases go through the REAL create_rig
+# (real local git clone) so repo/prompts/{code01,critic01} actually exist.
+# ==========================================================================
+
+
+def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> Path:
+    """Like make_local_repo, but the working tree carries a versioned
+    ``prompts/`` dir with ``code01``/``critic01`` template files — so a rig
+    cloned from it has readable prompt artifacts under ``repo/prompts/``
+    (build spec §1.1: prompts_dir resolves relative to repo_root)."""
+    repo_dir = tmp_path / name
+    (repo_dir / "prompts").mkdir(parents=True)
+    (repo_dir / "prompts" / "code01").write_text("code01 template: $goal\n")
+    (repo_dir / "prompts" / "critic01").write_text("critic01 template\n")
+    (repo_dir / "README.md").write_text("hello from the fixture repo\n")
+    env_cfg = ["-c", "user.email=test@example.com", "-c", "user.name=Test User"]
+    subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+    subprocess.run(["git", *env_cfg, "-C", str(repo_dir), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", *env_cfg, "-C", str(repo_dir), "commit", "-q", "-m", "initial commit"],
+        check=True,
+    )
+    return repo_dir
+
+
+def _write_scaffold(
+    rig_root: Path,
+    *,
+    charter_content: str = BASE_CHARTER_TOML,
+    models: bool = True,
+    db: bool = True,
+) -> None:
+    """Create a rig directory on disk WITHOUT create_rig's git clone — just
+    the artifacts resolve_rig gates on. ``models``/``db`` toggle whether the
+    corresponding artifact is written (for the missing-artifact cases)."""
+    rig_root.mkdir(parents=True, exist_ok=True)
+    (rig_root / "charter.toml").write_text(charter_content)
+    if models:
+        shutil.copy(MODELS_REGISTRY_PATH, rig_root / "models.toml")
+    if db:
+        RigStore.create(rig_root / "tickets.db").close()
+
+
+# --- case 1: happy path -----------------------------------------------------
+
+
+def test_resolve_rig_happy_path(tmp_path: Path) -> None:
+    repo = make_local_repo_with_prompts(tmp_path)
+    charter_path = make_charter(tmp_path, repo)
+    rigs_root = tmp_path / "rigs"
+    create_rig(charter_path, base_dir=rigs_root)
+
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+    try:
+        assert isinstance(resolved, ResolvedRig)
+        assert resolved.rig_root == rigs_root / "shipyard"
+        assert isinstance(resolved.charter, Charter)
+        assert isinstance(resolved.registry, Registry)
+        assert isinstance(resolved.store, RigStore)
+
+        # rig_paths carries EXACTLY the 5 daemon-required keys.
+        assert set(resolved.rig_paths) == set(_REQUIRED_RIG_PATH_KEYS)
+        rig_root = rigs_root / "shipyard"
+        assert resolved.rig_paths["context_root"] == rig_root / "context"
+        assert resolved.rig_paths["repo_root"] == rig_root / "repo"
+        assert resolved.rig_paths["clones_root"] == rig_root / "clones"
+        assert resolved.rig_paths["records_dir"] == rig_root / "records"
+        # prompts_dir resolves relative to repo_root (§1.1), NOT rig_root.
+        assert resolved.rig_paths["prompts_dir"] == rig_root / "repo" / "prompts"
+
+        # Prove the artifacts are readable THROUGH the resolved path, not just
+        # that the path string matches.
+        prompts_dir = resolved.rig_paths["prompts_dir"]
+        assert (prompts_dir / "code01").read_text().startswith("code01")
+        assert (prompts_dir / "critic01").read_text().startswith("critic01")
+    finally:
+        resolved.store.close()
+
+
+# --- case 2: ~/rigs default -------------------------------------------------
+
+
+def test_resolve_rig_defaults_to_home_rigs(tmp_path: Path, monkeypatch) -> None:
+    """rigs_root omitted -> resolves <~/rigs>/<name>, the SAME base create_rig
+    itself defaults to. Both are Path('~/rigs').expanduser(), driven by $HOME."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = make_local_repo_with_prompts(tmp_path)
+    charter_path = make_charter(tmp_path, repo)
+    create_rig(charter_path)  # default base_dir -> ~/rigs == tmp_path/rigs
+
+    resolved = resolve_rig("shipyard")  # default rigs_root -> ~/rigs
+    try:
+        assert resolved.rig_root == tmp_path / "rigs" / "shipyard"
+    finally:
+        resolved.store.close()
+
+
+# --- case 3: rig_root missing ----------------------------------------------
+
+
+def test_resolve_rig_missing_rig_root_raises(tmp_path: Path) -> None:
+    with pytest.raises(RigError) as exc:
+        resolve_rig("ghost", rigs_root=tmp_path)
+    msg = str(exc.value)
+    assert "ghost" in msg
+    assert str(tmp_path / "ghost") in msg
+
+
+# --- case 4: charter missing (+ multi-missing message) ----------------------
+
+
+def test_resolve_rig_missing_charter_raises(tmp_path: Path) -> None:
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root)
+    (rig_root / "charter.toml").unlink()
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    assert "charter" in str(exc.value).lower()
+
+
+def test_resolve_rig_lists_all_missing_artifacts(tmp_path: Path) -> None:
+    """§4 case 4 (second half): BOTH charter.toml AND tickets.db missing — the
+    single error names BOTH, not just the first checked."""
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    rig_root.mkdir(parents=True)
+    shutil.copy(MODELS_REGISTRY_PATH, rig_root / "models.toml")  # only models present
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    msg = str(exc.value).lower()
+    assert "charter" in msg
+    assert "ticket" in msg  # names the ticket store too, not just charter
+
+
+# --- case 5: models.toml missing --------------------------------------------
+
+
+def test_resolve_rig_missing_models_raises(tmp_path: Path) -> None:
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, models=False)
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    assert "model" in str(exc.value).lower()
+
+
+# --- case 6: tickets.db missing ---------------------------------------------
+
+
+def test_resolve_rig_missing_ticket_db_raises(tmp_path: Path) -> None:
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, db=False)
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    assert "ticket" in str(exc.value).lower()
+
+
+# --- case 7: invalid charter -> CharterError propagates UNCAUGHT ------------
+
+
+def test_resolve_rig_invalid_charter_propagates_charter_error(tmp_path: Path) -> None:
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, charter_content=mutate("workers = 1", "workers = 2"))
+
+    # NOT wrapped in RigError — a chartering bug surfaces as CharterError.
+    with pytest.raises(CharterError):
+        resolve_rig("shipyard", rigs_root=rigs_root)
+
+
+# --- case 8: invalid registry -> fails closed -------------------------------
+# DEVIATION from .27 build spec §1 step 2 (documented): the spec predicted
+# UnbudgetableError here, but resolve_rig's step-1 load_charter ALREADY loads
+# + validates the registry named by the charter's [models].registry and wraps
+# any UnbudgetableError as CharterError. So when the charter-referenced
+# registry is the broken one, CharterError escapes and resolve_rig's own
+# step-2 load_registry is never reached. Fail-closed either way (both types
+# are in _cmd_daemon_run's except tuple). Case 8b below pins the one scenario
+# where the explicit load_registry's UnbudgetableError genuinely escapes.
+
+
+def test_resolve_rig_invalid_charter_registry_propagates_charter_error(tmp_path: Path) -> None:
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, models=False)
+    # Valid TOML, but a model missing required fields. This IS the file the
+    # charter's [models].registry names ("models.toml"), so load_charter fails.
+    (rig_root / "models.toml").write_text('[brokenmodel]\nprovider = "anthropic"\n')
+
+    with pytest.raises(CharterError):
+        resolve_rig("shipyard", rigs_root=rigs_root)
+
+
+def test_resolve_rig_broken_rig_local_registry_propagates_unbudgetable_error(
+    tmp_path: Path,
+) -> None:
+    """Defense-in-depth edge (case 8b): resolve_rig's step-2 load_registry
+    loads rig_root/models.toml DIRECTLY, whereas load_charter loads the
+    charter's [models].registry path. If a (hand-edited) charter points its
+    registry at a DIFFERENT, valid file but the rig-local models.toml is
+    broken, the explicit load_registry's UnbudgetableError genuinely escapes
+    uncaught — this is why UnbudgetableError stays in _cmd_daemon_run's catch."""
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    content = BASE_CHARTER_TOML.replace(
+        'registry = "models.toml"', 'registry = "good_registry.toml"'
+    )
+    _write_scaffold(rig_root, charter_content=content, models=False)
+    shutil.copy(MODELS_REGISTRY_PATH, rig_root / "good_registry.toml")  # load_charter OK
+    # The rig-local models.toml (what resolve_rig loads directly) is broken.
+    (rig_root / "models.toml").write_text('[brokenmodel]\nprovider = "anthropic"\n')
+
+    with pytest.raises(UnbudgetableError):
+        resolve_rig("shipyard", rigs_root=rigs_root)
+
+
+# --- case 9: charter has no [prompts] table ---------------------------------
+
+
+def test_resolve_rig_no_prompts_table_raises(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML.replace('[prompts]\ndir = "prompts/"\n', "")
+    assert "[prompts]" not in content
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, charter_content=content)
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    assert "prompts" in str(exc.value).lower()
+
+
+# --- case 10: [prompts] present but dir empty -------------------------------
+
+
+def test_resolve_rig_empty_prompts_dir_raises(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML.replace('dir = "prompts/"', 'dir = ""')
+    rigs_root = tmp_path / "rigs"
+    rig_root = rigs_root / "shipyard"
+    _write_scaffold(rig_root, charter_content=content)
+
+    with pytest.raises(RigError) as exc:
+        resolve_rig("shipyard", rigs_root=rigs_root)
+    assert "prompts" in str(exc.value).lower()
+
+
+# --- case 11: store returned OPEN + usable ----------------------------------
+
+
+def test_resolve_rig_returns_open_usable_store(tmp_path: Path) -> None:
+    repo = make_local_repo_with_prompts(tmp_path)
+    charter_path = make_charter(tmp_path, repo)
+    rigs_root = tmp_path / "rigs"
+    create_rig(charter_path, base_dir=rigs_root)
+
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+    try:
+        # Not .create()'d and not closed — a live connection.
+        resolved.store.add_ticket(id="t-1", title="live")
+        got = resolved.store.get_ticket("t-1")
+        assert got is not None
+        assert got["id"] == "t-1"
+    finally:
+        resolved.store.close()
+
+
+# --- case 12: side-effect free across repeated resolves ---------------------
+
+
+def test_resolve_rig_is_side_effect_free_across_calls(tmp_path: Path) -> None:
+    repo = make_local_repo_with_prompts(tmp_path)
+    charter_path = make_charter(tmp_path, repo)
+    rigs_root = tmp_path / "rigs"
+    create_rig(charter_path, base_dir=rigs_root)
+
+    first = resolve_rig("shipyard", rigs_root=rigs_root)
+    try:
+        first.store.add_ticket(id="t-1", title="seed")
+        before = sorted(t["id"] for t in first.store.list_tickets())
+    finally:
+        first.store.close()
+
+    # A second resolve must not add/remove/mutate ticket rows — it only opens
+    # the store (compare list_tickets across the second call).
+    second = resolve_rig("shipyard", rigs_root=rigs_root)
+    try:
+        after = sorted(t["id"] for t in second.store.list_tickets())
+    finally:
+        second.store.close()
+
+    assert before == after == ["t-1"]

@@ -28,11 +28,13 @@ import shutil
 import sqlite3
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from stigmergy import __version__
 from stigmergy.charter import Charter, CharterError, load_charter
+from stigmergy.registry import Registry, load_registry
 
 # --- schema (SPEC.md §3 rig definition, §6 ticket work-order contract) -------
 
@@ -434,3 +436,132 @@ def _clone_repo(repo: str, dest: Path) -> None:
         raise RigError(
             f"git clone of {repo!r} failed (exit {result.returncode}): {result.stderr.strip()}"
         )
+
+
+# --- resolve: read-side inverse of create_rig -------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedRig:
+    """Everything needed to construct a real `Daemon` for an already-scaffolded rig.
+
+    Lifecycle contract: `store` is opened (NOT `.create()`'d) and returned OPEN. A
+    long-lived caller (daemon run_forever) owns it for the process lifetime and never
+    closes it. A SHORT-LIVED caller (bead .33's status/tickets/range-report subcommands)
+    MUST call `store.close()` itself when done — `resolve_rig` does not know the
+    caller's lifetime and never closes what it opens.
+    """
+
+    rig_root: Path
+    charter: Charter
+    registry: Registry
+    store: RigStore
+    rig_paths: dict[str, Path]  # exactly daemon._REQUIRED_RIG_PATH_KEYS' 5 keys
+
+
+def resolve_rig(name: str, *, rigs_root: str | os.PathLike[str] | None = None) -> ResolvedRig:
+    """Load an ALREADY-SCAFFOLDED rig by name (SPEC §3; the read-side inverse of
+    `create_rig`). `rigs_root` defaults to `~/rigs` (mirrors `create_rig`'s own
+    `base_dir` default) — a caller-supplied value is used verbatim (Path(...).expanduser()).
+
+    Rig root is `<rigs_root>/<name>`.
+
+    Fail-closed existence checks BEFORE opening anything (mirrors create_rig's own
+    error-handling weight class — does not schema-validate the sqlite file, that
+    duplicates what create_rig already guarantees):
+    - `rig_root` itself must exist and be a directory -> RigError
+    - `rig_root/charter.toml` must exist -> RigError
+    - `rig_root/models.toml` must exist -> RigError
+    - `rig_root/tickets.db` must exist -> RigError
+    Lists ALL missing expected paths in ONE RigError message if more than one is
+    missing (does not fail on the first check only — a caller fixing a
+    half-scaffolded rig wants the whole picture at once).
+
+    Then, in order:
+    1. `charter = load_charter(rig_root / "charter.toml")` — env defaults to
+       `os.environ` (real process env, NOT `{}` — this is production code, unlike
+       test fixtures). `CharterError` propagates UNCAUGHT (a chartering bug, not a
+       resolve_rig bug — mirrors create_rig's own uncaught-CharterError precedent).
+       NOTE: `load_charter` ALSO loads + validates the model registry named by
+       the charter's `[models].registry` (to resolve lane/critic models) and
+       wraps any `UnbudgetableError` from it as `CharterError`. So for the
+       common scaffolded rig (where `[models].registry == "models.toml"`), a
+       broken registry surfaces HERE as `CharterError`, and step 2 below is
+       never reached — a documented deviation from the .27 build spec's
+       original prediction of `UnbudgetableError`. Fail-closed either way.
+    2. `registry = load_registry(rig_root / "models.toml")` — loads the
+       rig-local registry to populate `ResolvedRig.registry` (the `Charter`
+       object does not expose the registry step 1 loaded). `UnbudgetableError`
+       propagates uncaught. This is only distinct from step 1 when a
+       hand-edited charter points `[models].registry` at some OTHER (valid)
+       file while `rig_root/models.toml` is broken — a genuine, if narrow,
+       defense-in-depth path (see tests case 8b).
+    3. `prompts_rel = charter.raw.get("prompts", {}).get("dir")` — if this is falsy
+       (missing `[prompts]` table, or missing/empty `dir` key), raises `RigError`
+       (fail closed: never silently pick a made-up prompts location).
+    4. `store = RigStore(rig_root / "tickets.db")` — plain open, not `.create()`.
+    5. Builds `rig_paths`:
+       - `context_root = rig_root / "context"`
+       - `repo_root    = rig_root / "repo"`
+       - `clones_root  = rig_root / "clones"`
+       - `records_dir  = rig_root / "records"`
+       - `prompts_dir  = repo_root / prompts_rel` (see §3.1 of the .27 build spec for
+         the reasoning — NOT `rig_root / prompts_rel`, and NOT relative to
+         `charter.toml`'s own directory: `create_rig` never copies `prompts/` into
+         `rig_root`, only the rig's OWN git clone of `[rig].repo` at `repo_root` can
+         be relied on to carry it, and only that path is hash-protected by the
+         already-built approval mechanism).
+
+    Returns `ResolvedRig(rig_root, charter, registry, store, rig_paths)`. Does **not**
+    validate `repo_root` is actually a git repository, or that any file under
+    `prompts_dir` exists — those are the caller's problem (mirrors `steering.py`'s own
+    `derive_steering`, which raises its own `SteeringError` lazily, on first read, not
+    up front; and mirrors `Daemon._git_rev_parse`'s own graceful-`None`-on-failure
+    design — validating git-repo-ness here would tax `.33`'s git-untouching
+    status/tickets/range-report commands for no benefit).
+    """
+    base = Path(rigs_root).expanduser() if rigs_root is not None else Path("~/rigs").expanduser()
+    rig_root = base / name
+
+    missing: list[str] = []
+    if not rig_root.is_dir():
+        missing.append(f"rig root directory: {rig_root}")
+    else:
+        if not (rig_root / "charter.toml").is_file():
+            missing.append(f"charter: {rig_root / 'charter.toml'}")
+        if not (rig_root / "models.toml").is_file():
+            missing.append(f"model registry: {rig_root / 'models.toml'}")
+        if not (rig_root / "tickets.db").is_file():
+            missing.append(f"ticket store: {rig_root / 'tickets.db'}")
+
+    if missing:
+        joined = "; ".join(missing)
+        raise RigError(f"rig {name!r} is not a valid scaffolded rig — missing: {joined}")
+
+    charter = load_charter(rig_root / "charter.toml")
+    registry = load_registry(rig_root / "models.toml")
+
+    prompts_rel = charter.raw.get("prompts", {}).get("dir")
+    if not prompts_rel:
+        raise RigError(
+            f"rig {name!r}'s charter has no [prompts].dir — cannot resolve a prompts directory"
+        )
+
+    store = RigStore(rig_root / "tickets.db")
+
+    repo_root = rig_root / "repo"
+    rig_paths: dict[str, Path] = {
+        "context_root": rig_root / "context",
+        "repo_root": repo_root,
+        "clones_root": rig_root / "clones",
+        "prompts_dir": repo_root / prompts_rel,
+        "records_dir": rig_root / "records",
+    }
+
+    return ResolvedRig(
+        rig_root=rig_root,
+        charter=charter,
+        registry=registry,
+        store=store,
+        rig_paths=rig_paths,
+    )
