@@ -56,6 +56,14 @@ $tier1_checks
 - Stay in scope. Change only what this ticket requires: a change outside the
   target scope is a defect even when it looks like an improvement. No
   refactoring, cleanup, or features beyond the ticket.
+- File what you discover. If you find work this ticket does not cover — a
+  defect elsewhere, something missing from the system, a material
+  improvement — record it as a proposed ticket in
+  /work/.stigmergy/filed-tickets.json (a JSON array of objects with keys
+  "title", "description", and optional "evidence" file/line pointers), then
+  return to your ticket. Do not fix it here and do not commit that file: the
+  harness collects it automatically, and a human triages every proposal
+  before it becomes work.
 - Solve the problem generally. Implement the real logic the acceptance
   criteria describe, correct for all valid inputs — never hard-code expected
   values or special-case the tests. Checks verify the solution; they are not
