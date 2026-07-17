@@ -79,6 +79,35 @@ CREATE TABLE worker_names (
 );
 """
 
+# `filed_tickets` DDL (D14, bead workspace-e2uh.38) — deliberately NOT part
+# of `_SCHEMA_SQL` (one home for this table's DDL, avoid drift). A filed
+# proposal lives here, NEVER in `tickets`: `intake.claim`/`intake.eligible`
+# read `tickets` only, so a row that only ever exists here is structurally
+# un-claimable — the load-bearing security property behind D14 (worker-
+# authored ticket text is an injection surface; keeping proposals out of
+# the live pool is physics, not a `WHERE approved=1` filter that can
+# regress). Run via `RigStore._ensure_filed_tickets_table` at the END of
+# `RigStore.__init__` so both fresh `.create()` rigs and pre-D14 rigs
+# reopened via plain `RigStore(path)`/`resolve_rig` self-heal.
+_FILED_TICKETS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS filed_tickets (
+  id                   TEXT PRIMARY KEY,
+  title                TEXT NOT NULL,
+  description          TEXT NOT NULL,
+  evidence             TEXT,
+  origin_role          TEXT NOT NULL,
+  origin_worker        TEXT,
+  origin_dispatch_id   TEXT,
+  origin_parent_ticket TEXT,
+  discovered_from      TEXT NOT NULL,
+  proposal_hash        TEXT NOT NULL,
+  created_at           REAL NOT NULL,
+  triaged              INTEGER NOT NULL DEFAULT 0,
+  triage_outcome       TEXT,
+  resulting_ticket_id  TEXT
+);
+"""
+
 # Columns settable through add_ticket() beyond the required id/title (which
 # have their own keyword-only parameters). created_at/updated_at are
 # stamped internally and are not caller-settable.
@@ -138,6 +167,19 @@ class RigStore:
         # free without an extra migration step.
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
+        self._ensure_filed_tickets_table()
+
+    def _ensure_filed_tickets_table(self) -> None:
+        """Self-healing migration (D14): create `filed_tickets` if absent.
+
+        `CREATE TABLE IF NOT EXISTS`, run unconditionally at the end of
+        every `__init__` — idempotent for fresh `.create()` rigs and the
+        only migration path for a rig scaffolded before D14 and reopened
+        via plain `RigStore(path)`/`resolve_rig` (which never run
+        `.create()`).
+        """
+        self._conn.executescript(_FILED_TICKETS_SCHEMA_SQL)
+        self._conn.commit()
 
     @classmethod
     def create(cls, db_path: str | os.PathLike[str]) -> RigStore:
@@ -290,6 +332,77 @@ class RigStore:
         row = self._conn.execute("SELECT value FROM rig_meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def add_filed_ticket(
+        self,
+        *,
+        id: str,
+        title: str,
+        description: str,
+        evidence: str | None = None,
+        origin_role: str,
+        origin_worker: str | None,
+        origin_dispatch_id: str | None,
+        origin_parent_ticket: str | None,
+        discovered_from: str,
+        proposal_hash: str,
+    ) -> None:
+        """Insert one UNAPPROVED filed-ticket proposal (D14, bead
+        workspace-e2uh.38). Stamps `created_at=time.time()`, `triaged=0`.
+
+        CRITICAL INVARIANT: this method NEVER inserts into `tickets` — a
+        filed proposal is structurally un-claimable (see the module-level
+        `_FILED_TICKETS_SCHEMA_SQL` docstring). Triage promotion into a
+        real `tickets` row is a separate, later capability (bead .42),
+        out of scope here.
+        """
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO filed_tickets ("
+            "  id, title, description, evidence, origin_role, origin_worker,"
+            "  origin_dispatch_id, origin_parent_ticket, discovered_from,"
+            "  proposal_hash, created_at, triaged"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+            (
+                id,
+                title,
+                description,
+                evidence,
+                origin_role,
+                origin_worker,
+                origin_dispatch_id,
+                origin_parent_ticket,
+                discovered_from,
+                proposal_hash,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    def list_filed_tickets(self, *, triaged: bool | None = None) -> list[dict[str, Any]]:
+        """List `filed_tickets` rows as dicts, ordered by `created_at`.
+
+        `triaged=False` -> only untriaged rows (`WHERE triaged = 0`);
+        `triaged=True` -> only triaged rows (`WHERE triaged = 1`);
+        `triaged=None` (default) -> all rows, no filter.
+        """
+        if triaged is None:
+            rows = self._conn.execute(
+                "SELECT * FROM filed_tickets ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM filed_tickets WHERE triaged = ? ORDER BY created_at",
+                (1 if triaged else 0,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_untriaged_filings(self) -> int:
+        """Count `filed_tickets` rows with `triaged = 0` (status.py D14 field)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM filed_tickets WHERE triaged = 0"
+        ).fetchone()
+        return int(row["n"])
+
     def close(self) -> None:
         """Checkpoint the WAL into the main file and close the connection.
 
@@ -393,7 +506,7 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
 
     store = RigStore.create(rig_root / "tickets.db")
     try:
-        store.set_meta("schema_version", "2")
+        store.set_meta("schema_version", "3")
         store.set_meta("stigmergy_version", __version__)
         store.set_meta("charter_hash", charter.resolved_hash)
         store.set_meta("rig_name", charter.raw["rig"]["name"])

@@ -68,7 +68,12 @@ DEFAULT_CHARTER: dict[str, Any] = {
     "loop": {
         "concurrency": {"workers": 1},
         "budgets": {"dispatches": 50, "usd": 25.0, "gate_calls": 30},
-        "dispatch_limits": {"output_tokens": 200000, "driver_turns": 100},
+        "dispatch_limits": {
+            "output_tokens": 200000,
+            "driver_turns": 100,
+            "filed_tickets": 5,
+            "filed_ticket_bytes": 16384,
+        },
         "retries": {"attempts_per_rung": 3, "integration_failures": 2, "flake_reruns": 2},
         "cadences": {"staging_quiescent_tickets": 3, "staging_max_wait_seconds": 7200},
         "timers": {
@@ -111,7 +116,12 @@ _KNOWN_LOOP_KEYS = {
 }
 _KNOWN_CONCURRENCY_KEYS = {"workers"}
 _KNOWN_BUDGETS_KEYS = {"dispatches", "usd", "gate_calls"}
-_KNOWN_DISPATCH_LIMITS_KEYS = {"output_tokens", "driver_turns"}
+_KNOWN_DISPATCH_LIMITS_KEYS = {
+    "output_tokens",
+    "driver_turns",
+    "filed_tickets",
+    "filed_ticket_bytes",
+}
 _KNOWN_RETRIES_KEYS = {"attempts_per_rung", "integration_failures", "flake_reruns"}
 _KNOWN_CADENCES_KEYS = {"staging_quiescent_tickets", "staging_max_wait_seconds"}
 # loop.timers is intentionally open-ended: any key is legal as long as it is

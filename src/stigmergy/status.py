@@ -46,6 +46,7 @@ class Status:
     escalated_unnotified: int
     disk_free_bytes: int
     disk_ok: bool
+    untriaged_filings: int
 
 
 def reconstruct_spend(
@@ -171,6 +172,8 @@ def gather_status(
     disk_free_bytes = shutil.disk_usage(disk_path).free
     disk_ok = True if min_disk_bytes is None else disk_free_bytes >= min_disk_bytes
 
+    untriaged_filings = store.count_untriaged_filings()
+
     return Status(
         state_counts=state_counts,
         last_verdicts=last_verdicts,
@@ -180,6 +183,7 @@ def gather_status(
         escalated_unnotified=escalated_unnotified,
         disk_free_bytes=disk_free_bytes,
         disk_ok=disk_ok,
+        untriaged_filings=untriaged_filings,
     )
 
 
@@ -223,6 +227,7 @@ def render_status(status: Status) -> str:
         f"  disk_free_bytes: {status.disk_free_bytes} "
         f"(disk_ok={'yes' if status.disk_ok else 'no'})"
     )
+    lines.append(f"  untriaged_filings: {status.untriaged_filings}")
 
     lines.append("")
     lines.append("=== last verdicts (newest first) ===")

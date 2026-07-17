@@ -333,3 +333,38 @@ def test_classify_diff_equal_is_safe() -> None:
     prev = _resolved()
     curr = _resolved()
     assert classify_diff(prev, curr) == "safe"
+
+
+# --- D14: dispatch_limits filing caps (bead workspace-e2uh.38, AC14 case 10)
+
+
+def test_dispatch_limits_filed_keys_load(tmp_path: Path) -> None:
+    content = mutate(
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n"
+        "filed_tickets = 7\nfiled_ticket_bytes = 4096\n",
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    dl = charter.raw["loop"]["dispatch_limits"]
+    assert dl["filed_tickets"] == 7
+    assert dl["filed_ticket_bytes"] == 4096
+
+
+def test_dispatch_limits_filed_keys_default_when_absent() -> None:
+    # the base fixture declares no filed_* keys -> in-code defaults fill them
+    # (deep-merge over DEFAULT_CHARTER).
+    charter = load_charter(VALID_CHARTER_PATH, env={})
+    dl = charter.raw["loop"]["dispatch_limits"]
+    assert dl["filed_tickets"] == 5
+    assert dl["filed_ticket_bytes"] == 16384
+
+
+def test_unknown_dispatch_limits_key_still_rejected(tmp_path: Path) -> None:
+    # regression guard on _validate_keys: adding the two known filing keys must
+    # NOT open the section to arbitrary keys.
+    content = mutate(
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\nbogus_limit = 1\n",
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})

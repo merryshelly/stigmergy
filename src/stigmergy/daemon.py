@@ -142,6 +142,7 @@ actually exercises it live.
 
 from __future__ import annotations
 
+import logging
 import secrets
 import shlex
 import subprocess
@@ -162,6 +163,7 @@ from stigmergy.dispatch import DispatchPlan, prepare_dispatch, select_lane
 from stigmergy.drivers import claude_code
 from stigmergy.drivers.claude_code import DispatchResult, DispatchStatus
 from stigmergy.egress import EgressHandle
+from stigmergy.filing import harvest_worker_filings
 from stigmergy.intake import LeaseError
 from stigmergy.notify import NotificationStore, NtfyNotifier
 from stigmergy.records import EventType, RecordPlane, make_event
@@ -188,6 +190,8 @@ from stigmergy.statemachine import (
     transition,
 )
 from stigmergy.weaver import Weaver, WeaveResult
+
+_logger = logging.getLogger(__name__)
 
 _ZERO_TOKENS: dict[str, int] = {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
 
@@ -589,6 +593,28 @@ class Daemon:
                 detail=result.detail,
             )
             self._record_plane.append(dispatch_event)
+
+            try:
+                limits = self._charter.raw["loop"]["dispatch_limits"]
+                harvest_worker_filings(
+                    plan.work_clone,
+                    store=self._store,
+                    record_plane=self._record_plane,
+                    ctx=ctx,
+                    attempt_kind=attempt_kind,
+                    max_filings=limits["filed_tickets"],
+                    max_bytes=limits["filed_ticket_bytes"],
+                )
+            except Exception:
+                # Defensive belt only: harvest_worker_filings is contracted
+                # to never raise (SPEC amendment A). A harvest failure must
+                # never be able to break the dispatch outcome path.
+                _logger.warning(
+                    "worker filing harvest failed for dispatch %s (ticket %s)",
+                    plan.dispatch_id,
+                    ticket_id,
+                    exc_info=True,
+                )
 
             infra_trip = self._handle_dispatch_outcome(ticket_id, plan, result, ctx, now=t_end)
         finally:

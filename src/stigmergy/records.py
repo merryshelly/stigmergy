@@ -29,7 +29,12 @@ types (`dispatch, check, gate, integration, disposition, notify`), but SPEC
 --critic` (the `rangecrit01` prompt), and §12 requires "amortized
 range/report spend" to be counted from events. The six-type prose list is a
 paraphrase, not the full schema; :class:`EventType` includes `REPORT` as a
-seventh member so range-report spend has an event to land in.
+seventh member so range-report spend has an event to land in. D14 (bead
+workspace-e2uh.38) adds an eighth member, `TICKET_FILED`, for the
+host-side worker/critic/range-critic ticket-filing harvest (see
+`filing.py`) — it is NOT an LLM-invocation event (the harvest is
+mechanism-only; the worker's cognition was already recorded on the
+DISPATCH event) so it carries no `prompt_artifact_hash`.
 """
 
 from __future__ import annotations
@@ -58,12 +63,14 @@ class RecordError(Exception):
 class EventType(enum.Enum):
     """Event-plane discriminant (SPEC.md §8).
 
-    Seven members. `dispatch`, `check`, `gate`, `integration`,
+    Eight members. `dispatch`, `check`, `gate`, `integration`,
     `disposition`, `notify` are SPEC §8's prose list; `report` is added
     per SPEC §4 (prompt-artifact invariant: "every LLM-invoked role... the
     prompt hash is logged in every event that invocation produces") and
     §12 (range/report spend must be counted from events) — see module
-    docstring for the full justification.
+    docstring for the full justification. `ticket-filed` (D14, bead
+    workspace-e2uh.38) is added for the host-side ticket-filing harvest
+    (see `filing.py`); it is mechanism-only, not an LLM invocation.
     """
 
     DISPATCH = "dispatch"
@@ -73,6 +80,7 @@ class EventType(enum.Enum):
     DISPOSITION = "disposition"
     NOTIFY = "notify"
     REPORT = "report"
+    TICKET_FILED = "ticket-filed"
 
 
 # LLM-invocation events (SPEC §4 prompt-artifact invariant): must carry the

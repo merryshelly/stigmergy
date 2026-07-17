@@ -1053,3 +1053,59 @@ def test_parked_tickets_processed_in_deterministic_order(tmp_path, store, plane)
     log = run_git(staging_repo, ["log", "refs/heads/staging", "--oneline"]).stdout
     assert results[0].landed_oid[:7] in log
     assert results[1].landed_oid[:7] in log
+
+
+# ==========================================================================
+# D14: a filings file COMMITTED into the worker bundle is stripped at weave
+# and flagged (belt-and-suspenders — the normal path is host-side harvest of
+# the UNCOMMITTED file; code01 tells the worker never to commit it).
+# bead workspace-e2uh.38, AC14 case 6.
+# ==========================================================================
+
+
+def test_committed_filed_tickets_is_stripped_and_flagged(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    pinned = rev_parse(staging_repo, "refs/heads/staging")
+    # a REAL change plus the stray filings file the worker wrongly committed.
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="t6",
+        files={
+            "feature.txt": "a real, legitimate change\n",
+            ".stigmergy/filed-tickets.json": '[{"title": "x", "description": "y"}]\n',
+        },
+    )
+    add_parked_ticket(store, "t6", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    results = weaver.weave(now=1000.0)
+
+    assert len(results) == 1
+    result = results[0]
+    # the legitimate change still lands ...
+    assert result.outcome == "landed"
+    assert store.get_ticket("t6")["state"] == LANDED
+    new_tip = rev_parse(staging_repo, "refs/heads/staging")
+    assert new_tip != pinned
+
+    # ... but the stray filings file NEVER reaches the landed commit ...
+    tree = run_git(
+        staging_repo, ["ls-tree", "-r", "--name-only", "refs/heads/staging"]
+    ).stdout
+    assert ".stigmergy/filed-tickets.json" not in tree
+    assert "feature.txt" in tree
+
+    # ... and the strip is surfaced for a human (flag + disposition marker).
+    assert result.flagged_for_human is True
+    dispositions = disposition_events(plane, "t6")
+    assert len(dispositions) == 1
+    assert dispositions[0]["disposition"] == "landed"
+    assert "filed-tickets-stripped" in (dispositions[0].get("reason") or "")

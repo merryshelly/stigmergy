@@ -335,7 +335,9 @@ class Weaver:
 
         candidate_dir = self._clone_candidate(pinned_oid)
         try:
-            applied, candidate_oid = self._apply_bundle(candidate_dir, ticket_row, pinned_oid)
+            applied, candidate_oid, stripped = self._apply_bundle(
+                candidate_dir, ticket_row, pinned_oid
+            )
             if not applied:
                 return self._die(
                     ticket_id=ticket_id,
@@ -372,7 +374,7 @@ class Weaver:
             )
 
             touched = self._protected_paths_touched(candidate_dir, pinned_oid, candidate_oid)
-            flagged = bool(touched)
+            flagged = bool(touched) or stripped
 
             checks = self._all_checks(ticket_row)
             check_results = self.run_checks_fn(
@@ -502,7 +504,7 @@ class Weaver:
             self._append_integration_event(
                 ctx, phase="land", pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
             )
-            reason = self._combine_reason(None, touched)
+            reason = self._combine_reason(None, touched, stripped=stripped)
             record_disposition(
                 self.record_plane,
                 ctx={**ctx, "ticket": ticket_id},
@@ -612,17 +614,27 @@ class Weaver:
         )
 
     @staticmethod
-    def _combine_reason(reason: str | None, touched: list[str] | None) -> str | None:
+    def _combine_reason(
+        reason: str | None, touched: list[str] | None, *, stripped: bool = False
+    ) -> str | None:
         """Blend the base disposition reason with the protection-asymmetry
         flag (SPEC §6) onto the SAME disposition event, rather than firing
         a second, premature `record_disposition` call before the ticket's
         final outcome is known (see class docstring / weaver design notes:
         this is a deliberate reading of an underspecified point in the
-        design doc)."""
-        if not touched:
-            return reason
-        flag = f"protected-path-touched:{','.join(sorted(touched))}"
-        return flag if reason is None else f"{reason};{flag}"
+        design doc). When `stripped` is True (D14, bead .38 AC14 case 6 —
+        a committed `.stigmergy/filed-tickets.json` was stripped from the
+        candidate at `_apply_bundle` time), also append the
+        `filed-tickets-stripped` marker, same semicolon-joined style as
+        the `protected-path-touched:` flag."""
+        combined = reason
+        if touched:
+            flag = f"protected-path-touched:{','.join(sorted(touched))}"
+            combined = flag if combined is None else f"{combined};{flag}"
+        if stripped:
+            marker = "filed-tickets-stripped"
+            combined = marker if combined is None else f"{combined};{marker}"
+        return combined
 
     # -- context / checks / rubric -------------------------------------------
 
@@ -737,17 +749,24 @@ class Weaver:
 
     def _apply_bundle(
         self, candidate_dir: Path, ticket_row: dict[str, Any], pinned_oid: str
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None, bool]:
         """Fetch ONLY :data:`_BUNDLE_REF` from the ticket's bundle and
         merge it onto the candidate (SPEC §10 AC6 case 9: any other ref
         the bundle carries — including a malicious `refs/heads/staging` —
         is never requested and never reaches any local ref). Returns
-        ``(applied, candidate_oid)``; ``applied is False`` covers a
-        missing bundle, a missing/unfetchable ref, a merge conflict, and a
-        would-be no-op merge (nothing new to integrate)."""
+        ``(applied, candidate_oid, stripped)``; ``applied is False`` covers
+        a missing bundle, a missing/unfetchable ref, a merge conflict, and
+        a would-be no-op merge (nothing new to integrate). ``stripped`` is
+        ``True`` when a stray, committed `.stigmergy/filed-tickets.json`
+        (D14, bead .38 AC14 case 6 — the worker is told never to commit
+        this file; the host-side harvest reads it uncommitted) was found
+        in the merged candidate tree and removed via an amend of the merge
+        commit itself, BEFORE `candidate_oid` is read — so the returned
+        oid already reflects the stripped tree and no second candidate
+        commit is ever created."""
         bundle_path = ticket_row.get("work_product")
         if not bundle_path:
-            return False, None
+            return False, None, False
 
         incoming_ref = f"{_INCOMING_REF_PREFIX}-bundle"
         fetch = self._git(
@@ -763,7 +782,7 @@ class Weaver:
             check=False,
         )
         if fetch.returncode != 0:
-            return False, None
+            return False, None, False
 
         merge = self._git(
             candidate_dir,
@@ -780,15 +799,33 @@ class Weaver:
         )
         if merge.returncode != 0:
             self._git(candidate_dir, ["merge", "--abort"], check=False)
-            return False, None
+            return False, None, False
+
+        # D14 (bead .38 AC14 case 6): a worker must never commit its
+        # filings file — the host-side harvest reads it uncommitted from
+        # the worktree. If one snuck into this merge anyway, strip it by
+        # AMENDING the merge commit itself (still exactly one candidate
+        # commit, same parents) BEFORE candidate_oid is read below, so
+        # every downstream consumer (journal/CAS/checks) sees the already-
+        # stripped tree.
+        stripped = False
+        stray_filings = candidate_dir / ".stigmergy" / "filed-tickets.json"
+        if stray_filings.exists():
+            self._git(candidate_dir, ["rm", "--quiet", ".stigmergy/filed-tickets.json"])
+            self._git(candidate_dir, ["commit", "--amend", "--no-edit", "--quiet"])
+            stripped = True
 
         candidate_oid = self._rev_parse(candidate_dir, _CANDIDATE_BRANCH)
         if candidate_oid == pinned_oid:
             # Nothing new was actually integrated -- treat as a conflict
             # rather than risk an ambiguous candidate_oid == pinned_oid
             # comparison later (in resolve()'s crash-recovery reconciliation).
-            return False, None
-        return True, candidate_oid
+            # This also covers a bundle whose ONLY change was the stray
+            # filings file just stripped above: once removed, there is
+            # nothing left to integrate, so it correctly falls into this
+            # same non-applying-conflict path.
+            return False, None, False
+        return True, candidate_oid, stripped
 
     def _protected_paths_touched(
         self, candidate_dir: Path, pinned_oid: str, candidate_oid: str

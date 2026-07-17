@@ -1177,3 +1177,74 @@ def test_case20_spend_exhaustion_blocks_claims_but_allows_final_weave(env: Env) 
     assert second.weave_ran is False  # nothing parked anymore
 
     assert spy_leash.final_weave_allowed_calls == 1
+
+
+# ==========================================================================
+# D14: worker ticket-filing harvest hook (bead workspace-e2uh.38, AC14 case 2
+# end-to-end + fail-closed isolation). The harvest runs host-side AFTER the
+# container is killed (i.e. after spawn_fn returns), reading the UNCOMMITTED
+# `/work/.stigmergy/filed-tickets.json` from the work_clone.
+# ==========================================================================
+
+
+class FilingSpawn:
+    """spawn_fn that writes an (uncommitted) filed-tickets.json into the
+    work_clone, as a real worker would, then returns DONE."""
+
+    def __init__(self, proposals: Any):
+        self._proposals = proposals
+        self.calls = 0
+
+    def __call__(self, task_pack, work_clone, model_cfg, capability, budgets):
+        import json
+
+        self.calls += 1
+        dest = Path(work_clone) / ".stigmergy" / "filed-tickets.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(self._proposals))
+        return make_result(DispatchStatus.DONE)
+
+
+class BadFilingSpawn:
+    """spawn_fn that writes a MALFORMED filings file then returns DONE."""
+
+    def __call__(self, task_pack, work_clone, model_cfg, capability, budgets):
+        dest = Path(work_clone) / ".stigmergy" / "filed-tickets.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("{ not valid json ]]")
+        return make_result(DispatchStatus.DONE)
+
+
+def test_worker_filings_harvested_host_side_after_dispatch(env: Env) -> None:
+    add_dispatchable_ticket(env, "t-1")
+    spawn_fn = FilingSpawn([{"title": "flaky test", "description": "test_x flakes 1/10"}])
+    daemon = make_daemon(env, spawn_fn=spawn_fn)
+
+    daemon.poll_once()
+
+    # harvested into filed_tickets: unapproved, un-claimable, worker origin.
+    assert env.store.count_untriaged_filings() == 1
+    filed = env.store.list_filed_tickets()[0]
+    assert filed["origin_role"] == "worker"
+    assert filed["origin_parent_ticket"] == "t-1"
+    assert env.store.get_ticket(filed["id"]) is None  # never a claimable ticket
+
+    # a ticket-filed event was emitted alongside the normal dispatch trail.
+    filed_ev = [e for e in env.record_plane.read_events() if e["event_type"] == "ticket-filed"]
+    assert len(filed_ev) == 1
+    assert filed_ev[0]["outcome"] == "accepted"
+    assert filed_ev[0]["origin"]["parent_ticket"] == "t-1"
+
+
+def test_harvest_failure_is_isolated_from_the_dispatch_outcome(env: Env) -> None:
+    """A malformed filings file must never corrupt or abort the dispatch: the
+    ticket still reaches its normal terminal state (PARKED) and nothing files
+    (fail-closed, isolated — build item 1)."""
+    add_dispatchable_ticket(env, "t-1")
+    daemon = make_daemon(env, spawn_fn=BadFilingSpawn())
+
+    summary = daemon.poll_once()
+
+    assert summary.dispatch_status == "done"
+    assert env.store.get_ticket("t-1")["state"] == PARKED
+    assert env.store.count_untriaged_filings() == 0

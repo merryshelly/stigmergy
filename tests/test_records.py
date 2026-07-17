@@ -412,3 +412,57 @@ def test_missing_common_field_rejected() -> None:
 def test_stat_mode_helper_uses_stat_module() -> None:
     # sanity import check to keep `stat` import used/meaningful in this file
     assert stat.S_IMODE(0o600) == 0o600
+
+
+# --- D14: ticket-filed event (bead workspace-e2uh.38) -----------------------
+
+
+def test_ticket_filed_event_type_exists() -> None:
+    assert EventType.TICKET_FILED.value == "ticket-filed"
+
+
+def _filed_fields(**overrides: Any) -> dict[str, Any]:
+    """ticket-filed common fields with honest zeros for the cost fields."""
+    base = common_fields(
+        computed_usd=0.0,
+        tokens={"in": 0, "cached": 0, "out": 0, "reasoning": 0},
+        wall_time_seconds=0.0,
+    )
+    base.update(
+        origin={
+            "role": "worker",
+            "worker": base["worker"],
+            "dispatch_id": base["dispatch_id"],
+            "parent_ticket": base["ticket"],
+        },
+        proposal_hash="proposalhashabc",
+        outcome="accepted",
+        reason=None,
+        filed_ticket_id="filed-dispatch-0001-1",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_ticket_filed_event_validates_and_roundtrips(plane: RecordPlane) -> None:
+    ev = make_event(EventType.TICKET_FILED, **_filed_fields())
+    plane.append(ev)
+    read = plane.read_events()
+    assert len(read) == 1
+    assert read[0]["event_type"] == "ticket-filed"
+    assert read[0]["outcome"] == "accepted"
+    assert read[0]["origin"]["role"] == "worker"
+
+
+def test_ticket_filed_is_not_an_llm_invocation_no_prompt_hash_required() -> None:
+    # unlike dispatch/gate/report, ticket-filed carries no prompt_artifact_hash.
+    fields = _filed_fields()
+    assert "prompt_artifact_hash" not in fields
+    make_event(EventType.TICKET_FILED, **fields)  # must NOT raise
+
+
+def test_ticket_filed_still_requires_common_fields() -> None:
+    fields = _filed_fields()
+    del fields["computed_usd"]
+    with pytest.raises(RecordError):
+        make_event(EventType.TICKET_FILED, **fields)

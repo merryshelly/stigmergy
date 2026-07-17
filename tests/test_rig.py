@@ -146,7 +146,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
 
     store = RigStore(rig_root / "tickets.db")
     try:
-        assert store.get_meta("schema_version") == "2"
+        assert store.get_meta("schema_version") == "3"
         assert store.get_meta("stigmergy_version") == __version__
         charter_hash = store.get_meta("charter_hash")
         assert charter_hash
@@ -359,12 +359,12 @@ def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute("SELECT value FROM rig_meta WHERE key = 'schema_version'").fetchall()
-        assert rows == [("2",)]
+        assert rows == [("3",)]
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        assert {"tickets", "ticket_deps", "rig_meta", "worker_names"} <= tables
+        assert {"tickets", "ticket_deps", "rig_meta", "worker_names", "filed_tickets"} <= tables
     finally:
         conn.close()
 
@@ -672,3 +672,120 @@ def test_resolve_rig_is_side_effect_free_across_calls(tmp_path: Path) -> None:
         second.store.close()
 
     assert before == after == ["t-1"]
+
+
+# ==========================================================================
+# filed_tickets store + migration (D14; bead workspace-e2uh.38)
+#
+# The `filed_tickets` table is DELIBERATELY separate from `tickets`: a filed
+# proposal is never a claimable row (structural un-claimability). Migration
+# is a `CREATE TABLE IF NOT EXISTS` run on every RigStore open, so a rig
+# scaffolded before D14 self-heals when reopened by D14 code.
+# ==========================================================================
+
+
+def test_add_and_read_filed_ticket_roundtrip(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_filed_ticket(
+            id="filed-d1-1",
+            title="Flaky test",
+            description="fails 1/10",
+            evidence="tests/x.py:1",
+            origin_role="worker",
+            origin_worker="worker-1",
+            origin_dispatch_id="d1",
+            origin_parent_ticket="workspace-e2uh.8",
+            discovered_from="d1@workspace-e2uh.8",
+            proposal_hash="abc123",
+        )
+        rows = store.list_filed_tickets()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["id"] == "filed-d1-1"
+        assert r["title"] == "Flaky test"
+        assert r["description"] == "fails 1/10"
+        assert r["evidence"] == "tests/x.py:1"
+        assert r["origin_role"] == "worker"
+        assert r["origin_worker"] == "worker-1"
+        assert r["origin_dispatch_id"] == "d1"
+        assert r["origin_parent_ticket"] == "workspace-e2uh.8"
+        assert r["discovered_from"] == "d1@workspace-e2uh.8"
+        assert r["proposal_hash"] == "abc123"
+        assert r["triaged"] == 0
+        assert r["triage_outcome"] is None
+        assert r["resulting_ticket_id"] is None
+        assert r["created_at"] > 0
+    finally:
+        store.close()
+
+
+def test_add_filed_ticket_evidence_optional(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_filed_ticket(
+            id="filed-d1-1",
+            title="t",
+            description="d",
+            origin_role="critic",
+            origin_worker="c-1",
+            origin_dispatch_id="d1",
+            origin_parent_ticket="p",
+            discovered_from="d1@p",
+            proposal_hash="h",
+        )
+        assert store.list_filed_tickets()[0]["evidence"] is None
+    finally:
+        store.close()
+
+
+def test_count_untriaged_and_triaged_filter(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        for n in (1, 2, 3):
+            store.add_filed_ticket(
+                id=f"filed-d1-{n}",
+                title=f"t{n}",
+                description="d",
+                origin_role="worker",
+                origin_worker="w",
+                origin_dispatch_id="d1",
+                origin_parent_ticket="p",
+                discovered_from="d1@p",
+                proposal_hash=f"h{n}",
+            )
+        assert store.count_untriaged_filings() == 3
+        assert len(store.list_filed_tickets(triaged=False)) == 3
+        assert store.list_filed_tickets(triaged=True) == []
+        assert len(store.list_filed_tickets()) == 3  # no filter -> all
+    finally:
+        store.close()
+
+
+def test_filed_tickets_table_absent_from_pre_d14_rig_is_migrated_on_open(tmp_path: Path) -> None:
+    """A rig store created, then its filed_tickets table dropped (simulating a
+    pre-D14 scaffold), gains the table again on the NEXT plain open — the
+    migration is idempotent and self-healing."""
+    db_path = tmp_path / "tickets.db"
+    store = RigStore.create(db_path)
+    store._conn.execute("DROP TABLE filed_tickets")
+    store._conn.commit()
+    store.close()
+
+    reopened = RigStore(db_path)  # plain open (mirrors resolve_rig)
+    try:
+        # table exists again and is usable.
+        reopened.add_filed_ticket(
+            id="filed-d1-1",
+            title="t",
+            description="d",
+            origin_role="worker",
+            origin_worker="w",
+            origin_dispatch_id="d1",
+            origin_parent_ticket="p",
+            discovered_from="d1@p",
+            proposal_hash="h",
+        )
+        assert reopened.count_untriaged_filings() == 1
+    finally:
+        reopened.close()

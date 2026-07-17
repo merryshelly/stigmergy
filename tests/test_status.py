@@ -406,3 +406,50 @@ def test_render_ticket_list_and_detail(store: RigStore) -> None:
     missing = render_ticket_detail(store, "no-such-ticket-id")
     assert "no such ticket" in missing
     assert "no-such-ticket-id" in missing
+
+
+# --- D14: untriaged filing count (bead workspace-e2uh.38, AC14 case 8) ------
+
+
+def test_untriaged_filings_count_in_status_and_render(store, plane, notification_store) -> None:
+    from stigmergy.status import render_status
+
+    for n in (1, 2):
+        store.add_filed_ticket(
+            id=f"filed-d1-{n}",
+            title=f"t{n}",
+            description="d",
+            origin_role="worker",
+            origin_worker="w",
+            origin_dispatch_id="d1",
+            origin_parent_ticket="p",
+            discovered_from="d1@p",
+            proposal_hash=f"h{n}",
+        )
+
+    status = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=CHARTER_RESOLVED,
+        disk_path=str(store.db_path.parent),
+        now=1000.0,
+    )
+    assert status.untriaged_filings == 2
+
+    text = render_status(status)
+    assert "untriaged_filings" in text
+    # value is text-labelled (deuteranopia: never colour-only).
+    assert "untriaged_filings: 2" in text
+
+
+def test_untriaged_filings_zero_when_none_filed(store, plane, notification_store) -> None:
+    status = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=CHARTER_RESOLVED,
+        disk_path=str(store.db_path.parent),
+        now=1000.0,
+    )
+    assert status.untriaged_filings == 0
