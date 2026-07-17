@@ -109,6 +109,15 @@ def derive_steering(
       blank).
     - ``context_set``: ``ticket_row.get("required_reading")`` as-is,
       ``None`` -> ``[]``.
+    - ``functional_summary``: ``ticket_row.get("functional_summary")`` as-is,
+      ``None``/missing -> ``""`` (mirrors ``goal``). The 8th signed steering
+      field (SPEC §6 item 10 / D15, bead `.42`): the operator-facing summary
+      the human judges at triage. Being a steering field, it is covered by the
+      approval hash automatically — a post-approval edit forces re-approval.
+
+    **Frozen 8-field contract** (bead `.42` extends `.35`'s original 7):
+    ``ticket_text, checks, rubric, target_scope, functional_summary, lane,
+    prompt_bytes, context_set``.
 
     Pure function: no I/O beyond the one prompt-template read, no
     timestamps, no unstable-ordering containers (everything returned is
@@ -134,6 +143,13 @@ def derive_steering(
     if context_set is None:
         context_set = []
 
+    # 8th steering field (SPEC §6 item 10 / D15, bead .42): the plain-language,
+    # operator-facing statement the human actually judges at triage. Fail closed
+    # to "" (mirrors `goal`); it is a STEERING field, so it flows into the
+    # approval hash automatically (approve() hashes whatever this returns) —
+    # mutating it post-approval de-eligibilizes the ticket.
+    functional_summary = ticket_row.get("functional_summary") or ""
+
     # Plain, no-override, hint-only resolution — reads only
     # ticket_row["lane_hint"]; never ticket_row["current_rung"]. Let
     # DispatchError propagate uncaught.
@@ -153,6 +169,7 @@ def derive_steering(
         "checks": checks,
         "rubric": rubric,
         "target_scope": target_scope,
+        "functional_summary": functional_summary,
         "lane": lane_selection.name,
         "prompt_bytes": prompt_bytes,
         "context_set": context_set,

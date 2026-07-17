@@ -35,6 +35,13 @@ host-side worker/critic/range-critic ticket-filing harvest (see
 `filing.py`) — it is NOT an LLM-invocation event (the harvest is
 mechanism-only; the worker's cognition was already recorded on the
 DISPATCH event) so it carries no `prompt_artifact_hash`.
+
+Bead `.42` (D1/D15) adds three more — `APPROVAL`, `UNAPPROVAL`,
+`TRIAGE_REJECTED` — the human triage attribution events (acting agent +
+operator session, agent-asserted in v0). They are the ONE-log audit line
+D1 locates in the event plane, and are **exempt from the dispatch-shaped
+common-field set** (human acts, not dispatches): they validate against
+`_REQUIRED_TRIAGE_FIELDS` only. Eleven members total.
 """
 
 from __future__ import annotations
@@ -63,7 +70,7 @@ class RecordError(Exception):
 class EventType(enum.Enum):
     """Event-plane discriminant (SPEC.md §8).
 
-    Eight members. `dispatch`, `check`, `gate`, `integration`,
+    Eleven members. `dispatch`, `check`, `gate`, `integration`,
     `disposition`, `notify` are SPEC §8's prose list; `report` is added
     per SPEC §4 (prompt-artifact invariant: "every LLM-invoked role... the
     prompt hash is logged in every event that invocation produces") and
@@ -71,6 +78,9 @@ class EventType(enum.Enum):
     docstring for the full justification. `ticket-filed` (D14, bead
     workspace-e2uh.38) is added for the host-side ticket-filing harvest
     (see `filing.py`); it is mechanism-only, not an LLM invocation.
+    `approval`/`unapproval`/`triage-rejected` (bead .42, D1/D15) are the
+    human triage attribution events — exempt from the dispatch-shaped
+    common-field set (see `_REQUIRED_TRIAGE_FIELDS` and `_validate_payload`).
     """
 
     DISPATCH = "dispatch"
@@ -81,6 +91,17 @@ class EventType(enum.Enum):
     NOTIFY = "notify"
     REPORT = "report"
     TICKET_FILED = "ticket-filed"
+    # Triage attribution events (bead .42, D1/D15): human triage acts executed
+    # by an agent at the operator's direction. They are NOT dispatch-adjacent —
+    # no worker, model, dispatch, tokens, or cost — so they are EXEMPT from the
+    # dispatch-shaped common-field set and validate against their own required
+    # set (see `_REQUIRED_TRIAGE_FIELDS`). This deliberately loosens "every
+    # event carries the full common-field set" (§8 prose, written when every
+    # event was dispatch-adjacent), the same way `.38` documented TICKET_FILED's
+    # own exemptions.
+    APPROVAL = "approval"
+    UNAPPROVAL = "unapproval"
+    TRIAGE_REJECTED = "triage-rejected"
 
 
 # LLM-invocation events (SPEC §4 prompt-artifact invariant): must carry the
@@ -88,6 +109,10 @@ class EventType(enum.Enum):
 _LLM_INVOCATION_TYPES = frozenset({EventType.DISPATCH, EventType.GATE, EventType.REPORT})
 
 # SPEC.md §9 "Retry semantics" attempt_kind enumeration — the exhaustive set.
+# `report` (bead .42): a `range-report --critic` REPORT event is rig-level, not
+# a ticket attempt; `initial` would be a recorded lie in an audit log, so a
+# dedicated honest value is used. SPEC §9's enumeration gains this member — a
+# tracked follow-up note for SB's next review (see bead42-build-spec.md).
 ATTEMPT_KINDS: frozenset[str] = frozenset(
     {
         "initial",
@@ -97,6 +122,7 @@ ATTEMPT_KINDS: frozenset[str] = frozenset(
         "infra-retry",
         "stepup-initial",
         "clean-restart",
+        "report",
     }
 )
 
@@ -122,6 +148,21 @@ _REQUIRED_COMMON_FIELDS: tuple[str, ...] = (
 )
 
 _TOKEN_KEYS: tuple[str, ...] = ("in", "cached", "out", "reasoning")
+
+# Triage attribution events (bead .42): the human-triage acts are EXEMPT from
+# `_REQUIRED_COMMON_FIELDS` (no dispatch/worker/model/tokens/cost) and validate
+# against this set instead. Each must be a non-empty str — a forgeable-by-
+# omission audit line (D1's agent-asserted attribution) is not acceptable.
+_TRIAGE_EVENT_TYPES = frozenset(
+    {EventType.APPROVAL, EventType.UNAPPROVAL, EventType.TRIAGE_REJECTED}
+)
+_REQUIRED_TRIAGE_FIELDS: tuple[str, ...] = (
+    "rig",
+    "subject_id",
+    "outcome",
+    "acting_agent",
+    "operator_session",
+)
 
 
 @dataclass(frozen=True)
@@ -181,6 +222,15 @@ def _validate_payload(payload: dict[str, Any]) -> None:
     if "ts" not in payload or not isinstance(payload["ts"], int | float):
         raise RecordError("event missing required numeric field 'ts'")
 
+    # Triage attribution events (bead .42) validate against their own required
+    # set and are EXEMPT from the dispatch-shaped common fields / LLM / gate
+    # branches below (they are human acts, not dispatches — no worker, model,
+    # tokens, or cost). Documented deviation from §8's "every event carries the
+    # full common-field set" prose (see the EventType docstring).
+    if event_type in _TRIAGE_EVENT_TYPES:
+        _validate_triage_payload(payload)
+        return
+
     missing = [f for f in _REQUIRED_COMMON_FIELDS if f not in payload]
     if missing:
         raise RecordError(f"event missing required common field(s): {missing}")
@@ -221,6 +271,21 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         decoding_params = payload.get("decoding_params")
         if not isinstance(decoding_params, dict) or not decoding_params:
             raise RecordError("gate event missing required 'decoding_params'")
+
+
+def _validate_triage_payload(payload: dict[str, Any]) -> None:
+    """Validate a triage attribution event (APPROVAL/UNAPPROVAL/TRIAGE_REJECTED,
+    bead .42). Only the five required attribution strings are enforced — no
+    dispatch-shaped common fields. `approval_hash`/`reason` are optional extras
+    (no validation beyond whatever the caller supplied)."""
+    for field in _REQUIRED_TRIAGE_FIELDS:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RecordError(
+                f"triage event field {field!r} must be a non-empty string "
+                f"(got {value!r}) — the v0 audit line (D1) must not be forgeable "
+                "by omission"
+            )
 
 
 def _validate_tokens(tokens: Any) -> None:

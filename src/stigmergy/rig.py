@@ -46,6 +46,7 @@ CREATE TABLE tickets (
   required_reading     TEXT,
   target_scope         TEXT,
   work_product         TEXT,
+  functional_summary   TEXT,
   acceptance_criteria  TEXT,
   tier1_checks         TEXT,
   difficulty           TEXT,
@@ -116,6 +117,7 @@ _TICKET_OPTIONAL_FIELDS = {
     "required_reading",
     "target_scope",
     "work_product",
+    "functional_summary",
     "acceptance_criteria",
     "tier1_checks",
     "difficulty",
@@ -168,6 +170,33 @@ class RigStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._ensure_filed_tickets_table()
+        self._ensure_functional_summary_column()
+
+    def _ensure_functional_summary_column(self) -> None:
+        """Self-healing migration (bead .42): add the `functional_summary`
+        column to `tickets` if absent (SPEC §6 item 10 / D15 — the 8th
+        steering field).
+
+        A guarded `ALTER TABLE ... ADD COLUMN`, run unconditionally at the end
+        of every `__init__`: idempotent for fresh `.create()` rigs (the column
+        is already in `_SCHEMA_SQL`) and the only migration path for a rig
+        scaffolded before `.42` (schema_version < 4) reopened via plain
+        `RigStore(path)`/`resolve_rig`. Mirrors `_ensure_filed_tickets_table`'s
+        self-heal pattern (a new column can't use `CREATE ... IF NOT EXISTS`,
+        so the presence check is a `PRAGMA table_info` scan).
+        """
+        table_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
+        ).fetchone()
+        if table_exists is None:
+            # Fresh store: `.create()` runs `__init__` BEFORE `_SCHEMA_SQL`
+            # builds `tickets`, and that DDL already carries the column — the
+            # ALTER would only ever fire here on a real pre-.42 rig reopen.
+            return
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
+        if "functional_summary" not in cols:
+            self._conn.execute("ALTER TABLE tickets ADD COLUMN functional_summary TEXT")
+            self._conn.commit()
 
     def _ensure_filed_tickets_table(self) -> None:
         """Self-healing migration (D14): create `filed_tickets` if absent.
@@ -189,6 +218,31 @@ class RigStore:
         store._conn.commit()
         return store
 
+    @staticmethod
+    def _encode_ticket_fields(fields: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Shared column-allowlist + JSON-encode helper for ticket field dicts.
+
+        Validates every key in ``fields`` against `_TICKET_OPTIONAL_FIELDS`
+        (raises :class:`ValueError` listing any unknown field), then
+        JSON-encodes the list/dict-valued fields (`_JSON_TICKET_FIELDS`).
+        Returns parallel ``(columns, values)`` lists suitable for splicing
+        into an INSERT/UPDATE. Reused by :meth:`add_ticket` and
+        :meth:`promote_filed_ticket` so the column/JSON rules live in
+        exactly one place (bead .42 DRY requirement).
+        """
+        unknown = set(fields) - _TICKET_OPTIONAL_FIELDS
+        if unknown:
+            raise ValueError(f"unknown ticket field(s): {sorted(unknown)}")
+
+        columns: list[str] = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if key in _JSON_TICKET_FIELDS and value is not None:
+                value = json.dumps(value)
+            columns.append(key)
+            values.append(value)
+        return columns, values
+
     def add_ticket(self, *, id: str, title: str, **fields: Any) -> None:
         """Insert a work-order ticket (SPEC.md §6).
 
@@ -198,18 +252,12 @@ class RigStore:
         JSON-encoded transparently — callers pass Python values, not raw
         JSON strings. ``created_at``/``updated_at`` are stamped here.
         """
-        unknown = set(fields) - _TICKET_OPTIONAL_FIELDS
-        if unknown:
-            raise ValueError(f"unknown ticket field(s): {sorted(unknown)}")
-
         now = time.time()
         columns = ["id", "title", "created_at", "updated_at"]
         values: list[Any] = [id, title, now, now]
-        for key, value in fields.items():
-            if key in _JSON_TICKET_FIELDS and value is not None:
-                value = json.dumps(value)
-            columns.append(key)
-            values.append(value)
+        extra_columns, extra_values = self._encode_ticket_fields(fields)
+        columns.extend(extra_columns)
+        values.extend(extra_values)
 
         col_sql = ", ".join(columns)
         placeholders = ", ".join("?" for _ in columns)
@@ -403,6 +451,111 @@ class RigStore:
         ).fetchone()
         return int(row["n"])
 
+    def mark_filed_ticket_triaged(
+        self, filed_id: str, *, outcome: str, resulting_ticket_id: str | None = None
+    ) -> None:
+        """Mark a filed proposal triaged (bead .42, SPEC §6 item 10 minors).
+
+        Sets ``triaged=1``, ``triage_outcome=outcome``,
+        ``resulting_ticket_id=resulting_ticket_id`` on the `filed_tickets`
+        row identified by ``filed_id``. The reject/tombstone path uses
+        ``outcome='rejected'`` with no ``resulting_ticket_id``; the promote
+        path (`promote_filed_ticket`) uses ``outcome='promoted'`` with the
+        new ticket id. NEVER deletes the row — filed proposals are
+        append-only history. Raises :class:`ValueError` if ``filed_id`` is
+        absent, or if it is already triaged (``triaged == 1``) — a filed
+        row can only be triaged once.
+        """
+        row = self._conn.execute(
+            "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no such filed ticket: {filed_id!r}")
+        if row["triaged"]:
+            raise ValueError(f"filed ticket already triaged: {filed_id!r}")
+
+        self._conn.execute(
+            "UPDATE filed_tickets SET triaged = 1, triage_outcome = ?, "
+            "resulting_ticket_id = ? WHERE id = ?",
+            (outcome, resulting_ticket_id, filed_id),
+        )
+        self._conn.commit()
+
+    def promote_filed_ticket(
+        self, *, filed_id: str, ticket_id: str, title: str, **ticket_fields: Any
+    ) -> None:
+        """Complete a filed proposal into a real, UNAPPROVED ticket (bead
+        .42, SPEC §6 item 10 / D2 / D15).
+
+        ATOMIC: a single transaction inserts the new `tickets` row (``id=
+        ticket_id``, ``title``, ``**ticket_fields``, ``approved`` forced to
+        0) AND updates the `filed_tickets` row (``triaged=1``,
+        ``triage_outcome='promoted'``, ``resulting_ticket_id=ticket_id``).
+        Reuses `_encode_ticket_fields` (same column allowlist + JSON
+        encoding as `add_ticket` — no duplicated rules).
+
+        Promotion and approval are distinct acts (D2): the ticket ALWAYS
+        lands unapproved, so ``approved``/``approval_hash`` are rejected
+        outright if present in ``ticket_fields``.
+
+        Raises :class:`ValueError` (nothing is written in any of these
+        cases):
+        - ``approved`` or ``approval_hash`` present in ``ticket_fields``;
+        - ``filed_id`` is absent or already triaged;
+        - ``ticket_id`` already exists in `tickets`;
+        - an unknown ticket field is passed.
+
+        On any failure, `self._conn.rollback()` is called so the filed row
+        is left untriaged — a failed promotion (e.g. a duplicate ticket id)
+        never half-tombstones the filed proposal.
+        """
+        forbidden = {"approved", "approval_hash"} & set(ticket_fields)
+        if forbidden:
+            raise ValueError(
+                f"promote_filed_ticket forbids caller-supplied field(s): {sorted(forbidden)} "
+                "— a promoted ticket always lands UNAPPROVED"
+            )
+
+        try:
+            row = self._conn.execute(
+                "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such filed ticket: {filed_id!r}")
+            if row["triaged"]:
+                raise ValueError(f"filed ticket already triaged: {filed_id!r}")
+
+            existing = self._conn.execute(
+                "SELECT 1 FROM tickets WHERE id = ?", (ticket_id,)
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"ticket id already exists: {ticket_id!r}")
+
+            now = time.time()
+            columns = ["id", "title", "created_at", "updated_at", "approved"]
+            values: list[Any] = [ticket_id, title, now, now, 0]
+            extra_columns, extra_values = self._encode_ticket_fields(ticket_fields)
+            columns.extend(extra_columns)
+            values.extend(extra_values)
+
+            col_sql = ", ".join(columns)
+            placeholders = ", ".join("?" for _ in columns)
+            self._conn.execute(
+                f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+                values,
+            )
+
+            self._conn.execute(
+                "UPDATE filed_tickets SET triaged = 1, triage_outcome = 'promoted', "
+                "resulting_ticket_id = ? WHERE id = ?",
+                (ticket_id, filed_id),
+            )
+        except Exception:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+
     def close(self) -> None:
         """Checkpoint the WAL into the main file and close the connection.
 
@@ -506,7 +659,7 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
 
     store = RigStore.create(rig_root / "tickets.db")
     try:
-        store.set_meta("schema_version", "3")
+        store.set_meta("schema_version", "4")
         store.set_meta("stigmergy_version", __version__)
         store.set_meta("charter_hash", charter.resolved_hash)
         store.set_meta("rig_name", charter.raw["rig"]["name"])

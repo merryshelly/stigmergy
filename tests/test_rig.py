@@ -146,7 +146,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
 
     store = RigStore(rig_root / "tickets.db")
     try:
-        assert store.get_meta("schema_version") == "3"
+        assert store.get_meta("schema_version") == "4"
         assert store.get_meta("stigmergy_version") == __version__
         charter_hash = store.get_meta("charter_hash")
         assert charter_hash
@@ -359,7 +359,7 @@ def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute("SELECT value FROM rig_meta WHERE key = 'schema_version'").fetchall()
-        assert rows == [("3",)]
+        assert rows == [("4",)]
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -789,3 +789,186 @@ def test_filed_tickets_table_absent_from_pre_d14_rig_is_migrated_on_open(tmp_pat
         assert reopened.count_untriaged_filings() == 1
     finally:
         reopened.close()
+
+
+# ==========================================================================
+# Bead .42 — schema v4 (functional_summary column) + triage-promotion store
+# methods (SPEC §6 item 10 / D2 / D15).
+# ==========================================================================
+
+
+def _seed_filed(store: RigStore, filed_id: str = "filed-x-1") -> str:
+    """Seed one untriaged filed proposal; return its id."""
+    store.add_filed_ticket(
+        id=filed_id,
+        title="proposal title",
+        description="proposal description",
+        origin_role="worker",
+        origin_worker="worker-haiku-code01-broom-casino-flock",
+        origin_dispatch_id="dispatch-1",
+        origin_parent_ticket="workspace-e2uh.8",
+        discovered_from="dispatch-1@workspace-e2uh.8",
+        proposal_hash="proposalhash",
+    )
+    return filed_id
+
+
+def _full_ticket_fields() -> dict:
+    """The §6 completion fields promote_filed_ticket accepts (minus id/title)."""
+    return {
+        "goal": "make it correct",
+        "functional_summary": "Operator-facing: the thing now works.",
+        "required_reading": ["repo:src/foo.py"],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "difficulty": "easy",
+    }
+
+
+def test_A5_fresh_create_has_functional_summary_column(tmp_path: Path) -> None:
+    """A fresh RigStore.create carries functional_summary in the tickets DDL.
+    (schema_version == "4" after scaffold is asserted by test_rig_meta_populated.)"""
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        cols = {row["name"] for row in store._conn.execute("PRAGMA table_info(tickets)")}
+        assert "functional_summary" in cols
+    finally:
+        store.close()
+
+
+def test_A6_functional_summary_column_migrated_on_open(tmp_path: Path) -> None:
+    """A tickets table WITHOUT functional_summary (pre-.42 scaffold) gains the
+    column on the next plain open; idempotent on a second open."""
+    db_path = tmp_path / "tickets.db"
+    store = RigStore.create(db_path)
+    store._conn.execute("ALTER TABLE tickets DROP COLUMN functional_summary")
+    store._conn.commit()
+    cols = {row["name"] for row in store._conn.execute("PRAGMA table_info(tickets)")}
+    assert "functional_summary" not in cols  # precondition: really absent
+    store.close()
+
+    reopened = RigStore(db_path)  # plain open triggers the guarded-ALTER migration
+    try:
+        cols = {row["name"] for row in reopened._conn.execute("PRAGMA table_info(tickets)")}
+        assert "functional_summary" in cols
+    finally:
+        reopened.close()
+
+    # idempotent: a second open does not raise / double-add.
+    reopened2 = RigStore(db_path)
+    try:
+        cols = {row["name"] for row in reopened2._conn.execute("PRAGMA table_info(tickets)")}
+        assert "functional_summary" in cols
+    finally:
+        reopened2.close()
+
+
+def test_A7_functional_summary_round_trips_as_plain_text(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_ticket(id="t-1", title="t", functional_summary="a plain string, not JSON")
+        assert store.get_ticket("t-1")["functional_summary"] == "a plain string, not JSON"
+        store.update_ticket("t-1", functional_summary="edited")
+        assert store.get_ticket("t-1")["functional_summary"] == "edited"
+    finally:
+        store.close()
+
+
+def test_B1_promote_filed_ticket_inserts_unapproved_and_tombstones(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        filed_id = _seed_filed(store)
+        store.promote_filed_ticket(
+            filed_id=filed_id, ticket_id="t-promoted", title="promoted ticket",
+            **_full_ticket_fields(),
+        )
+        ticket = store.get_ticket("t-promoted")
+        assert ticket is not None
+        assert ticket["approved"] == 0  # UNAPPROVED — approval is a separate act
+        assert ticket["functional_summary"] == "Operator-facing: the thing now works."
+        assert ticket["target_scope"] == ["src/foo.py"]
+
+        filed = store.list_filed_tickets(triaged=True)
+        assert len(filed) == 1
+        assert filed[0]["id"] == filed_id
+        assert filed[0]["triaged"] == 1
+        assert filed[0]["triage_outcome"] == "promoted"
+        assert filed[0]["resulting_ticket_id"] == "t-promoted"
+        assert store.count_untriaged_filings() == 0
+    finally:
+        store.close()
+
+
+def test_B2_promote_filed_ticket_rejects_approved_fields(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        filed_id = _seed_filed(store)
+        with pytest.raises(ValueError):
+            store.promote_filed_ticket(
+                filed_id=filed_id, ticket_id="t-x", title="x", approved=1,
+            )
+        with pytest.raises(ValueError):
+            store.promote_filed_ticket(
+                filed_id=filed_id, ticket_id="t-y", title="y", approval_hash="deadbeef",
+            )
+        # nothing landed / nothing tombstoned
+        assert store.get_ticket("t-x") is None
+        assert store.count_untriaged_filings() == 1
+    finally:
+        store.close()
+
+
+def test_B3_promote_filed_ticket_duplicate_ticket_id_rolls_back(tmp_path: Path) -> None:
+    """Atomicity: a failing INSERT (duplicate ticket id) leaves the filed row
+    UNtriaged — the tombstone and the ticket insert are one transaction."""
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_ticket(id="t-dup", title="pre-existing")
+        filed_id = _seed_filed(store)
+        with pytest.raises(ValueError):
+            store.promote_filed_ticket(
+                filed_id=filed_id, ticket_id="t-dup", title="collides",
+                **_full_ticket_fields(),
+            )
+        assert store.count_untriaged_filings() == 1  # filed row NOT tombstoned
+        assert store.list_filed_tickets(triaged=True) == []
+    finally:
+        store.close()
+
+
+def test_B4_promote_filed_ticket_bad_filed_id(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        with pytest.raises(ValueError):
+            store.promote_filed_ticket(
+                filed_id="nonexistent", ticket_id="t-z", title="z", **_full_ticket_fields()
+            )
+        # already-triaged filed row cannot be promoted twice
+        filed_id = _seed_filed(store)
+        store.mark_filed_ticket_triaged(filed_id, outcome="rejected")
+        with pytest.raises(ValueError):
+            store.promote_filed_ticket(
+                filed_id=filed_id, ticket_id="t-z2", title="z2", **_full_ticket_fields()
+            )
+    finally:
+        store.close()
+
+
+def test_B5_mark_filed_ticket_triaged_tombstone(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        filed_id = _seed_filed(store)
+        store.mark_filed_ticket_triaged(filed_id, outcome="rejected")
+        filed = store.list_filed_tickets(triaged=True)
+        assert len(filed) == 1
+        assert filed[0]["triage_outcome"] == "rejected"
+        assert filed[0]["resulting_ticket_id"] is None
+        assert store.count_untriaged_filings() == 0
+
+        with pytest.raises(ValueError):
+            store.mark_filed_ticket_triaged("nonexistent", outcome="rejected")
+        with pytest.raises(ValueError):  # already triaged
+            store.mark_filed_ticket_triaged(filed_id, outcome="rejected")
+    finally:
+        store.close()

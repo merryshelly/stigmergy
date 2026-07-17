@@ -11,6 +11,7 @@ No real podman / network / provider calls anywhere.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -27,6 +28,8 @@ from stigmergy.cli import (
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic, CriticInfraError
 from stigmergy.daemon import Daemon
+from stigmergy.rangereport import RangeCritic
+from stigmergy.records import RecordPlane
 from stigmergy.rig import create_rig, resolve_rig
 from stigmergy.steering import derive_steering
 
@@ -240,3 +243,386 @@ def test_usage_mentions_daemon_run(capsys) -> None:
     main([])
     out = capsys.readouterr().out
     assert "daemon run --rig" in out
+
+
+# ==========================================================================
+# Bead .42 — triage CLI (approve/unapprove/reject/promote) + folded .33
+# monitoring CLI (status/tickets/ticket/range-report) + REPORT event.
+# ==========================================================================
+
+RIG = "shipyard"
+
+
+def _seed_ticket(rigs_root: Path, ticket_id: str = "t-1", **fields) -> None:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        base = {
+            "title": "Do the thing",
+            "goal": "ship it",
+            "required_reading": [],
+            "target_scope": ["src/foo.py"],
+            "acceptance_criteria": ["works"],
+            "tier1_checks": {"pytest": "pytest -q"},
+            "functional_summary": "Operator-facing: the thing works now.",
+            "lane_hint": None,
+        }
+        base.update(fields)
+        resolved.store.add_ticket(id=ticket_id, **base)
+    finally:
+        resolved.store.close()
+
+
+def _seed_filed(rigs_root: Path, filed_id: str = "filed-dispatch-1-1") -> None:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        resolved.store.add_filed_ticket(
+            id=filed_id,
+            title="proposal",
+            description="a discovered proposal",
+            origin_role="worker",
+            origin_worker="worker-1",
+            origin_dispatch_id="dispatch-1",
+            origin_parent_ticket="workspace-e2uh.8",
+            discovered_from="dispatch-1@workspace-e2uh.8",
+            proposal_hash="proposalhash",
+        )
+    finally:
+        resolved.store.close()
+
+
+def _records_events(rigs_root: Path, event_type: str) -> list[dict]:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        plane = RecordPlane(resolved.rig_paths["records_dir"])
+        return [e for e in plane.read_events() if e.get("event_type") == event_type]
+    finally:
+        resolved.store.close()
+
+
+def _ticket(rigs_root: Path, ticket_id: str) -> dict:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        return resolved.store.get_ticket(ticket_id)
+    finally:
+        resolved.store.close()
+
+
+def _make_staging(rigs_root: Path) -> None:
+    """Create a `staging` branch in the rig's repo clone so range-report has a
+    ref to compute against."""
+    repo = rigs_root / RIG / "repo"
+    subprocess.run(["git", "-C", str(repo), "branch", "staging", "HEAD"], check=True)
+
+
+_ATTRIB = ["--agent", "merry", "--operator-session", "sess-42"]
+
+
+# --- C1: approve -----------------------------------------------------------
+
+
+def test_C1_approve_sets_hash_and_logs_attribution(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+
+    rc = main(["approve", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    ticket = _ticket(rigs_root, "t-1")
+    assert ticket["approved"] == 1
+    assert ticket["approval_hash"]
+    assert ticket["approval_hash"] in out  # spec §C: approve prints the resulting hash
+
+    events = _records_events(rigs_root, "approval")
+    assert len(events) == 1
+    assert events[0]["subject_id"] == "t-1"
+    assert events[0]["acting_agent"] == "merry"
+    assert events[0]["operator_session"] == "sess-42"
+    assert events[0]["approval_hash"] == ticket["approval_hash"]
+
+
+def test_C1_approve_json_prints_steering_dict(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    rc = main(["approve", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB, "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # a parseable JSON object containing the steering set is somewhere in stdout
+    payload = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            payload = json.loads(line)
+            break
+    assert payload is not None
+    assert "functional_summary" in payload
+
+
+# --- C2: approve missing ticket -------------------------------------------
+
+
+def test_C2_approve_missing_ticket_returns_1(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    rc = main(["approve", "ghost", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 1
+    assert _records_events(rigs_root, "approval") == []
+
+
+# --- C3: approve missing attribution --------------------------------------
+
+
+def test_C3_approve_missing_attribution_is_argparse_error(tmp_path: Path) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    with pytest.raises(SystemExit) as exc:
+        main(["approve", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert exc.value.code == 2
+    assert _ticket(rigs_root, "t-1")["approved"] == 0
+    assert _records_events(rigs_root, "approval") == []
+
+
+# --- C4: unapprove ---------------------------------------------------------
+
+
+def test_C4_unapprove_clears_approval_and_logs(tmp_path: Path) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    main(["approve", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+
+    rc = main(["unapprove", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 0
+    ticket = _ticket(rigs_root, "t-1")
+    assert ticket["approved"] == 0
+    assert ticket["approval_hash"] is None
+    assert len(_records_events(rigs_root, "unapproval")) == 1
+
+
+# --- C5: reject ------------------------------------------------------------
+
+
+def test_C5_reject_tombstones_filed_and_logs_reason(tmp_path: Path) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-dispatch-1-1")
+
+    rc = main(
+        ["reject", "filed-dispatch-1-1", "--rig", RIG, "--rigs-root", str(rigs_root),
+         *_ATTRIB, "--reason", "duplicate of t-12"]
+    )
+    assert rc == 0
+
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        filed = resolved.store.list_filed_tickets(triaged=True)
+        assert len(filed) == 1
+        assert filed[0]["triage_outcome"] == "rejected"
+    finally:
+        resolved.store.close()
+
+    events = _records_events(rigs_root, "triage-rejected")
+    assert len(events) == 1
+    assert events[0]["reason"] == "duplicate of t-12"
+
+
+# --- C6: promote from stdin JSON ------------------------------------------
+
+
+def test_C6_promote_from_stdin(tmp_path: Path, monkeypatch, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-dispatch-1-1")
+
+    spec = {
+        "id": "t-promoted",
+        "title": "Promoted ticket",
+        "functional_summary": "Operator-facing: fixes the export bug.",
+        "acceptance_criteria": ["export is complete"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "target_scope": ["src/export.py"],
+    }
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(spec)))
+    rc = main(
+        ["promote", "filed-dispatch-1-1", "--rig", RIG, "--rigs-root", str(rigs_root),
+         "--spec", "-"]
+    )
+    assert rc == 0
+
+    ticket = _ticket(rigs_root, "t-promoted")
+    assert ticket is not None
+    assert ticket["approved"] == 0
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        assert resolved.store.count_untriaged_filings() == 0
+    finally:
+        resolved.store.close()
+
+
+# --- C7: promote with malformed spec input (robustness) --------------------
+
+
+@pytest.mark.parametrize(
+    "spec_arg, stdin_text",
+    [
+        ("/no/such/spec/file.json", None),  # unreadable path -> OSError
+        ("-", "{not valid json"),  # malformed JSON -> JSONDecodeError
+        ("-", "[]"),  # valid JSON, not an object -> non-dict
+    ],
+)
+def test_C7_promote_bad_spec_input_returns_1(
+    tmp_path: Path, monkeypatch, capsys, spec_arg: str, stdin_text: str | None
+) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-dispatch-1-1")
+    if stdin_text is not None:
+        import io
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+
+    rc = main(
+        ["promote", "filed-dispatch-1-1", "--rig", RIG, "--rigs-root", str(rigs_root),
+         "--spec", spec_arg]
+    )
+    assert rc == 1
+    assert "stigmergy promote:" in capsys.readouterr().err
+    # nothing landed: the filed row is still untriaged
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        assert resolved.store.count_untriaged_filings() == 1
+    finally:
+        resolved.store.close()
+
+
+# --- D1c: status -----------------------------------------------------------
+
+
+def test_D1c_status(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    rc = main(["status", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ticket states" in out
+    assert "untriaged_filings" in out
+
+
+# --- D2c: tickets / ticket -------------------------------------------------
+
+
+def test_D2c_tickets_and_ticket_detail(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+
+    rc = main(["tickets", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert "t-1" in capsys.readouterr().out
+
+    rc = main(["ticket", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert "functional_summary" in capsys.readouterr().out
+
+    rc = main(["ticket", "ghost", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert "no such ticket" in capsys.readouterr().out
+
+
+# --- D3c: range-report (no critic) -----------------------------------------
+
+
+def test_D3c_range_report_no_critic(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert "staging:" in capsys.readouterr().out
+    assert _records_events(rigs_root, "report") == []  # no event without --critic
+
+
+# --- D4c: range-report --critic emits a REPORT event -----------------------
+
+
+def _stub_range_critic(model: str = "opus", usage: dict | None = None) -> RangeCritic:
+    usage = usage if usage is not None else {"in": 1000, "cached": 0, "out": 200, "reasoning": 0}
+
+    def client(prompt: str, *, model: str, **params: object) -> dict:
+        return {"text": "advisory findings: looks fine.", "usage": usage}
+
+    return RangeCritic(
+        client=client,
+        model=model,
+        decoding_params={"temperature": 0.0},
+        template="rangecrit template\n",
+    )
+
+
+def test_D4c_range_report_critic_emits_report_event(tmp_path: Path, monkeypatch, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(cli, "_build_range_critic", lambda resolved: _stub_range_critic("opus"))
+
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "advisory findings" in out
+
+    events = _records_events(rigs_root, "report")
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["attempt_kind"] == "report"
+    assert ev["prompt_artifact_hash"]
+    assert ev["model"] == "opus"
+    assert ev["tokens"] == {"in": 1000, "cached": 0, "out": 200, "reasoning": 0}
+    assert isinstance(ev["computed_usd"], float)  # metered "opus" -> a real number
+
+
+# --- D5c: range-report --critic with an unbudgetable model -----------------
+
+
+def test_D5c_range_report_critic_unbudgetable_model(tmp_path: Path, monkeypatch, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic", lambda resolved: _stub_range_critic("no-such-model")
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+    events = _records_events(rigs_root, "report")
+    assert len(events) == 1
+    assert events[0]["computed_usd"] == "unbudgetable"  # fail-closed, never $0
+
+
+# --- D6c: usage discoverability --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["approve", "unapprove", "reject", "promote", "status", "tickets", "range-report"],
+)
+def test_D6c_usage_mentions_new_subcommands(token: str, capsys) -> None:
+    main([])
+    assert token in capsys.readouterr().out
+
+
+# --- D7c: read-only command closes its store -------------------------------
+
+
+def test_D7c_status_closes_store(tmp_path: Path, monkeypatch) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    closed: list[bool] = []
+    real_resolve = cli.resolve_rig
+
+    def spy(name, *, rigs_root=None):
+        resolved = real_resolve(name, rigs_root=rigs_root)
+        orig_close = resolved.store.close
+
+        def tracked() -> None:
+            closed.append(True)
+            orig_close()
+
+        monkeypatch.setattr(resolved.store, "close", tracked)
+        return resolved
+
+    monkeypatch.setattr(cli, "resolve_rig", spy)
+    rc = main(["status", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert closed == [True]

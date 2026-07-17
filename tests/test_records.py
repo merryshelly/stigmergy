@@ -166,6 +166,10 @@ def test_attempt_kinds_matches_spec_enumeration() -> None:
             "infra-retry",
             "stepup-initial",
             "clean-restart",
+            # bead .42: rig-level range-report is not a ticket attempt;
+            # 'report' is the honest attempt_kind for a REPORT event
+            # (SPEC §9 enumeration gains this member — follow-up note for SB).
+            "report",
         }
     )
 
@@ -466,3 +470,110 @@ def test_ticket_filed_still_requires_common_fields() -> None:
     del fields["computed_usd"]
     with pytest.raises(RecordError):
         make_event(EventType.TICKET_FILED, **fields)
+
+
+# --- bead .42: triage attribution events + report attempt_kind --------------
+
+
+def _triage_fields(**overrides: Any) -> dict[str, Any]:
+    """The frozen triage-event required set (NO dispatch-shaped common fields)."""
+    base: dict[str, Any] = {
+        "rig": "shipyard",
+        "subject_id": "workspace-e2uh.8",
+        "outcome": "approved",
+        "acting_agent": "merry",
+        "operator_session": "2026-07-16T21:40-triage-1",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_D1r_triage_event_types_exist_and_enum_has_eleven_members() -> None:
+    assert EventType.APPROVAL.value == "approval"
+    assert EventType.UNAPPROVAL.value == "unapproval"
+    assert EventType.TRIAGE_REJECTED.value == "triage-rejected"
+    assert len(list(EventType)) == 11
+
+
+@pytest.mark.parametrize(
+    "event_type,outcome",
+    [
+        (EventType.APPROVAL, "approved"),
+        (EventType.UNAPPROVAL, "unapproved"),
+        (EventType.TRIAGE_REJECTED, "rejected"),
+    ],
+)
+def test_D2r_triage_event_validates_without_common_fields(
+    plane: RecordPlane, event_type: EventType, outcome: str
+) -> None:
+    """A triage act carries only its own required set — NO dispatch_id, attempt,
+    attempt_kind, tokens, computed_usd, wall_time_seconds — and round-trips."""
+    fields = _triage_fields(outcome=outcome, approval_hash="steeringhashabc")
+    ev = make_event(event_type, **fields)
+    plane.append(ev)
+    read = plane.read_events()
+    assert len(read) == 1
+    assert read[0]["event_type"] == event_type.value
+    assert read[0]["acting_agent"] == "merry"
+    assert read[0]["operator_session"] == "2026-07-16T21:40-triage-1"
+    assert read[0]["outcome"] == outcome
+    # exempt from the dispatch-shaped schema
+    assert "attempt_kind" not in read[0]
+    assert "computed_usd" not in read[0]
+
+
+@pytest.mark.parametrize(
+    "missing", ["rig", "subject_id", "outcome", "acting_agent", "operator_session"]
+)
+def test_D3r_triage_event_missing_required_field_raises(missing: str) -> None:
+    fields = _triage_fields()
+    del fields[missing]
+    with pytest.raises(RecordError):
+        make_event(EventType.APPROVAL, **fields)
+
+
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_D3r_triage_event_empty_attribution_rejected(empty: str) -> None:
+    """A forgeable-by-omission audit line is not acceptable: empty/blank
+    acting_agent must be rejected, not silently accepted."""
+    with pytest.raises(RecordError):
+        make_event(EventType.APPROVAL, **_triage_fields(acting_agent=empty))
+
+
+def test_D4r_triage_events_do_not_pollute_cv_or_spend(plane: RecordPlane) -> None:
+    """A triage event (no dispatch_id / computed_usd / tokens) produces NO CV
+    row and counts as neither dispatch nor gate, adding 0 to metered spend."""
+    from stigmergy.status import reconstruct_spend
+
+    plane.append(make_event(EventType.APPROVAL, **_triage_fields(approval_hash="h")))
+    plane.append(
+        make_event(
+            EventType.TRIAGE_REJECTED,
+            **_triage_fields(subject_id="filed-x", outcome="rejected"),
+        )
+    )
+    plane.rebuild_cv()
+
+    cv_lines = [ln for ln in plane.cv_path.read_text().splitlines() if ln.strip()]
+    assert cv_lines == []  # no dispatch_id -> no CV rows
+
+    spend = reconstruct_spend(plane, usd_cap=25.0, dispatches_cap=50, gate_calls_cap=30)
+    assert spend["metered_spent"] == 0.0
+    assert spend["dispatches_used"] == 0
+    assert spend["gate_calls_used"] == 0
+
+
+def test_D5r_report_event_with_report_attempt_kind_validates() -> None:
+    fields = common_fields(
+        attempt_kind="report",
+        prompt_artifact_hash="rangecrit01-hashxyz",
+        ticket=None,
+        dispatch_id="report-abc123def456",
+        worker=None,
+        rung=None,
+        image_digest=None,
+        model_version=None,
+    )
+    ev = make_event(EventType.REPORT, **fields)
+    assert ev.payload["attempt_kind"] == "report"
+    assert ev.payload["prompt_artifact_hash"] == "rangecrit01-hashxyz"

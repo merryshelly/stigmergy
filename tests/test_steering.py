@@ -74,6 +74,7 @@ def base_ticket_row(**overrides: Any) -> dict[str, Any]:
         "target_scope": ["src/foo.py"],
         "acceptance_criteria": ["foo() returns 42", "foo() raises on negative input"],
         "tier1_checks": {"pytest": "pytest -q", "lint": "ruff check ."},
+        "functional_summary": "Makes foo() return the right answer for callers.",
         "lane_hint": None,
         "current_rung": None,
     }
@@ -124,6 +125,7 @@ def test_case1_full_valid_ticket_row_all_seven_fields(tmp_path: Path) -> None:
         "checks",
         "rubric",
         "target_scope",
+        "functional_summary",
         "lane",
         "prompt_bytes",
         "context_set",
@@ -134,6 +136,7 @@ def test_case1_full_valid_ticket_row_all_seven_fields(tmp_path: Path) -> None:
     assert result["checks"] == {"pytest": "pytest -q", "lint": "ruff check ."}
     assert result["rubric"] == ["foo() returns 42", "foo() raises on negative input"]
     assert result["target_scope"] == ["src/foo.py"]
+    assert result["functional_summary"] == "Makes foo() return the right answer for callers."
     # lane_hint=None -> falls through to the charter's one selector-less
     # fallthrough lane, "default".
     assert result["lane"] == "default"
@@ -367,3 +370,91 @@ def test_case12_pure_function_two_calls_byte_for_byte_equal(tmp_path: Path) -> N
     blob_a = json.dumps(result_a, sort_keys=True, separators=(",", ":"), default=str)
     blob_b = json.dumps(result_b, sort_keys=True, separators=(",", ":"), default=str)
     assert blob_a == blob_b
+
+
+# ==========================================================================
+# Bead .42 — the 8th steering field (functional_summary, SPEC §6 item 10 / D15).
+# ==========================================================================
+
+
+def test_A1_functional_summary_echoed_from_ticket_row(tmp_path: Path) -> None:
+    charter = make_full_charter(tmp_path)
+    prompts_dir = make_prompts_dir(tmp_path)
+    ticket_row = base_ticket_row(
+        functional_summary="Operator-facing: the login page stops 500-ing."
+    )
+
+    result = derive_steering(ticket_row, charter, prompts_dir)
+
+    assert result["functional_summary"] == "Operator-facing: the login page stops 500-ing."
+
+
+@pytest.mark.parametrize("absent", [None, "missing"])
+def test_A2_functional_summary_none_or_missing_becomes_empty_string(
+    tmp_path: Path, absent: object
+) -> None:
+    """None (explicit) OR the key entirely absent -> "" (fail-closed to empty,
+    mirrors the `goal` field pattern) -- and never raises."""
+    charter = make_full_charter(tmp_path)
+    prompts_dir = make_prompts_dir(tmp_path)
+    ticket_row = base_ticket_row()
+    if absent == "missing":
+        del ticket_row["functional_summary"]
+    else:
+        ticket_row["functional_summary"] = None
+
+    result = derive_steering(ticket_row, charter, prompts_dir)
+
+    assert result["functional_summary"] == ""
+
+
+def test_A3_functional_summary_is_signed_into_the_steering_hash(tmp_path: Path) -> None:
+    """Two rows identical EXCEPT functional_summary must derive DIFFERENT
+    steering hashes -- proof it is a real signed steering field, not cosmetic."""
+    charter = make_full_charter(tmp_path)
+    prompts_dir = make_prompts_dir(tmp_path)
+
+    row_a = base_ticket_row(functional_summary="Summary A — does X.")
+    row_b = base_ticket_row(functional_summary="Summary B — does Y instead.")
+
+    steering_a = derive_steering(row_a, charter, prompts_dir)
+    steering_b = derive_steering(row_b, charter, prompts_dir)
+
+    assert steering_a != steering_b
+    assert steering_hash(steering_a) != steering_hash(steering_b)
+
+
+def test_A4_mutating_functional_summary_deeligibilizes_approved_ticket(
+    tmp_path: Path, store: RigStore
+) -> None:
+    """AC11 alignment: functional_summary is a steering field, so editing it on
+    an APPROVED ticket recomputes the steering hash and is_approval_valid goes
+    False (round-trip against the real approve()/is_approval_valid())."""
+    charter = make_full_charter(tmp_path)
+    prompts_dir = make_prompts_dir(tmp_path)
+
+    ticket_id = "t-fs-ac11"
+    store.add_ticket(
+        id=ticket_id,
+        title="Implement foo() to spec",
+        goal="Make foo() return 42.",
+        required_reading=[],
+        target_scope=["src/foo.py"],
+        acceptance_criteria=["foo() returns 42"],
+        tier1_checks={"pytest": "pytest -q"},
+        functional_summary="Original operator-facing summary.",
+        lane_hint=None,
+    )
+    ticket_row = store.get_ticket(ticket_id)
+    assert ticket_row is not None
+
+    steering_at_approval = derive_steering(ticket_row, charter, prompts_dir)
+    approve(store, ticket_id, steering=steering_at_approval)
+    assert is_approval_valid(
+        store.get_ticket(ticket_id), derive_steering(ticket_row, charter, prompts_dir)
+    ) is True
+
+    # Mutate ONLY functional_summary.
+    ticket_row["functional_summary"] = "A materially different summary."
+    steering_after = derive_steering(ticket_row, charter, prompts_dir)
+    assert is_approval_valid(store.get_ticket(ticket_id), steering_after) is False

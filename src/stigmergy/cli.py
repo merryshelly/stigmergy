@@ -4,6 +4,17 @@ Top-level argparse dispatcher. v0 subcommand tree:
 
     stigmergy rig new --charter <path> [--path <base-dir>]
     stigmergy daemon run --rig <name> [--rigs-root <path>]
+    stigmergy approve   <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>
+        --operator-session <s> [--json]
+    stigmergy unapprove <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>
+        --operator-session <s>
+    stigmergy reject    <filed-id>  --rig <name> [--rigs-root <path>] --agent <a>
+        --operator-session <s> [--reason <text>]
+    stigmergy promote   <filed-id>  --rig <name> [--rigs-root <path>] --spec <path|->
+    stigmergy status       --rig <name> [--rigs-root <path>]
+    stigmergy tickets      --rig <name> [--rigs-root <path>]
+    stigmergy ticket <id>  --rig <name> [--rigs-root <path>]
+    stigmergy range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]
 
 Bare invocation (no args) prints short usage and returns 0 — preserved
 from the v0 stub so existing scripts/tests calling `main([])` keep working.
@@ -12,13 +23,15 @@ from the v0 stub so existing scripts/tests calling `main([])` keep working.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from stigmergy import checks
+from stigmergy import approval, checks, spend, triage
 from stigmergy.charter import Charter, CharterError
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
@@ -26,18 +39,42 @@ from stigmergy.critic_client import make_critic_client
 from stigmergy.daemon import Daemon, DaemonError
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
-from stigmergy.records import RecordPlane
+from stigmergy.rangereport import (
+    RangeCritic,
+    RangeCriticResult,
+    RangeReport,
+    RangeReportError,
+    compute_range_report,
+)
+from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.registry import UnbudgetableError
 from stigmergy.relay import CapabilityStore
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
+from stigmergy.status import (
+    gather_status,
+    render_status,
+    render_ticket_detail,
+    render_ticket_list,
+)
 from stigmergy.steering import derive_steering
 from stigmergy.weaver import Weaver
 
 _USAGE = (
     "stigmergy v0 — usage: stigmergy <command> ...\n"
     "  rig new --charter <path> [--path <base-dir>]\n"
-    "  daemon run --rig <name> [--rigs-root <path>]"
+    "  daemon run --rig <name> [--rigs-root <path>]\n"
+    "  approve <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>"
+    " --operator-session <s> [--json]\n"
+    "  unapprove <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>"
+    " --operator-session <s>\n"
+    "  reject <filed-id> --rig <name> [--rigs-root <path>] --agent <a>"
+    " --operator-session <s> [--reason <text>]\n"
+    "  promote <filed-id> --rig <name> [--rigs-root <path>] --spec <path|->\n"
+    "  status --rig <name> [--rigs-root <path>]\n"
+    "  tickets --rig <name> [--rigs-root <path>]\n"
+    "  ticket <id> --rig <name> [--rigs-root <path>]\n"
+    "  range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]"
 )
 
 
@@ -73,6 +110,71 @@ def _build_parser() -> argparse.ArgumentParser:
         "--rigs-root",
         default=None,
         help="Base directory the rig lives under (default: ~/rigs).",
+    )
+
+    def add_rig_args(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--rig", required=True, help="Name of the rig.")
+        subparser.add_argument(
+            "--rigs-root",
+            default=None,
+            help="Base directory the rig lives under (default: ~/rigs).",
+        )
+
+    def add_attribution_args(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--agent", required=True, help="Acting agent (the v0 audit line, D1)."
+        )
+        subparser.add_argument(
+            "--operator-session", required=True, help="Operator session id (the v0 audit line)."
+        )
+
+    approve_parser = subparsers.add_parser("approve", help="Approve a ticket for dispatch.")
+    approve_parser.add_argument("ticket_id", help="Ticket id to approve.")
+    add_rig_args(approve_parser)
+    add_attribution_args(approve_parser)
+    approve_parser.add_argument(
+        "--json", action="store_true", help="Print the steering dict as JSON."
+    )
+
+    unapprove_parser = subparsers.add_parser("unapprove", help="Withdraw a ticket's approval.")
+    unapprove_parser.add_argument("ticket_id", help="Ticket id to unapprove.")
+    add_rig_args(unapprove_parser)
+    add_attribution_args(unapprove_parser)
+
+    reject_parser = subparsers.add_parser("reject", help="Reject (tombstone) a filed proposal.")
+    reject_parser.add_argument("filed_id", help="Filed proposal id to reject.")
+    add_rig_args(reject_parser)
+    add_attribution_args(reject_parser)
+    reject_parser.add_argument("--reason", default=None, help="Optional rejection reason.")
+
+    promote_parser = subparsers.add_parser(
+        "promote", help="Complete a filed proposal into an unapproved ticket."
+    )
+    promote_parser.add_argument("filed_id", help="Filed proposal id to promote.")
+    add_rig_args(promote_parser)
+    promote_parser.add_argument(
+        "--spec", required=True, help="Path to a JSON promotion spec, or '-' for stdin."
+    )
+
+    status_parser = subparsers.add_parser("status", help="Print the AC12 status snapshot.")
+    add_rig_args(status_parser)
+
+    tickets_parser = subparsers.add_parser("tickets", help="List all tickets.")
+    add_rig_args(tickets_parser)
+
+    ticket_parser = subparsers.add_parser("ticket", help="Show one ticket's full detail.")
+    ticket_parser.add_argument("ticket_id", help="Ticket id to show.")
+    add_rig_args(ticket_parser)
+
+    range_report_parser = subparsers.add_parser(
+        "range-report", help="Compute the deterministic range diff artifact."
+    )
+    add_rig_args(range_report_parser)
+    range_report_parser.add_argument(
+        "--base-ref", default=None, help="Explicit base ref (default: refs/heads/main or root)."
+    )
+    range_report_parser.add_argument(
+        "--critic", action="store_true", help="Also run a one-shot range-critic review."
     )
 
     return parser
@@ -203,6 +305,310 @@ def _make_steering_of(
     return steering_of
 
 
+# ==========================================================================
+# Bead .42: triage CLI (approve/unapprove/reject/promote) + folded .33
+# monitoring CLI (status/tickets/ticket/range-report) + REPORT event.
+# ==========================================================================
+
+
+def _resolve_rig_or_none(args: argparse.Namespace) -> tuple[ResolvedRig | None, int | None]:
+    """Shared rig resolver for every C+D verb (bead .42 build spec §C/§D
+    "shared resolver" gap #7). Returns ``(resolved, None)`` on success, or
+    ``(None, 1)`` after printing a stderr error on failure — callers just
+    check the second element. Calls the module-global `resolve_rig` by
+    plain name (never imported/aliased locally) so tests can monkeypatch
+    `cli.resolve_rig` and have it take effect here."""
+    try:
+        resolved = resolve_rig(args.rig, rigs_root=args.rigs_root)
+    except (RigError, CharterError, UnbudgetableError, OSError) as exc:
+        print(f"stigmergy: {exc}", file=sys.stderr)
+        return None, 1
+    return resolved, None
+
+
+def _rig_name(resolved: ResolvedRig) -> str:
+    """The rig's own name: `rig_meta.rig_name` if the store has it (it
+    always should, post `create_rig`), else the charter's `[rig].name` as
+    a fallback (mirrors the REPORT-event field map's own fallback)."""
+    name = resolved.store.get_meta("rig_name")
+    if name:
+        return name
+    return resolved.charter.raw["rig"]["name"]
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        ticket = resolved.store.get_ticket(args.ticket_id)
+        if ticket is None:
+            print(f"stigmergy approve: no such ticket: {args.ticket_id}", file=sys.stderr)
+            return 1
+
+        steering = derive_steering(
+            ticket, resolved.charter, resolved.rig_paths["prompts_dir"]
+        )
+        if args.json:
+            print(json.dumps(steering, default=str))
+        else:
+            for key in (
+                "ticket_text",
+                "checks",
+                "rubric",
+                "target_scope",
+                "functional_summary",
+                "lane",
+                "prompt_bytes",
+                "context_set",
+            ):
+                print(f"{key}: {steering[key]}")
+
+        approval.approve(resolved.store, args.ticket_id, steering=steering)
+        approved_ticket = resolved.store.get_ticket(args.ticket_id)
+        approval_hash = approved_ticket["approval_hash"] if approved_ticket else None
+
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+        triage.record_triage_event(
+            record_plane,
+            event_type=EventType.APPROVAL,
+            rig=_rig_name(resolved),
+            subject_id=args.ticket_id,
+            outcome="approved",
+            acting_agent=args.agent,
+            operator_session=args.operator_session,
+            approval_hash=approval_hash,
+        )
+        print(f"approval_hash: {approval_hash}")
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_unapprove(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        ticket = resolved.store.get_ticket(args.ticket_id)
+        if ticket is None:
+            print(f"stigmergy unapprove: no such ticket: {args.ticket_id}", file=sys.stderr)
+            return 1
+
+        previous_hash = ticket.get("approval_hash")
+        approval.unapprove(resolved.store, args.ticket_id)
+
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+        triage.record_triage_event(
+            record_plane,
+            event_type=EventType.UNAPPROVAL,
+            rig=_rig_name(resolved),
+            subject_id=args.ticket_id,
+            outcome="unapproved",
+            acting_agent=args.agent,
+            operator_session=args.operator_session,
+            approval_hash=previous_hash,
+        )
+        print(f"unapproved {args.ticket_id}")
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_reject(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            resolved.store.mark_filed_ticket_triaged(args.filed_id, outcome="rejected")
+        except ValueError as exc:
+            print(f"stigmergy reject: {exc}", file=sys.stderr)
+            return 1
+
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+        triage.record_triage_event(
+            record_plane,
+            event_type=EventType.TRIAGE_REJECTED,
+            rig=_rig_name(resolved),
+            subject_id=args.filed_id,
+            outcome="rejected",
+            acting_agent=args.agent,
+            operator_session=args.operator_session,
+            reason=args.reason,
+        )
+        print(f"rejected {args.filed_id}")
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_promote(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            raw = sys.stdin.read() if args.spec == "-" else Path(args.spec).read_text(
+                encoding="utf-8"
+            )
+            spec = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"stigmergy promote: could not read spec: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(spec, dict):
+            print(
+                f"stigmergy promote: spec must be a JSON object (got {type(spec).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            new_ticket_id = triage.promote_proposal(
+                resolved.store, filed_id=args.filed_id, spec=spec
+            )
+        except triage.TriageError as exc:
+            print(f"stigmergy promote: {exc}", file=sys.stderr)
+            return 1
+
+        print(new_ticket_id)
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        records_dir = resolved.rig_paths["records_dir"]
+        status = gather_status(
+            store=resolved.store,
+            record_plane=RecordPlane(records_dir),
+            notification_store=NotificationStore(records_dir / "notifications.jsonl"),
+            charter_resolved=resolved.charter.raw,
+            disk_path=str(resolved.rig_root),
+            min_disk_bytes=None,
+            now=time.time(),
+        )
+        print(render_status(status))
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_tickets(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        print(render_ticket_list(resolved.store))
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_ticket(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        print(render_ticket_detail(resolved.store, args.ticket_id))
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _build_range_critic(resolved: ResolvedRig) -> RangeCritic:
+    """Production `RangeCritic` builder (bead .42 build spec §D) — a
+    monkeypatchable module-level helper: tests replace `cli._build_range_critic`
+    wholesale to inject a stub client, so this function must be called by
+    plain module-global name (never imported/aliased/bound early) at every
+    call site."""
+    charter = resolved.charter
+    critic_cfg = charter.raw["roles"]["critic"]
+    critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
+    return RangeCritic.from_prompt_file(
+        resolved.rig_paths["prompts_dir"] / "rangecrit01",
+        client=make_critic_client(key_provider=critic_key_provider, registry=resolved.registry),
+        model=critic_cfg["model"],
+        decoding_params={"temperature": critic_cfg["temperature"]},
+    )
+
+
+def _emit_report_event(
+    resolved: ResolvedRig, report: RangeReport, result: RangeCriticResult
+) -> None:
+    """Emit ONE REPORT event for a `range-report --critic` run (bead .42
+    build spec §D field map). Never a silent $0 on an unbudgetable model —
+    `computed_usd` is `"unbudgetable"` in that case."""
+    tokens = {
+        "in": result.usage.get("in", 0),
+        "cached": result.usage.get("cached", 0),
+        "out": result.usage.get("out", 0),
+        "reasoning": result.usage.get("reasoning", 0),
+    }
+    try:
+        entry = resolved.registry.resolve(result.model)
+        computed_usd = spend.cost_usd(entry, tokens)
+    except UnbudgetableError:
+        computed_usd = "unbudgetable"
+
+    event = make_event(
+        EventType.REPORT,
+        rig=_rig_name(resolved),
+        ticket=None,
+        dispatch_id=f"report-{report.staging_oid[:12]}",
+        worker=None,
+        rung=None,
+        attempt=0,
+        attempt_kind="report",
+        charter_hash=resolved.charter.resolved_hash,
+        approval_hash=None,
+        image_digest=None,
+        model=result.model,
+        model_version=None,
+        price_table_version=resolved.registry.version_hash,
+        tokens=tokens,
+        computed_usd=computed_usd,
+        prompt_artifact_hash=result.prompt_artifact_hash,
+        wall_time_seconds=0.0,
+    )
+    record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+    record_plane.append(event)
+
+
+def _cmd_range_report(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            report = compute_range_report(
+                resolved.rig_paths["repo_root"], base_ref=args.base_ref
+            )
+        except RangeReportError as exc:
+            print(f"stigmergy range-report: {exc}", file=sys.stderr)
+            return 1
+
+        print(report.render())
+
+        if args.critic:
+            critic = _build_range_critic(resolved)
+            try:
+                result = critic.review(report)
+            except RangeReportError as exc:
+                print(f"stigmergy range-report: {exc}", file=sys.stderr)
+                return 1
+            print(result.findings)
+            _emit_report_event(resolved, report, result)
+
+        return 0
+    finally:
+        resolved.store.close()
+
+
 # The dedicated dogfood 1Password item for the critic's real Anthropic key
 # (item id `oknaudituuajtuw3cnv4dra7s4`, field `credential`) -- per bead .31's
 # comment, do NOT source the critic key from any other vault item.
@@ -250,6 +656,23 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_daemon_run(args)
         print(_USAGE, file=sys.stderr)
         return 1
+
+    if args.command == "approve":
+        return _cmd_approve(args)
+    if args.command == "unapprove":
+        return _cmd_unapprove(args)
+    if args.command == "reject":
+        return _cmd_reject(args)
+    if args.command == "promote":
+        return _cmd_promote(args)
+    if args.command == "status":
+        return _cmd_status(args)
+    if args.command == "tickets":
+        return _cmd_tickets(args)
+    if args.command == "ticket":
+        return _cmd_ticket(args)
+    if args.command == "range-report":
+        return _cmd_range_report(args)
 
     print(_USAGE)
     return 0

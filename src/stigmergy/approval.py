@@ -83,6 +83,20 @@ def approve(store: Any, ticket_id: str, *, steering: dict[str, Any]) -> None:
     store.update_ticket(ticket_id, approved=1, approval_hash=steering_hash(steering))
 
 
+def unapprove(store: Any, ticket_id: str) -> None:
+    """Withdraw approval WITHOUT a steering edit (bead .42, SPEC §4 minors).
+
+    Sets ``approved=0`` and ``approval_hash=None`` on the ticket via
+    ``store.update_ticket`` — the symmetric inverse of :func:`approve`.
+    Like `approve`, this is a plain, pure function that only touches the
+    store: it represents the human withdraw act itself (not an automated
+    judgment), so it stays free of any record-plane side effect — callers
+    that want an audit trail append the attribution event separately
+    (`triage.record_triage_event`).
+    """
+    store.update_ticket(ticket_id, approved=0, approval_hash=None)
+
+
 def is_approval_valid(ticket_row: dict[str, Any], current_steering: dict[str, Any]) -> bool:
     """True iff the ticket is approved AND its stored hash matches steering now.
 
