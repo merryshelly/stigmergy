@@ -275,6 +275,8 @@ def test_range_critic_one_shot_returns_findings():
     assert result.findings == "FINDINGS..."
     assert result.prompt_artifact_hash  # set
     assert result.usage == {"output_tokens": 12}
+    # a response with no `filed_tickets` key -> tolerant [] (beads .41).
+    assert result.filed_tickets == []
     assert len(client.calls) == 1  # stub called EXACTLY once
 
 
@@ -339,10 +341,18 @@ def test_range_critic_never_files_beads():
 
     result = critic.review(SAMPLE_REPORT)
 
-    # Structural assertion: the result carries only advisory text +
-    # provenance fields — no store/pool/ticket handle anywhere on it.
+    # Structural assertion: the result carries advisory text + provenance +
+    # RAW filed-ticket PROPOSALS — but no store/pool/ticket handle anywhere on
+    # it. `filed_tickets` (beads .41) are proposals for the CLI to file; a
+    # proposal on a result is not a filing — review() itself files nothing.
     result_fields = {f.name for f in dataclasses.fields(RangeCriticResult)}
-    assert result_fields == {"findings", "prompt_artifact_hash", "model", "usage"}
+    assert result_fields == {
+        "findings",
+        "filed_tickets",
+        "prompt_artifact_hash",
+        "model",
+        "usage",
+    }
     assert isinstance(result.findings, str)
 
     # `review`'s own signature has no store/pool/ticket-creation parameter
@@ -368,3 +378,56 @@ def test_range_critic_client_failure_is_clean():
         critic = make_range_critic(client)
         with pytest.raises(RangeReportError):
             critic.review(SAMPLE_REPORT)
+
+
+# --------------------------------------------------------------------------
+# 12. filed_tickets pass-through (beads .41) — review carries RAW proposals
+#     for the CLI to file; it validates them NOT AT ALL (file_proposals is
+#     the single validation authority) and files nothing itself.
+# --------------------------------------------------------------------------
+
+
+def test_range_critic_passes_filed_tickets_through_verbatim():
+    tickets = [
+        {"title": "Dedup range-base resolution", "description": "why", "evidence": "e"},
+        {"title": "Add test for X", "description": "why2"},
+    ]
+    client = StubClient(response={"text": "F", "usage": {}, "filed_tickets": tickets})
+    critic = make_range_critic(client)
+    result = critic.review(SAMPLE_REPORT)
+    # verbatim — no reshaping, no reordering, no per-item validation here.
+    assert result.filed_tickets == tickets
+
+
+def test_range_critic_tolerates_non_list_filed_tickets():
+    # A malformed/absent filed_tickets channel MUST NOT sink the whole review
+    # (advisory prose still reaches the operator). Non-list -> [] (beads .41).
+    for bad in (None, "nope", 42, {"title": "x"}):
+        client = StubClient(response={"text": "F", "usage": {}, "filed_tickets": bad})
+        critic = make_range_critic(client)
+        result = critic.review(SAMPLE_REPORT)
+        assert result.findings == "F"
+        assert result.filed_tickets == []
+
+
+def test_range_critic_passes_malformed_items_through_for_file_proposals_to_reject():
+    # review() does NOT pre-filter bad-shape items — file_proposals owns
+    # validation and emits per-item `bad-shape` audit events. review() only
+    # guarantees a LIST; the items travel verbatim (here, a bad item alongside
+    # a good one).
+    items = [{"title": "ok", "description": "d"}, {"missing": "title"}, "not-a-dict"]
+    client = StubClient(response={"text": "F", "usage": {}, "filed_tickets": items})
+    critic = make_range_critic(client)
+    result = critic.review(SAMPLE_REPORT)
+    assert result.filed_tickets == items  # verbatim; CLI/file_proposals judges shape
+
+
+def test_range_critic_missing_text_still_fails_even_with_filed_tickets():
+    # findings is STRICT (advisor pt1): a filing-only response with no prose is
+    # still a review failure — there is nothing to deliver to the operator.
+    client = StubClient(
+        response={"text": "", "usage": {}, "filed_tickets": [{"title": "t", "description": "d"}]}
+    )
+    critic = make_range_critic(client)
+    with pytest.raises(RangeReportError):
+        critic.review(SAMPLE_REPORT)

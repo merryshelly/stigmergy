@@ -91,7 +91,9 @@ class CapturingOpener:
         raise urllib.error.URLError("captured (test opener never connects upstream)")
 
 
-def _upstream(path: str, *, method: str = "POST", body: bytes = b'{"model":"x"}') -> UpstreamRequest:
+def _upstream(
+    path: str, *, method: str = "POST", body: bytes = b'{"model":"x"}'
+) -> UpstreamRequest:
     return UpstreamRequest(
         request=RelayRequest(
             method=method, path=path, headers={CAP_HEADER: DUMMY_REAL_KEY}, body=body
@@ -321,12 +323,17 @@ class TestF3EndpointAllowlist:
 # F7 (MEDIUM) — Content-Length validated ascii, malformed => clean 400          #
 # =========================================================================== #
 class TestF7ContentLengthAscii:
-    @pytest.mark.parametrize("bad_cl", ["\u00b2", "1\u00b2", "\u00b3"])  # superscripts: isdigit()=True, int()=ValueError
+    # superscripts: isdigit() is True but int() raises ValueError
+    @pytest.mark.parametrize("bad_cl", ["\u00b2", "1\u00b2", "\u00b3"])
     def test_unicode_content_length_is_relay_transport_error_not_uncaught(self, bad_cl):
         raw = _raw(
             "POST",
             "/v1/messages",
-            headers={CAP_HEADER: "tok", "content-type": "application/json", "content-length": bad_cl},
+            headers={
+                CAP_HEADER: "tok",
+                "content-type": "application/json",
+                "content-length": bad_cl,
+            },
             body=b"xx",
         )
         with pytest.raises(RelayTransportError):

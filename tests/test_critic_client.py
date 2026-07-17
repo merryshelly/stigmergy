@@ -27,11 +27,15 @@ import pytest
 from stigmergy.critic import Critic, CriticInfraError
 from stigmergy.critic_client import (
     ANTHROPIC_VERSION,
+    DEFAULT_RANGE_MAX_TOKENS,
     DEFAULT_TIMEOUT,
+    RANGE_REVIEW_TOOL_NAME,
     VERDICT_TOOL_NAME,
     CriticClientError,
+    build_range_review_tool,
     build_verdict_tool,
     make_critic_client,
+    make_range_critic_client,
 )
 from stigmergy.registry import UnbudgetableError, load_registry
 from stigmergy.verdicts import Outcome, Severity, Verdict
@@ -398,3 +402,245 @@ def test_default_http_post_propagates_http_error(monkeypatch):
             body=b"{}",
             timeout=7.0,
         )
+
+
+# ==========================================================================
+# make_range_critic_client — the combined-schema range-critic adapter
+# (beads .51 + .41). AUTHORED BY THE ORCHESTRATOR (Merry), not the implementor.
+#
+# `.51` bug: production `range-report --critic` wired the VERDICT client
+# (make_critic_client), which returns {outcome,tier,reason,severity} — not the
+# {text, usage} shape RangeCritic.review needs. The fix is a DEDICATED client
+# that forces a single `submit_range_review` tool carrying BOTH the advisory
+# prose `findings` AND proposed `filed_tickets[]` (.41), and maps the response's
+# real usage into the canonical 4-key shape. Same split as .36: this client
+# returns the RAW tool input + usage; rangereport.py owns semantic validation.
+# ==========================================================================
+
+# A real Anthropic Messages `usage` object (the top-level field, not tool input).
+ANTHROPIC_USAGE = {
+    "input_tokens": 1200,
+    "output_tokens": 300,
+    "cache_read_input_tokens": 40,
+    "cache_creation_input_tokens": 10,
+}
+FINDINGS = "Overview: the range looks coherent.\nRisks & concerns: none observed.\n"
+
+
+def _range_response(findings=FINDINGS, filed_tickets="__omit__", usage="__default__"):
+    """A well-formed Anthropic Messages response forcing the range-review tool.
+
+    `filed_tickets="__omit__"` leaves the key absent from the tool input;
+    `usage="__default__"` attaches ANTHROPIC_USAGE; `usage=None` omits the
+    top-level usage object entirely.
+    """
+    tool_input = {}
+    if findings is not None:
+        tool_input["findings"] = findings
+    if filed_tickets != "__omit__":
+        tool_input["filed_tickets"] = filed_tickets
+    resp = {
+        "id": "msg_r",
+        "type": "message",
+        "role": "assistant",
+        "stop_reason": "tool_use",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_r",
+                "name": RANGE_REVIEW_TOOL_NAME,
+                "input": tool_input,
+            }
+        ],
+    }
+    if usage == "__default__":
+        resp["usage"] = dict(ANTHROPIC_USAGE)
+    elif usage is not None:
+        resp["usage"] = usage
+    return resp
+
+
+def _range_client(registry, http, **kw):
+    return make_range_critic_client(
+        key_provider=_key_provider(), registry=registry, http_post=http, **kw
+    )
+
+
+# --- schema ---------------------------------------------------------------
+
+
+def test_range_review_tool_schema():
+    tool = build_range_review_tool()
+    assert tool["name"] == RANGE_REVIEW_TOOL_NAME
+    schema = tool["input_schema"]
+    assert schema["type"] == "object"
+    # findings is required; filed_tickets is NOT (a clean range files nothing).
+    assert schema["required"] == ["findings"]
+    props = schema["properties"]
+    assert props["findings"]["type"] == "string"
+    assert props["filed_tickets"]["type"] == "array"
+    item = props["filed_tickets"]["items"]
+    assert item["type"] == "object"
+    assert set(item["required"]) == {"title", "description"}
+    assert item["properties"]["title"]["type"] == "string"
+    assert item["properties"]["description"]["type"] == "string"
+    assert item["properties"]["evidence"]["type"] == "string"
+
+
+# --- request construction --------------------------------------------------
+
+
+def test_range_client_posts_to_messages_with_auth_and_forces_range_tool(registry):
+    http = FakeHttp(response=_range_response())
+    client = _range_client(registry, http, base_url="https://api.anthropic.com")
+    client(PROMPT, model="opus", temperature=0.0)
+    call = http.calls[0]
+    assert call["url"] == "https://api.anthropic.com/v1/messages"
+    assert call["headers"]["x-api-key"] == KEY
+    assert call["headers"]["anthropic-version"] == ANTHROPIC_VERSION
+    assert call["headers"]["content-type"] == "application/json"
+    body = json.loads(call["body"])
+    assert body["tool_choice"] == {"type": "tool", "name": RANGE_REVIEW_TOOL_NAME}
+    assert any(t["name"] == RANGE_REVIEW_TOOL_NAME for t in body["tools"])
+    assert body["messages"] == [{"role": "user", "content": PROMPT}]
+    assert body["model"] == registry.resolve("opus").version
+
+
+def test_range_client_default_max_tokens_is_generous(registry):
+    # range prose + proposals are larger than a 1024-token verdict.
+    http = FakeHttp(response=_range_response())
+    client = _range_client(registry, http)
+    client(PROMPT, model="opus", temperature=0.0)
+    body = json.loads(http.calls[0]["body"])
+    assert body["max_tokens"] == DEFAULT_RANGE_MAX_TOKENS
+    assert DEFAULT_RANGE_MAX_TOKENS >= 4096
+
+
+def test_range_client_decoding_params_cannot_clobber_structural_keys(registry):
+    http = FakeHttp(response=_range_response())
+    client = _range_client(registry, http)
+    client(
+        PROMPT,
+        model="opus",
+        temperature=0.0,
+        tool_choice={"type": "auto"},
+        tools=[],
+        messages=[{"role": "user", "content": "HIJACKED"}],
+    )
+    body = json.loads(http.calls[0]["body"])
+    assert body["model"] == registry.resolve("opus").version
+    assert body["tool_choice"] == {"type": "tool", "name": RANGE_REVIEW_TOOL_NAME}
+    assert any(t["name"] == RANGE_REVIEW_TOOL_NAME for t in body["tools"])
+    assert body["messages"] == [{"role": "user", "content": PROMPT}]
+
+
+# --- return shape: {text, filed_tickets, usage} ---------------------------
+
+
+def test_range_client_returns_text_filed_tickets_and_usage(registry):
+    tickets = [{"title": "T1", "description": "D1", "evidence": "e"}]
+    http = FakeHttp(response=_range_response(findings="F", filed_tickets=tickets))
+    client = _range_client(registry, http)
+    out = client(PROMPT, model="opus", temperature=0.0)
+    assert out["text"] == "F"
+    assert out["filed_tickets"] == tickets
+    # usage mapped to the canonical 4-key shape (records._TOKEN_KEYS).
+    assert out["usage"] == {"in": 1200 + 10, "cached": 40, "out": 300, "reasoning": 0}
+
+
+def test_range_client_absent_filed_tickets_passes_through_none(registry):
+    # The client does NOT default filed_tickets; RangeCritic.review tolerates None.
+    http = FakeHttp(response=_range_response(filed_tickets="__omit__"))
+    client = _range_client(registry, http)
+    out = client(PROMPT, model="opus", temperature=0.0)
+    assert out["filed_tickets"] is None
+
+
+# --- usage provenance: absent/invalid usage object -> {} (never fabricated) --
+
+
+def test_range_client_absent_usage_object_yields_empty_usage(registry):
+    http = FakeHttp(response=_range_response(usage=None))
+    client = _range_client(registry, http)
+    out = client(PROMPT, model="opus", temperature=0.0)
+    assert out["usage"] == {}
+
+
+def test_range_client_usage_without_output_tokens_yields_empty_usage(registry):
+    # a usage object with no trustworthy completion count is not real accounting.
+    http = FakeHttp(response=_range_response(usage={"input_tokens": 10}))
+    client = _range_client(registry, http)
+    out = client(PROMPT, model="opus", temperature=0.0)
+    assert out["usage"] == {}
+
+
+def test_range_client_usage_not_a_dict_yields_empty_usage(registry):
+    http = FakeHttp(response=_range_response(usage="not-a-dict"))
+    client = _range_client(registry, http)
+    out = client(PROMPT, model="opus", temperature=0.0)
+    assert out["usage"] == {}
+
+
+# --- _map_range_usage unit edges ------------------------------------------
+
+
+def test_map_range_usage_edges():
+    from stigmergy import critic_client as cc
+
+    assert cc._map_range_usage(None) == {}
+    assert cc._map_range_usage("x") == {}
+    assert cc._map_range_usage({}) == {}
+    assert cc._map_range_usage({"input_tokens": 5}) == {}  # no output_tokens
+    # bool output_tokens is not a valid count (bool is-a int in Python)
+    assert cc._map_range_usage({"output_tokens": True}) == {}
+    # negative output_tokens is not valid -> not real accounting
+    assert cc._map_range_usage({"output_tokens": -1}) == {}
+    # a real object maps fully; missing optional cache fields default to 0.
+    assert cc._map_range_usage({"output_tokens": 7}) == {
+        "in": 0,
+        "cached": 0,
+        "out": 7,
+        "reasoning": 0,
+    }
+    assert cc._map_range_usage(dict(ANTHROPIC_USAGE)) == {
+        "in": 1210,
+        "cached": 40,
+        "out": 300,
+        "reasoning": 0,
+    }
+
+
+# --- fail-closed guards (mirror make_critic_client) -----------------------
+
+
+def test_range_client_non_anthropic_provider_raises_without_http(registry):
+    http = FakeHttp(response=_range_response())
+    client = _range_client(registry, http)
+    with pytest.raises(CriticClientError):
+        client(PROMPT, model="local-qwen", temperature=0.0)
+    assert http.calls == []
+
+
+def test_range_client_unknown_model_raises_unbudgetable_without_http(registry):
+    http = FakeHttp(response=_range_response())
+    client = _range_client(registry, http)
+    with pytest.raises(UnbudgetableError):
+        client(PROMPT, model="does-not-exist", temperature=0.0)
+    assert http.calls == []
+
+
+def test_range_client_no_tool_use_block_raises(registry):
+    resp = {"stop_reason": "end_turn", "content": [{"type": "text", "text": "no tool"}]}
+    http = FakeHttp(response=resp)
+    client = _range_client(registry, http)
+    with pytest.raises(CriticClientError):
+        client(PROMPT, model="opus", temperature=0.0)
+
+
+def test_range_client_tool_input_not_a_dict_raises(registry):
+    resp = _range_response()
+    resp["content"][0]["input"] = "not-a-dict"
+    http = FakeHttp(response=resp)
+    client = _range_client(registry, http)
+    with pytest.raises(CriticClientError):
+        client(PROMPT, model="opus", temperature=0.0)

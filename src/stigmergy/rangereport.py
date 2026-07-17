@@ -22,12 +22,17 @@ Two things, one module (SPEC §9):
    channel — the range diff is worker-authored content and therefore
    hostile input, same threat model as `critic.py`'s artifact).
 
-   **The injection edge stays closed by construction (SPEC §9): a range
-   review NEVER auto-files a bead/ticket/task.** :meth:`RangeCritic.review`
-   takes no store, no pool, no ticket-creation handle of any kind — only a
-   :class:`RangeReport` in, a :class:`RangeCriticResult` (text + provenance)
-   out. Even if the model's findings text itself says "file a ticket",
-   there is structurally nothing in this module capable of doing so.
+   **The injection edge stays closed by construction (SPEC §9):
+   :meth:`RangeCritic.review` performs NO filing and holds no store, pool,
+   or ticket-creation handle of any kind** — only a :class:`RangeReport` in,
+   a :class:`RangeCriticResult` out. The result now also carries RAW
+   `filed_tickets` proposals (beads .41), but a proposal on a result is not
+   a filing: only the CLI (`cli._cmd_range_report`) may persist them, and
+   only via `filing.file_proposals` into the separate, structurally
+   un-claimable `filed_tickets` table as UNAPPROVED rows awaiting human
+   triage. Even if the range's own text says "file a ticket", nothing in
+   this module files anything, and no proposal becomes eligible work without
+   a human `approved` label.
 
 **Base resolution** (SPEC §9): promotion `staging`→`main` is a human act in
 v0 (no automated watermark yet — that is a v1 concern), so the
@@ -253,11 +258,19 @@ def build_range_prompt(template: str, range_text: str) -> str:
 
 @dataclass(frozen=True)
 class RangeCriticResult:
-    """The outcome of one range-critic read (SPEC §9): advisory prose for a
-    human operator, plus the provenance a later REPORT-event wiring layer
-    (out of scope here — see module docstring) needs to log spend."""
+    """The outcome of one range-critic read (SPEC §9; beads .51 + .41):
+    advisory prose for a human operator, plus the provenance a later
+    REPORT-event wiring layer (out of scope here — see module docstring)
+    needs to log spend.
+
+    ``findings`` are advisory prose ONLY — nothing more than what a human
+    operator reads. ``filed_tickets`` (beads .41) are RAW proposal dicts
+    for the CLI to file via `filing.file_proposals`; `review()` itself
+    files nothing — see the class/module invariant below.
+    """
 
     findings: str
+    filed_tickets: list[dict[str, Any]]
     prompt_artifact_hash: str
     model: str
     usage: dict[str, Any]
@@ -266,11 +279,13 @@ class RangeCriticResult:
 class RangeCritic:
     """One-shot range reviewer (SPEC §9/§3 `range-critic` role). Mirrors
     `critic.Critic`'s injected-client discipline: no provider SDK, no real
-    network I/O. Its output is ADVISORY prose to the operator — never a
-    gate, never auto-filed. `review` takes no store/pool/ticket-creation
-    handle of any kind, so the injection edge stays closed by construction:
-    nothing this method returns can ever become a bead, ticket, or task,
-    no matter what the findings text says.
+    network I/O. Its output is ADVISORY prose to the operator plus RAW
+    `filed_tickets` proposals (beads .41) — never a gate. `review` takes no
+    store/pool/ticket-creation handle of any kind and files NOTHING itself;
+    the injection edge stays closed by construction. The proposals it
+    returns can be persisted ONLY by the CLI, ONLY as unapproved,
+    structurally un-claimable rows that a human must triage — no findings
+    text can make this method (or anything it returns) file or approve work.
     """
 
     def __init__(
@@ -294,7 +309,7 @@ class RangeCritic:
         decoding_params: dict[str, Any],
     ) -> RangeCritic:
         """Build a `RangeCritic` whose template is read from a versioned
-        prompt artifact file (`prompts/rangecrit01` in production; tests
+        prompt artifact file (`prompts/rangecrit02` in production; tests
         pass their own inline `template` string directly to
         `RangeCritic()`)."""
         template = Path(path).read_text(encoding="utf-8")
@@ -302,10 +317,16 @@ class RangeCritic:
 
     def review(self, report: RangeReport) -> RangeCriticResult:
         """Make ONE client call over ``report``'s rendered text and return
-        advisory findings. Raises :class:`RangeReportError` — never a
-        partial or fabricated result — if the client call itself fails, or
-        if it succeeds but returns anything short of a dict carrying a
-        non-empty string ``"text"``. ``usage`` defaults to ``{}`` if absent.
+        advisory findings plus raw filed-ticket proposals. Raises
+        :class:`RangeReportError` — never a partial or fabricated result —
+        if the client call itself fails, or if it succeeds but returns
+        anything short of a dict carrying a non-empty string ``"text"``
+        (STRICT — the findings prose is the one thing this call must
+        deliver). ``usage`` defaults to ``{}`` if absent. ``filed_tickets``
+        (beads .41) is extracted TOLERANTLY — a non-list/absent value
+        becomes ``[]`` rather than failing the whole review; raw list
+        items pass through verbatim with no per-item validation (that is
+        `filing.file_proposals`'s job, not this method's).
 
         NEVER creates a bead/ticket — this method has no store/pool access
         by construction (SPEC §9: the injection edge stays closed in v0).
@@ -333,8 +354,18 @@ class RangeCritic:
         if not isinstance(usage, dict):
             usage = {}
 
+        # beads .41: filed_tickets is extracted TOLERANTLY — a malformed or
+        # absent channel must not sink the whole review (the advisory prose
+        # still reaches the operator). Raw list items pass through verbatim;
+        # `filing.file_proposals` is the single validation authority and
+        # emits per-item `bad-shape` audit events for anything malformed.
+        filed_tickets = response.get("filed_tickets")
+        if not isinstance(filed_tickets, list):
+            filed_tickets = []
+
         return RangeCriticResult(
             findings=text,
+            filed_tickets=filed_tickets,
             prompt_artifact_hash=self.prompt_artifact_hash,
             model=self.model,
             usage=usage,

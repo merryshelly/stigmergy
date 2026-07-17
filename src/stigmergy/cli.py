@@ -35,8 +35,9 @@ from stigmergy import approval, checks, spend, triage
 from stigmergy.charter import Charter, CharterError
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
-from stigmergy.critic_client import make_critic_client
+from stigmergy.critic_client import make_critic_client, make_range_critic_client
 from stigmergy.daemon import Daemon, DaemonError
+from stigmergy.filing import file_proposals
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
 from stigmergy.rangereport import (
@@ -47,7 +48,7 @@ from stigmergy.rangereport import (
     compute_range_report,
 )
 from stigmergy.records import EventType, RecordPlane, make_event
-from stigmergy.registry import UnbudgetableError
+from stigmergy.registry import PricingClass, UnbudgetableError
 from stigmergy.relay import CapabilityStore
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
@@ -521,28 +522,80 @@ def _cmd_ticket(args: argparse.Namespace) -> int:
 
 
 def _build_range_critic(resolved: ResolvedRig) -> RangeCritic:
-    """Production `RangeCritic` builder (bead .42 build spec §D) — a
-    monkeypatchable module-level helper: tests replace `cli._build_range_critic`
-    wholesale to inject a stub client, so this function must be called by
-    plain module-global name (never imported/aliased/bound early) at every
-    call site."""
+    """Production `RangeCritic` builder (bead .42 build spec §D; fixed by
+    beads .51 + .41) — a monkeypatchable module-level helper: tests replace
+    `cli._build_range_critic` wholesale to inject a stub client, so this
+    function must be called by plain module-global name (never imported/
+    aliased/bound early) at every call site.
+
+    `.51` fix: wires `make_range_critic_client` (NOT the verdict client
+    `make_critic_client`, which returns the wrong `{outcome,tier,reason,
+    severity}` shape) and reads the `rangecrit02` prompt artifact (the
+    `.41` combined-schema prompt bump, superseding `rangecrit01`).
+    """
     charter = resolved.charter
     critic_cfg = charter.raw["roles"]["critic"]
     critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
     return RangeCritic.from_prompt_file(
-        resolved.rig_paths["prompts_dir"] / "rangecrit01",
-        client=make_critic_client(key_provider=critic_key_provider, registry=resolved.registry),
+        resolved.rig_paths["prompts_dir"] / "rangecrit02",
+        client=make_range_critic_client(
+            key_provider=critic_key_provider, registry=resolved.registry
+        ),
         model=critic_cfg["model"],
         decoding_params={"temperature": critic_cfg["temperature"]},
     )
 
 
+def _report_ctx(resolved: ResolvedRig, report: RangeReport, result: RangeCriticResult) -> dict:
+    """The single source of truth for the 12 common-minus-4 event fields
+    shared by the REPORT event and the `.41` filing (beads .51 + .41 build
+    spec §3.3). Deliberately EXCLUDES `attempt_kind`/`tokens`/
+    `computed_usd`/`wall_time_seconds` — `make_event`/`file_proposals`
+    supply those 4 themselves, so including them here would raise a
+    duplicate-kwarg `TypeError` at the call sites below.
+
+    `ticket=None` is honest — a range report has no parent ticket
+    (advisor pt3); the resulting `discovered_from = "report-<oid>@None"`
+    is an accepted cosmetic wart, not to be "fixed" by forging `ticket`.
+    """
+    return {
+        "rig": _rig_name(resolved),
+        "ticket": None,
+        "dispatch_id": f"report-{report.staging_oid[:12]}",
+        "attempt": 0,
+        "rung": None,
+        "worker": None,
+        "charter_hash": resolved.charter.resolved_hash,
+        "approval_hash": None,
+        "image_digest": None,
+        "model": result.model,
+        "model_version": None,
+        "price_table_version": resolved.registry.version_hash,
+    }
+
+
 def _emit_report_event(
-    resolved: ResolvedRig, report: RangeReport, result: RangeCriticResult
+    resolved: ResolvedRig,
+    report: RangeReport,
+    result: RangeCriticResult,
+    record_plane: RecordPlane,
 ) -> None:
     """Emit ONE REPORT event for a `range-report --critic` run (bead .42
-    build spec §D field map). Never a silent $0 on an unbudgetable model —
-    `computed_usd` is `"unbudgetable"` in that case."""
+    build spec §D field map; unbudgetable fix beads .51 + .41). Takes an
+    INJECTED `record_plane` (built once by the caller) rather than
+    constructing its own — `_cmd_range_report` shares one `RecordPlane`
+    between this REPORT event and the `.41` filing.
+
+    Never a silent $0 on a paid metered call with unparseable usage:
+    `computed_usd` is `"unbudgetable"` whenever the model resolves to
+    `PricingClass.METERED` and `result.usage` is empty (the provenance-
+    gated sentinel `_map_range_usage` returns for "no trustworthy usage
+    object"). A registry-miss model is unbudgetable too (existing
+    behavior). Any other pricing class (or a metered model with real
+    usage) prices normally via `spend.cost_usd`, which may itself still
+    return the string `"unbudgetable"` (e.g. a metered category with no
+    declared rate).
+    """
     tokens = {
         "in": result.usage.get("in", 0),
         "cached": result.usage.get("cached", 0),
@@ -551,31 +604,24 @@ def _emit_report_event(
     }
     try:
         entry = resolved.registry.resolve(result.model)
-        computed_usd = spend.cost_usd(entry, tokens)
     except UnbudgetableError:
-        computed_usd = "unbudgetable"
+        computed_usd: float | str = "unbudgetable"
+    else:
+        if entry.pricing is PricingClass.METERED and not result.usage:
+            # paid call, no usage object -> never a silent $0.
+            computed_usd = "unbudgetable"
+        else:
+            computed_usd = spend.cost_usd(entry, tokens)
 
     event = make_event(
         EventType.REPORT,
-        rig=_rig_name(resolved),
-        ticket=None,
-        dispatch_id=f"report-{report.staging_oid[:12]}",
-        worker=None,
-        rung=None,
-        attempt=0,
+        **_report_ctx(resolved, report, result),
         attempt_kind="report",
-        charter_hash=resolved.charter.resolved_hash,
-        approval_hash=None,
-        image_digest=None,
-        model=result.model,
-        model_version=None,
-        price_table_version=resolved.registry.version_hash,
         tokens=tokens,
         computed_usd=computed_usd,
         prompt_artifact_hash=result.prompt_artifact_hash,
         wall_time_seconds=0.0,
     )
-    record_plane = RecordPlane(resolved.rig_paths["records_dir"])
     record_plane.append(event)
 
 
@@ -602,7 +648,32 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
                 print(f"stigmergy range-report: {exc}", file=sys.stderr)
                 return 1
             print(result.findings)
-            _emit_report_event(resolved, report, result)
+
+            # ONE RecordPlane, shared between the REPORT event and the
+            # .41 filing below (never construct a second one here).
+            record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+
+            # The paid call is recorded FIRST — even if filing partially
+            # rejects or hits caps, the REPORT event already landed
+            # (advisor pt4: "never lose the report").
+            _emit_report_event(resolved, report, result, record_plane)
+
+            ctx = _report_ctx(resolved, report, result)
+            limits = resolved.charter.raw["loop"]["dispatch_limits"]
+            filing_result = file_proposals(
+                result.filed_tickets,
+                store=resolved.store,
+                record_plane=record_plane,
+                ctx=ctx,
+                attempt_kind="report",
+                origin_role="range-critic",
+                max_filings=limits["filed_tickets"],
+                max_bytes=limits["filed_ticket_bytes"],
+            )
+            if filing_result.accepted_ids:
+                print("filed proposals:")
+                for filed_id in filing_result.accepted_ids:
+                    print(f"  {filed_id}")
 
         return 0
     finally:

@@ -49,6 +49,8 @@ def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> P
     (repo_dir / "prompts").mkdir(parents=True)
     (repo_dir / "prompts" / "code01").write_text("code01 template: $goal\n")
     (repo_dir / "prompts" / "critic01").write_text("critic01 template\n")
+    # beads .41: production `range-report --critic` reads rangecrit02.
+    (repo_dir / "prompts" / "rangecrit02").write_text("rangecrit02 template\n")
     (repo_dir / "README.md").write_text("hello from the fixture repo\n")
     env_cfg = ["-c", "user.email=test@example.com", "-c", "user.name=Test User"]
     subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
@@ -540,11 +542,18 @@ def test_D3c_range_report_no_critic(tmp_path: Path, capsys) -> None:
 # --- D4c: range-report --critic emits a REPORT event -----------------------
 
 
-def _stub_range_critic(model: str = "opus", usage: dict | None = None) -> RangeCritic:
+def _stub_range_critic(
+    model: str = "opus",
+    usage: dict | None = None,
+    filed_tickets: list | None = None,
+) -> RangeCritic:
     usage = usage if usage is not None else {"in": 1000, "cached": 0, "out": 200, "reasoning": 0}
 
     def client(prompt: str, *, model: str, **params: object) -> dict:
-        return {"text": "advisory findings: looks fine.", "usage": usage}
+        resp = {"text": "advisory findings: looks fine.", "usage": usage}
+        if filed_tickets is not None:
+            resp["filed_tickets"] = filed_tickets
+        return resp
 
     return RangeCritic(
         client=client,
@@ -626,3 +635,206 @@ def test_D7c_status_closes_store(tmp_path: Path, monkeypatch) -> None:
     rc = main(["status", "--rig", RIG, "--rigs-root", str(rigs_root)])
     assert rc == 0
     assert closed == [True]
+
+
+# ==========================================================================
+# beads .51 + .41 — combined-schema range-critic: production wiring fix +
+# filing of range-critic findings + unbudgetable-never-$0.
+# AUTHORED BY THE ORCHESTRATOR (Merry), not the implementor.
+# ==========================================================================
+
+
+def _records_all(rigs_root: Path) -> list[dict]:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        return list(RecordPlane(resolved.rig_paths["records_dir"]).read_events())
+    finally:
+        resolved.store.close()
+
+
+def _filed(rigs_root: Path) -> list[dict]:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        return resolved.store.list_filed_tickets()
+    finally:
+        resolved.store.close()
+
+
+# --- .51 wiring regression: the REAL _build_range_critic ------------------
+# The .51 bug was a WIRING bug: _build_range_critic used the verdict client
+# (make_critic_client) + rangecrit01. The fix wires make_range_critic_client
+# + rangecrit02. This exercises the REAL builder (no _build_range_critic
+# monkeypatch), proving both, without shelling out to 1Password.
+
+
+def test_51_build_range_critic_uses_range_client_and_rangecrit02(tmp_path, monkeypatch):
+    import hashlib
+
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        made = {"range_client": False}
+
+        def fake_range_client(**kwargs):
+            made["range_client"] = True
+
+            def client(prompt, *, model, **params):
+                return {"text": "F", "usage": {}, "filed_tickets": []}
+
+            return client
+
+        def boom_verdict_client(**kwargs):  # the .51 bug: MUST NOT be used here
+            raise AssertionError("range-report must NOT use the verdict client")
+
+        # make_op_key_provider is lazy in production; stub it so no `op` call.
+        monkeypatch.setattr(cli, "make_op_key_provider", lambda ref: (lambda: "dummy-key"))
+        monkeypatch.setattr(cli, "make_range_critic_client", fake_range_client)
+        monkeypatch.setattr(cli, "make_critic_client", boom_verdict_client)
+
+        critic = cli._build_range_critic(resolved)
+
+        assert made["range_client"] is True  # range client, not verdict client
+        # ...and the rangecrit02 template (the .41 prompt bump), not rangecrit01.
+        rc02 = resolved.rig_paths["prompts_dir"] / "rangecrit02"
+        assert critic.prompt_artifact_hash == hashlib.sha256(rc02.read_bytes()).hexdigest()
+    finally:
+        resolved.store.close()
+
+
+# --- .41 filing: range-critic proposals land unapproved + provenanced -----
+
+_TICKETS = [
+    {
+        "title": "Dedup range-base resolution",
+        "description": "weaver+rangereport diverge",
+        "evidence": "rangereport.py:210",
+    },
+    {"title": "Add cross-ticket test", "description": "interaction untested"},
+]
+
+
+def test_41_range_report_critic_files_proposals_unapproved(tmp_path, monkeypatch, capsys):
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic",
+        lambda resolved: _stub_range_critic("opus", filed_tickets=_TICKETS),
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+
+    filed = _filed(rigs_root)
+    assert len(filed) == 2
+    for row in filed:
+        assert row["origin_role"] == "range-critic"
+        assert row["triaged"] == 0  # UNAPPROVED — sits until human triage
+        # loop-stamped discovered-from provenance (report dispatch id).
+        assert row["discovered_from"].startswith("report-")
+        assert row["origin_dispatch_id"].startswith("report-")
+    titles = {r["title"] for r in filed}
+    assert titles == {"Dedup range-base resolution", "Add cross-ticket test"}
+
+    # ticket-filed events emitted (honest zero cost — no double count).
+    tf = _records_events(rigs_root, "ticket-filed")
+    assert len(tf) == 2
+    for ev in tf:
+        assert ev["origin"]["role"] == "range-critic"
+        assert ev["computed_usd"] == 0.0
+        assert ev["outcome"] == "accepted"
+
+    # findings AND the filed proposal ids are surfaced to the operator.
+    out = capsys.readouterr().out
+    assert "advisory findings" in out
+    for row in filed:
+        assert row["id"] in out
+
+
+def test_41_range_report_critic_files_nothing_when_no_proposals(tmp_path, monkeypatch, capsys):
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic", lambda resolved: _stub_range_critic("opus", filed_tickets=[])
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+    assert _filed(rigs_root) == []
+    assert _records_events(rigs_root, "ticket-filed") == []
+    # the REPORT event is still emitted (the paid call happened).
+    assert len(_records_events(rigs_root, "report")) == 1
+
+
+def test_41_report_event_emitted_before_ticket_filed_events(tmp_path, monkeypatch, capsys):
+    # Ordering (advisor pt4): the paid REPORT event is recorded BEFORE filing,
+    # so the accounting survives even if filing degrades.
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic",
+        lambda resolved: _stub_range_critic("opus", filed_tickets=_TICKETS),
+    )
+    main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    kinds = [e["event_type"] for e in _records_all(rigs_root)]
+    assert "report" in kinds
+    assert "ticket-filed" in kinds
+    assert kinds.index("report") < kinds.index("ticket-filed")
+
+
+def test_41_bad_shape_proposals_rejected_without_corrupting_pool(tmp_path, monkeypatch, capsys):
+    # file_proposals is the single validation authority: a malformed item is
+    # rejected (bad-shape event), the well-formed one lands, and the REPORT
+    # event is still emitted. review() passes items verbatim; the CLI files.
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    mixed = [{"title": "good", "description": "d"}, {"missing": "title"}]
+    monkeypatch.setattr(
+        cli, "_build_range_critic",
+        lambda resolved: _stub_range_critic("opus", filed_tickets=mixed),
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+    filed = _filed(rigs_root)
+    assert [r["title"] for r in filed] == ["good"]
+    outcomes = {e["outcome"] for e in _records_events(rigs_root, "ticket-filed")}
+    assert outcomes == {"accepted", "rejected"}
+    assert len(_records_events(rigs_root, "report")) == 1
+
+
+# --- finding #5 fold-in: absent metered usage -> unbudgetable, never $0 ----
+
+
+def test_51_metered_model_absent_usage_is_unbudgetable_not_zero(tmp_path, monkeypatch, capsys):
+    # SB decision: a paid (metered) call whose usage cannot be parsed records
+    # computed_usd="unbudgetable", NEVER $0 — AND still delivers the findings
+    # and files the proposals (never lose the report).
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic",
+        lambda resolved: _stub_range_critic("opus", usage={}, filed_tickets=_TICKETS),
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+
+    events = _records_events(rigs_root, "report")
+    assert len(events) == 1
+    assert events[0]["computed_usd"] == "unbudgetable"  # never a silent 0.0
+    # findings delivered AND proposals filed despite the unbudgetable usage.
+    assert "advisory findings" in capsys.readouterr().out
+    assert len(_filed(rigs_root)) == 2
+
+
+def test_51_subscription_model_absent_usage_stays_declared_zero(tmp_path, monkeypatch, capsys):
+    # Only METERED absent-usage is unbudgetable. A subscription model's marginal
+    # cost is a declared $0 (registry value), not a fallback — usage absence
+    # does not make it unbudgetable.
+    rigs_root = scaffold_rig(tmp_path)
+    _make_staging(rigs_root)
+    monkeypatch.setattr(
+        cli, "_build_range_critic",
+        lambda resolved: _stub_range_critic("claude-max-sub", usage={}),
+    )
+    rc = main(["range-report", "--rig", RIG, "--rigs-root", str(rigs_root), "--critic"])
+    assert rc == 0
+    events = _records_events(rigs_root, "report")
+    assert len(events) == 1
+    assert events[0]["computed_usd"] == 0.0  # declared subscription $0, not unbudgetable
