@@ -144,7 +144,7 @@ def test_artifact_cannot_forge_the_boundary():
 def test_judge_returns_structured_verdict_and_gate_fields():
     client = StubClient(response=_ok_response(outcome="unmet", severity="high"))
     critic = _critic(client)
-    verdict, gate_fields = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    verdict, gate_fields, filed_tickets = critic.judge(BENIGN_ARTIFACT, RUBRIC)
 
     assert isinstance(verdict, Verdict)
     assert verdict.outcome is Outcome.UNMET
@@ -156,6 +156,7 @@ def test_judge_returns_structured_verdict_and_gate_fields():
     assert gate_fields["decoding_params"] == PINNED
     assert gate_fields["prompt_artifact_hash"]  # the critic01 template hash
     assert gate_fields["model"] == "opus"
+    assert filed_tickets == []  # bead .39: no filed_tickets in this response
 
 
 def test_decoding_params_are_pinned_and_passed_to_client():
@@ -173,7 +174,7 @@ def test_prompt_hash_is_stable_and_over_the_template():
 
     client = StubClient(response=_ok_response())
     critic = _critic(client)
-    _, gate_fields = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    _, gate_fields, _ = critic.judge(BENIGN_ARTIFACT, RUBRIC)
     expected = hashlib.sha256(TEMPLATE.encode("utf-8")).hexdigest()
     assert gate_fields["prompt_artifact_hash"] == expected
 
@@ -219,3 +220,71 @@ def test_unmet_does_not_land_regardless_of_severity():
     unmet_high = Verdict(outcome=Outcome.UNMET, tier=2, reason="no test", severity=Severity.HIGH)
     assert unmet_low.lands() is False
     assert unmet_high.lands() is False
+
+
+# --------------------------------------------------------------------------
+# D14 (bead .39): filed_tickets — tolerant + additive; verdict stays STRICT
+# --------------------------------------------------------------------------
+#
+# The critic gains an optional filed_tickets channel (out-of-rubric follow-up
+# proposals). judge() now returns (verdict, gate_fields, filed_tickets). The
+# verdict stays the strict safety authority (a malformed verdict is always
+# CriticInfraError, parsed BEFORE filings); filings are extracted TOLERANTLY
+# (non-list/absent -> []) and passed through verbatim — file_proposals is the
+# sole item-shape validator, not critic.py.
+
+_FILINGS = [
+    {"title": "Deduplicate range-base resolution", "description": "two paths do the same thing"},
+    {"title": "Cover the empty-usage branch", "description": "uncovered", "evidence": "cli.py:640"},
+]
+
+
+def test_judge_returns_filed_tickets_verbatim_when_present():
+    resp = {**_ok_response(outcome="met", severity="none"), "filed_tickets": _FILINGS}
+    verdict, gate_fields, filed_tickets = _critic(StubClient(response=resp)).judge(
+        BENIGN_ARTIFACT, RUBRIC
+    )
+    assert verdict.outcome is Outcome.MET
+    assert filed_tickets == _FILINGS  # verbatim; file_proposals judges item shape
+    # filings are NOT smuggled into gate_fields (event-provenance metadata only).
+    assert set(gate_fields) == {"decoding_params", "prompt_artifact_hash", "model"}
+
+
+def test_judge_absent_filed_tickets_is_empty_list():
+    # _ok_response carries no filed_tickets key -> tolerant [].
+    _, _, filed_tickets = _critic(StubClient(response=_ok_response())).judge(
+        BENIGN_ARTIFACT, RUBRIC
+    )
+    assert filed_tickets == []
+
+
+def test_judge_non_list_filed_tickets_is_empty_list():
+    # A malformed filed_tickets channel must NOT sink the verdict -> tolerant [].
+    for bad in ("not a list", {"title": "x"}, 5, None):
+        resp = {**_ok_response(), "filed_tickets": bad}
+        _, _, filed_tickets = _critic(StubClient(response=resp)).judge(BENIGN_ARTIFACT, RUBRIC)
+        assert filed_tickets == []
+
+
+def test_judge_passes_filed_tickets_items_through_without_shape_validation():
+    # Item shape is file_proposals' job, not critic.py's — malformed items ride
+    # through verbatim (the client returned a list; critic.py never pre-filters).
+    malformed = [{"title": "ok", "description": "d"}, {"no_title": True}, "garbage"]
+    resp = {**_ok_response(), "filed_tickets": malformed}
+    _, _, filed_tickets = _critic(StubClient(response=resp)).judge(BENIGN_ARTIFACT, RUBRIC)
+    assert filed_tickets == malformed
+
+
+def test_malformed_verdict_with_valid_filed_tickets_still_infra():
+    # Verdict stays STRICT and is parsed FIRST: a bad verdict fails the whole
+    # judge() call even when filed_tickets is well-formed. Filings are additive,
+    # never a reason to accept a broken verdict.
+    resp = {
+        "outcome": "banana",
+        "tier": 2,
+        "reason": "r",
+        "severity": "none",
+        "filed_tickets": _FILINGS,
+    }
+    with pytest.raises(CriticInfraError):
+        _critic(StubClient(response=resp)).judge(BENIGN_ARTIFACT, RUBRIC)

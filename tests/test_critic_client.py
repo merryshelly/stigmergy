@@ -118,6 +118,16 @@ def test_verdict_tool_schema():
     assert props["severity"]["enum"] == ["none", "low", "medium", "high"]
     assert props["tier"]["type"] == "integer"
     assert props["reason"]["type"] == "string"
+    # bead .39: optional filed_tickets channel (same shape as the range tool);
+    # NOT in top-level required — a clean verdict files nothing.
+    assert "filed_tickets" not in schema["required"]
+    assert props["filed_tickets"]["type"] == "array"
+    item = props["filed_tickets"]["items"]
+    assert item["type"] == "object"
+    assert set(item["required"]) == {"title", "description"}
+    assert item["properties"]["title"]["type"] == "string"
+    assert item["properties"]["description"]["type"] == "string"
+    assert item["properties"]["evidence"]["type"] == "string"
 
 
 # --------------------------------------------------------------------------
@@ -284,13 +294,29 @@ def _critic(registry, http):
 def test_judge_returns_valid_verdict_end_to_end(registry):
     http = FakeHttp(response=_tool_use_response(outcome="met", severity="none", reason="ok"))
     critic = _critic(registry, http)
-    verdict, gate_fields = critic.judge("artifact", ["item one"])
+    verdict, gate_fields, filed_tickets = critic.judge("artifact", ["item one"])
     assert isinstance(verdict, Verdict)
     assert verdict.outcome is Outcome.MET
     assert verdict.severity is Severity.NONE
     assert gate_fields["model"] == "opus"
     assert "prompt_artifact_hash" in gate_fields
     assert gate_fields["decoding_params"] == {"temperature": 0.0}
+    assert filed_tickets == []  # bead .39: no filed_tickets in this response
+
+
+def test_verdict_client_passes_filed_tickets_through_when_present(registry):
+    # bead .39: the raw verdict client returns the tool input verbatim, so an
+    # optional filed_tickets key rides along untouched — critic.py extracts it
+    # tolerantly downstream; the client itself never validates or strips it
+    # (same raw-passthrough split as the range client / .36).
+    resp = _tool_use_response(outcome="met", severity="none")
+    filings = [{"title": "t", "description": "d"}]
+    resp["content"][0]["input"]["filed_tickets"] = filings
+    http = FakeHttp(response=resp)
+    client = make_critic_client(key_provider=_key_provider(), registry=registry, http_post=http)
+    raw = client(PROMPT, model="opus", temperature=0.0)
+    assert raw["filed_tickets"] == filings
+    assert raw["outcome"] == "met"
 
 
 def test_judge_transport_failure_is_infra_never_verdict(registry):

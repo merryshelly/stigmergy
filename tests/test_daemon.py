@@ -471,6 +471,8 @@ def make_real_weaver(env: Env, *, run_checks_fn: Any, critic: Any) -> Weaver:
         protected_paths=[],
         journal_path=env.tmp_path / "weave-journal.jsonl",
         ctx_of=stub_ctx_of,
+        filing_max_filings=5,
+        filing_max_bytes=16384,
     )
 
 

@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -70,6 +71,7 @@ from typing import Any
 
 from stigmergy.checks import CheckOutcome, CheckResult
 from stigmergy.critic import CriticInfraError
+from stigmergy.filing import file_proposals
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.statemachine import (
     GATED,
@@ -81,6 +83,8 @@ from stigmergy.statemachine import (
     transition,
 )
 from stigmergy.verdicts import Verdict
+
+_logger = logging.getLogger(__name__)
 
 # The fixed refspec convention a parked ticket's bundle is expected to carry
 # (a documented convention this module owns, since a bundle is just object
@@ -191,6 +195,14 @@ class Weaver:
     stub; if omitted, a conservative all-zero/None default is used (see
     :meth:`_default_ctx`).
 
+    ``filing_max_filings`` / ``filing_max_bytes``: REQUIRED (no defaults —
+    an omitted wiring must fail loudly, not silently pass) D14 per-dispatch
+    filing caps (bead `.39`), injected explicitly from
+    ``charter.raw["loop"]["dispatch_limits"]`` at wire time — passed
+    straight through to :func:`stigmergy.filing.file_proposals` as
+    ``max_filings``/``max_bytes`` when the critic's `filed_tickets` are
+    filed after the GATE event (see :meth:`_file_critic_proposals`).
+
     **Bundle convention** (documented here since the design doc leaves the
     exact bundle-location/ref-name convention to the implementation): a
     parked ticket's work product is a `git bundle` file whose path is
@@ -215,6 +227,8 @@ class Weaver:
         flake_reruns: int,
         protected_paths: list[str],
         journal_path: str | Path,
+        filing_max_filings: int,
+        filing_max_bytes: int,
         ctx_of: Any = None,
     ) -> None:
         self.store = store
@@ -227,6 +241,8 @@ class Weaver:
         self.protected_paths = list(protected_paths)
         self.journal_path = Path(journal_path)
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self.filing_max_filings = filing_max_filings
+        self.filing_max_bytes = filing_max_bytes
         self.ctx_of = ctx_of
 
     # -- WeaveJournalResolver protocol (recover.py) ------------------------
@@ -407,7 +423,7 @@ class Weaver:
             rubric_items = self._rubric_items(ticket_row)
 
             try:
-                verdict, gate_fields = self.critic.judge(artifact, rubric_items)
+                verdict, gate_fields, filed_tickets = self.critic.judge(artifact, rubric_items)
             except CriticInfraError:
                 return self._die(
                     ticket_id=ticket_id,
@@ -429,6 +445,12 @@ class Weaver:
                 )
 
             self._append_gate_event(ctx, verdict=verdict, gate_fields=gate_fields, now=now)
+            # D14 (bead .39): verdict-first / filings-after — the paid GATE
+            # event is recorded before ANY filing is attempted, and filing
+            # happens on BOTH the MET and UNMET paths below (out-of-rubric
+            # findings survive even a rejected candidate). Never reached on
+            # a CriticInfraError (the `except` above returns first).
+            self._file_critic_proposals(ctx, filed_tickets)
 
             if not verdict.lands():
                 return self._die(
@@ -943,6 +965,66 @@ class Weaver:
         fields["ts"] = now
         event = make_event(EventType.GATE, **fields)
         self.record_plane.append(event)
+
+    def _file_critic_proposals(
+        self, ctx: dict[str, Any], filed_tickets: list[dict[str, Any]]
+    ) -> None:
+        """D14 (bead .39): file the critic's out-of-rubric `filed_tickets`
+        via the shared, verbatim-reused :func:`stigmergy.filing.
+        file_proposals` core, `origin_role="critic"` — mirrors bead
+        `.41`'s range-critic filing (`cli._report_ctx` + the filing call
+        in `_cmd_range_report`), except this weaver's `ctx` carries the
+        REAL gated ticket id (unlike the range report's `ticket=None`), so
+        `discovered_from = "{dispatch_id}@{ticket}"` is honest here.
+
+        `filing_ctx` is exactly the 12 `make_event` common fields MINUS
+        the 4 that `file_proposals`/`make_event` supply themselves
+        (`attempt_kind`, `tokens`, `computed_usd`, `wall_time_seconds`) —
+        including any of those 4 would raise a duplicate-kwarg `TypeError`
+        at `_emit`'s `make_event(**ctx, attempt_kind=..., tokens=...)`
+        call inside `filing.py`. `file_proposals([], ...)` (the common
+        case — most critics file nothing) emits no events and writes
+        nothing.
+        """
+        filing_ctx = {
+            "rig": ctx["rig"],
+            "ticket": ctx["ticket"],
+            "dispatch_id": ctx["dispatch_id"],
+            "attempt": ctx["attempt"],
+            "rung": ctx["rung"],
+            "worker": ctx["worker"],
+            "charter_hash": ctx["charter_hash"],
+            "approval_hash": ctx["approval_hash"],
+            "image_digest": ctx["image_digest"],
+            "model": ctx["model"],
+            "model_version": ctx["model_version"],
+            "price_table_version": ctx["price_table_version"],
+        }
+        try:
+            file_proposals(
+                filed_tickets,
+                store=self.store,
+                record_plane=self.record_plane,
+                ctx=filing_ctx,
+                attempt_kind=ctx["attempt_kind"],
+                origin_role="critic",
+                max_filings=self.filing_max_filings,
+                max_bytes=self.filing_max_bytes,
+            )
+        except Exception:
+            # Defensive belt (mirrors the daemon's harvest_worker_filings
+            # posture): file_proposals is contracted to fold every failure
+            # into a recorded rejection and never raise, but the weaver is
+            # the single serialized writer — an unexpected filing-side
+            # exception here (after the GATE event, before disposition) must
+            # never strand the weave at GATED. Filing is strictly additive:
+            # losing a filing is acceptable; crashing the writer is not.
+            _logger.warning(
+                "critic filing failed for dispatch %s (ticket %s)",
+                ctx.get("dispatch_id"),
+                ctx.get("ticket"),
+                exc_info=True,
+            )
 
     # -- journal --------------------------------------------------------------
 

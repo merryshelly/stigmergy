@@ -253,13 +253,16 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # bead .36: the critic client is now real (direct Anthropic Messages call,
     # SPEC §7) -- any client-side/provider failure surfaces as CriticInfraError,
     # never a silent wrong gate verdict (critic.py's own fail-closed discipline).
+    # bead .39: the staging-gate critic now reads critic02 (the D14 filing-
+    # mandate prompt bump, carrying the optional filed_tickets schema field).
     critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
     critic = Critic.from_prompt_file(
-        rig_paths["prompts_dir"] / "critic01",  # hardcoded filename -- see §3.7 note
+        rig_paths["prompts_dir"] / "critic02",  # hardcoded filename -- see §3.7 note
         client=make_critic_client(key_provider=critic_key_provider, registry=registry),
         model=critic_cfg["model"],
         decoding_params={"temperature": critic_cfg["temperature"]},
     )
+    dispatch_limits = charter.raw["loop"]["dispatch_limits"]
     weaver = Weaver(
         store=store,
         record_plane=record_plane,
@@ -270,6 +273,10 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         flake_reruns=charter.raw["loop"]["retries"]["flake_reruns"],
         protected_paths=list(_DEFAULT_PROTECTED_PATHS),
         journal_path=records_dir / "weave_journal.jsonl",
+        # bead .39: D14 per-dispatch filing caps, injected explicitly from the
+        # charter (never an implicit charter reach-in from inside the weaver).
+        filing_max_filings=dispatch_limits["filed_tickets"],
+        filing_max_bytes=dispatch_limits["filed_ticket_bytes"],
     )
 
     return Daemon(

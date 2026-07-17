@@ -222,7 +222,18 @@ def file_proposals(
             rejected.append({"reason": "size-cap-exceeded", "title": proposal["title"]})
             continue
 
-        pid = f"filed-{ctx['dispatch_id']}-{n}"
+        # bead .39: the id namespace includes `origin_role`. The worker's
+        # dispatch and the staging critic's gate share ONE real dispatch id
+        # (the daemon reconciles the ticket's lease_dispatch_id to the worker's
+        # plan.dispatch_id, and the production weaver's default ctx reads that
+        # same lease id) — so a plain `filed-{dispatch_id}-{n}` collides across
+        # roles: a critic proposal at index n would hit the worker proposal's
+        # primary key and be dropped as `store-error`, silently losing the
+        # (per D14, highest-value) crit-role discovery. Keying on role makes
+        # cross-role filings on one dispatch structurally distinct, while a
+        # re-run of the SAME role on the SAME dispatch still collides -> the
+        # intended idempotency guard below.
+        pid = f"filed-{origin_role}-{ctx['dispatch_id']}-{n}"
         ph = proposal_hash(proposal)
         try:
             store.add_filed_ticket(
@@ -241,8 +252,8 @@ def file_proposals(
             # Defense in depth: harvest_worker_filings' contract is "never
             # raises into the dispatch teardown path" (SPEC amendment A),
             # and file_proposals is reused verbatim by that path. A store-
-            # level failure (e.g. a `filed-<dispatch_id>-<n>` primary-key
-            # collision on a re-run harvest for the same dispatch) must
+            # level failure (e.g. a `filed-<role>-<dispatch_id>-<n>` primary-
+            # key collision on a re-run harvest for the same role+dispatch) must
             # become a per-proposal rejection, never an exception that
             # escapes to the caller.
             _emit(

@@ -15,6 +15,10 @@ The client only has two jobs: (a) return the raw tool-input dict, or (b)
 raise. `critic._parse_verdict` remains the SOLE authority on verdict shape
 — this module never re-implements that validation, and a malformed/missing
 tool_use block is `CriticClientError` (infra), never a fabricated verdict.
+`build_verdict_tool`'s schema also carries an OPTIONAL `filed_tickets`
+channel (D14, bead `.39`) — the raw tool-input dict simply carries it
+verbatim when the model populates it; this module does not extract or
+validate it (`critic.py`'s tolerant `_extract_filed_tickets` does).
 
 `make_range_critic_client` (beads .51 + .41) is a SECOND, sibling direct
 client for the range-critic role. `.51` was a wiring bug: production
@@ -97,7 +101,16 @@ def build_verdict_tool() -> dict[str, Any]:
     return exactly one structured verdict. Mirrors `Outcome`/`Severity`
     (`verdicts.py`) but is only a HINT to the model — `_parse_verdict`
     (`critic.py`) remains the authority we actually trust; this schema is
-    never itself treated as validation."""
+    never itself treated as validation.
+
+    D14 (bead `.39`): the schema also carries an OPTIONAL `filed_tickets`
+    array — identical in shape to `build_range_review_tool()`'s — for the
+    critic to propose out-of-rubric follow-up tickets alongside its
+    verdict. It is deliberately NOT in the top-level `required` list (a
+    clean verdict files nothing) and, like the rest of this schema, is
+    only a HINT: `critic.py` tolerantly extracts it and never treats it
+    as validation, mirroring the strict-verdict/tolerant-filings split.
+    """
     return {
         "name": VERDICT_TOOL_NAME,
         "description": (
@@ -124,6 +137,18 @@ def build_verdict_tool() -> dict[str, Any]:
                     "type": "string",
                     "enum": ["none", "low", "medium", "high"],
                     "description": "Severity of any defect found (recorded, not gating).",
+                },
+                "filed_tickets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "evidence": {"type": "string"},
+                        },
+                        "required": ["title", "description"],
+                    },
                 },
             },
             "required": ["outcome", "tier", "reason", "severity"],

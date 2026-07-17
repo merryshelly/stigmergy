@@ -160,6 +160,30 @@ def _parse_verdict(response: Any) -> Verdict:
     return Verdict(outcome=outcome, tier=tier, reason=reason, severity=severity)
 
 
+def _extract_filed_tickets(response: Any) -> list[dict[str, Any]]:
+    """Tolerantly extract the optional `filed_tickets` channel (D14, bead
+    `.39`) from a critic client response. Mirrors `rangereport.review()`'s
+    own tolerant `filed_tickets` handling: NEVER raises, NEVER validates
+    item shape (`file_proposals`, `filing.py`, is the sole item-shape
+    validation authority and emits its own per-item `bad-shape` audit
+    events) — this is purely a tolerant "is there a well-formed list
+    here?" check.
+
+    - non-dict ``response`` -> ``[]`` (defense in depth only: by the time
+      this runs, `_parse_verdict` has already raised on a non-dict
+      response, so this branch should be unreachable in practice).
+    - ``response["filed_tickets"]`` absent, or present but not a `list`,
+      -> ``[]``.
+    - a well-formed `list` is returned VERBATIM, items unvalidated.
+    """
+    if not isinstance(response, dict):
+        return []
+    ft = response.get("filed_tickets")
+    if not isinstance(ft, list):
+        return []
+    return ft
+
+
 class Critic:
     """One-shot, no-tools structured-output critic caller (SPEC §3/§7:
     "Direct one-shot structured-output API call. Direct call, no tool loop").
@@ -201,14 +225,28 @@ class Critic:
         template = Path(path).read_text(encoding="utf-8")
         return cls(client=client, model=model, decoding_params=decoding_params, template=template)
 
-    def judge(self, artifact: str, rubric_items: list[str]) -> tuple[Verdict, dict[str, Any]]:
+    def judge(
+        self, artifact: str, rubric_items: list[str]
+    ) -> tuple[Verdict, dict[str, Any], list[dict[str, Any]]]:
         """Judge ``artifact`` against ``rubric_items`` with one one-shot,
-        no-tools client call. Returns ``(verdict, gate_fields)``.
+        no-tools client call. Returns ``(verdict, gate_fields,
+        filed_tickets)``.
 
         ``gate_fields`` carries the gate-event provenance SPEC §8 requires
         for every `gate` event: the pinned decoding params (verbatim, as
         passed to the client), the critic01 template hash, and the
-        resolved model name.
+        resolved model name. Filings are NEVER folded into `gate_fields`
+        (`gate_fields` is event-provenance metadata; filings are a
+        separate, additive channel the weaver files itself).
+
+        ``filed_tickets`` (D14, bead `.39`) is the critic's optional,
+        tolerant, out-of-rubric follow-up proposals — extracted via
+        :func:`_extract_filed_tickets` AFTER the verdict has already been
+        strictly parsed, so a malformed verdict always raises
+        :class:`CriticInfraError` regardless of whether `filed_tickets`
+        is well-formed. Absent/non-list `filed_tickets` -> `[]`; a
+        well-formed list is returned verbatim, items unvalidated (the
+        weaver's `file_proposals` call is the sole item-shape authority).
 
         Raises :class:`CriticInfraError` — never a `Verdict` — if the
         client call itself fails, or if it succeeds but returns anything
@@ -223,11 +261,14 @@ class Critic:
         except Exception as exc:
             raise CriticInfraError(f"critic client call failed: {exc!r}") from exc
 
+        # Verdict parsed FIRST and STRICTLY — a malformed verdict fails the
+        # whole call before any filing is ever considered (D14, bead .39).
         verdict = _parse_verdict(response)
+        filed_tickets = _extract_filed_tickets(response)
 
         gate_fields = {
             "decoding_params": self.decoding_params,
             "prompt_artifact_hash": self.prompt_artifact_hash,
             "model": self.model,
         }
-        return verdict, gate_fields
+        return verdict, gate_fields, filed_tickets

@@ -141,7 +141,8 @@ def test_valid_filing_lands_n_unapproved_rows_with_provenance(tmp_path, store, p
     rows = store.list_filed_tickets()
     assert len(rows) == 3
     ids = {r["id"] for r in rows}
-    assert ids == {f"filed-{DISPATCH_ID}-{n}" for n in (1, 2, 3)}
+    # bead .39: the id namespace carries origin_role (`filed-{role}-{dispatch}-{n}`).
+    assert ids == {f"filed-worker-{DISPATCH_ID}-{n}" for n in (1, 2, 3)}
     assert ids == set(result.accepted_ids)
 
     for r in rows:
@@ -371,7 +372,7 @@ def test_ticket_filed_accepted_event_shape(tmp_path, store, plane):
     # ticket-filed specifics.
     assert ev["outcome"] == "accepted"
     assert ev["reason"] is None
-    assert ev["filed_ticket_id"] == f"filed-{DISPATCH_ID}-1"
+    assert ev["filed_ticket_id"] == f"filed-worker-{DISPATCH_ID}-1"
     assert ev["origin"] == {
         "role": "worker",
         "worker": DISPATCH_ID,
@@ -468,6 +469,49 @@ def test_file_proposals_reused_with_critic_origin_role(store, plane):
     assert store.get_ticket(row["id"]) is None  # still not a claimable ticket
     ev = filed_events(plane)[0]
     assert ev["origin"]["role"] == "critic"
+
+
+def test_worker_and_critic_filings_on_same_dispatch_do_not_collide(store, plane):
+    """bead .39 regression: the worker's harvest and the staging critic's gate
+    filing share ONE real dispatch id in production (the daemon reconciles the
+    ticket's lease_dispatch_id to the worker's plan.dispatch_id, and the weaver's
+    default ctx reads that same lease id). With a role-blind `filed-{dispatch}-{n}`
+    id, the critic's proposal at index n would hit the worker proposal's primary
+    key and be dropped as `store-error`, silently losing the crit-role discovery.
+    Keying the id on origin_role makes both land with distinct ids."""
+    shared = dispatch_ctx(dispatch_id="shared-dispatch-1", worker="worker-1")
+
+    worker_res = file_proposals(
+        [valid_proposal(1), valid_proposal(2)],
+        store=store,
+        record_plane=plane,
+        ctx=shared,
+        attempt_kind="initial",
+        origin_role="worker",
+        max_filings=DEFAULT_MAX,
+        max_bytes=DEFAULT_BYTES,
+    )
+    critic_res = file_proposals(
+        [valid_proposal(1), valid_proposal(2)],  # same content, same indexes
+        store=store,
+        record_plane=plane,
+        ctx=shared,  # SAME dispatch id + worker
+        attempt_kind="report",
+        origin_role="critic",
+        max_filings=DEFAULT_MAX,
+        max_bytes=DEFAULT_BYTES,
+    )
+
+    # Both roles' proposals landed — none dropped as a collision.
+    assert len(worker_res.accepted_ids) == 2
+    assert len(critic_res.accepted_ids) == 2
+    assert critic_res.rejected == []
+    # Distinct id namespaces; no overlap.
+    assert set(worker_res.accepted_ids).isdisjoint(critic_res.accepted_ids)
+    assert all(i.startswith("filed-worker-") for i in worker_res.accepted_ids)
+    assert all(i.startswith("filed-critic-") for i in critic_res.accepted_ids)
+    # All four rows persisted.
+    assert len(store.list_filed_tickets()) == 4
 
 
 def test_list_filed_tickets_filter_and_count(store, plane):

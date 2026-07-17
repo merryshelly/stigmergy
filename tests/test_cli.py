@@ -49,6 +49,8 @@ def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> P
     (repo_dir / "prompts").mkdir(parents=True)
     (repo_dir / "prompts" / "code01").write_text("code01 template: $goal\n")
     (repo_dir / "prompts" / "critic01").write_text("critic01 template\n")
+    # bead .39: production staging-gate critic reads critic02 (the D14 filing bump).
+    (repo_dir / "prompts" / "critic02").write_text("critic02 template\n")
     # beads .41: production `range-report --critic` reads rangecrit02.
     (repo_dir / "prompts" / "rangecrit02").write_text("rangecrit02 template\n")
     (repo_dir / "README.md").write_text("hello from the fixture repo\n")
@@ -149,9 +151,22 @@ def test_main_daemon_run_rigs_root_override(tmp_path: Path, monkeypatch) -> None
 def test_build_daemon_wiring(tmp_path: Path) -> None:
     rigs_root = scaffold_rig(tmp_path)
     resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+    # bead .39: inject SENTINEL filing caps on the resolved charter so the
+    # weaver-wiring assertion below proves the values FLOW from
+    # charter.raw[loop][dispatch_limits] (an anti-.51 hardcode would not track
+    # these sentinels — the defaults are 5 / 16384).
+    resolved.charter.raw["loop"]["dispatch_limits"]["filed_tickets"] = 3
+    resolved.charter.raw["loop"]["dispatch_limits"]["filed_ticket_bytes"] = 9999
     # _build_daemon takes ownership of resolved.store via the Daemon.
     daemon = _build_daemon(resolved)
     try:
+        # bead .39: D14 filing caps flow charter -> weaver.
+        assert daemon._weaver.filing_max_filings == 3
+        assert daemon._weaver.filing_max_bytes == 9999
+        # bead .39: _build_daemon loads critic02 (filing-mandate bump), NOT critic01.
+        assert daemon._weaver.critic.template == (
+            resolved.rig_paths["prompts_dir"] / "critic02"
+        ).read_text(encoding="utf-8")
         # checker_image == charter [rig].image (v0: one image for worker+checker)
         assert daemon._checker_image == "stigmergy-worker:py312"
 

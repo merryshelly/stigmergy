@@ -192,10 +192,18 @@ class SpyCritic:
         return self._inner.judge(artifact, rubric_items)
 
 
-def make_critic(*, outcome: str = "met", severity: str = "none", reason: str = "looks good"):
+def make_critic(
+    *,
+    outcome: str = "met",
+    severity: str = "none",
+    reason: str = "looks good",
+    filed_tickets: list | None = None,
+):
     from stigmergy.critic import Critic
 
     response = {"outcome": outcome, "tier": 1, "reason": reason, "severity": severity}
+    if filed_tickets is not None:
+        response["filed_tickets"] = filed_tickets  # bead .39: optional filing channel
     client = StubCriticClient(response=response)
     return Critic(
         client=client,
@@ -277,6 +285,8 @@ def make_weaver(
     critic: Any,
     protected_paths: list[str] | None = None,
     journal_name: str = "weave-journal.jsonl",
+    filing_max_filings: int = 5,
+    filing_max_bytes: int = 16384,
 ) -> Weaver:
     return Weaver(
         store=store,
@@ -289,6 +299,8 @@ def make_weaver(
         protected_paths=protected_paths or [],
         journal_path=tmp_path / journal_name,
         ctx_of=stub_ctx_of,
+        filing_max_filings=filing_max_filings,
+        filing_max_bytes=filing_max_bytes,
     )
 
 
@@ -533,6 +545,8 @@ def test_cas_abort_on_concurrent_staging_move(tmp_path, store, plane):
         protected_paths=[],
         journal_path=tmp_path / "journal.jsonl",
         ctx_of=stub_ctx_of,
+        filing_max_filings=5,
+        filing_max_bytes=16384,
     )
     results = weaver.weave(now=1000.0)
 
@@ -1109,3 +1123,196 @@ def test_committed_filed_tickets_is_stripped_and_flagged(tmp_path, store, plane)
     assert len(dispositions) == 1
     assert dispositions[0]["disposition"] == "landed"
     assert "filed-tickets-stripped" in (dispositions[0].get("reason") or "")
+
+
+# ==========================================================================
+# D14 (bead .39): the STAGING CRITIC files out-of-rubric proposals.
+# After the GATE event (verdict-first), the weaver files the critic's
+# filed_tickets via file_proposals(origin_role="critic") — on BOTH the MET
+# and UNMET paths (out-of-rubric findings survive a rejected candidate).
+# A critic-infra failure files nothing. Filings are honest-zero cost.
+# ==========================================================================
+
+_CRITIC_FILINGS = [
+    {"title": "Extract shared range-base helper", "description": "two call sites duplicate it"},
+    {"title": "Add regression test for X", "description": "uncovered", "evidence": "y.py:10"},
+]
+
+
+def ticket_filed_events(plane: RecordPlane, ticket_id: str) -> list[dict]:
+    return [
+        e
+        for e in plane.read_events()
+        if e["event_type"] == "ticket-filed" and e["ticket"] == ticket_id
+    ]
+
+
+def test_met_verdict_files_critic_proposals_and_lands(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t1", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t1", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met", filed_tickets=_CRITIC_FILINGS),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "landed"  # filing is additive, never blocks landing
+    assert store.get_ticket("t1")["state"] == LANDED
+
+    filed = store.list_filed_tickets(triaged=False)
+    assert len(filed) == 2
+    assert {f["title"] for f in filed} == {t["title"] for t in _CRITIC_FILINGS}
+    for row in filed:
+        assert row["origin_role"] == "critic"  # unapproved, critic-origin
+        assert row["triaged"] == 0
+        assert row["discovered_from"] == "dispatch-t1@t1"  # real dispatch@ticket provenance
+
+    filings = ticket_filed_events(plane, "t1")
+    assert len(filings) == 2
+    for ev in filings:
+        assert ev["computed_usd"] == 0.0  # honest zero — the LLM cost is on the GATE event
+        assert ev["origin"]["role"] == "critic"
+
+
+def test_unmet_verdict_still_files_proposals(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    pinned = rev_parse(staging_repo, "refs/heads/staging")
+    bundle = make_bundle(tmp_path, staging_repo, name="t2", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t2", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="unmet", reason="missing tests", filed_tickets=_CRITIC_FILINGS),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "rejected"  # in-rubric failure -> rejected
+    assert rev_parse(staging_repo, "refs/heads/staging") == pinned
+    # ...but out-of-rubric proposals were still captured ("only a filed ticket survives").
+    filed = store.list_filed_tickets(triaged=False)
+    assert len(filed) == 2
+    assert all(f["origin_role"] == "critic" for f in filed)
+
+
+def test_gate_event_precedes_ticket_filed_events(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t3", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t3", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met", filed_tickets=_CRITIC_FILINGS),
+    )
+    weaver.weave(now=1000.0)
+
+    kinds = [e["event_type"] for e in plane.read_events() if e["ticket"] == "t3"]
+    # verdict-first: the GATE event is recorded before ANY ticket-filed event.
+    assert "gate" in kinds and "ticket-filed" in kinds
+    assert kinds.index("gate") < kinds.index("ticket-filed")
+
+
+def test_critic_infra_files_nothing(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t4", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t4", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_infra_critic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "infra"
+    assert store.list_filed_tickets() == []  # no verdict -> no filings
+    assert ticket_filed_events(plane, "t4") == []
+
+
+def test_no_filings_when_critic_returns_none(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t5", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t5", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),  # no filed_tickets -> tolerant []
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "landed"
+    assert store.list_filed_tickets() == []
+    assert ticket_filed_events(plane, "t5") == []
+
+
+def test_count_cap_rejects_whole_critic_filing(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t6", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t6", work_product=bundle)
+
+    too_many = [{"title": f"t{i}", "description": "d"} for i in range(4)]
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met", filed_tickets=too_many),
+        filing_max_filings=2,  # 4 > 2 -> whole filing rejected (file_proposals' rule)
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "landed"  # still lands; filing is additive
+    assert store.list_filed_tickets() == []  # nothing accepted
+    filings = ticket_filed_events(plane, "t6")
+    assert len(filings) == 1
+    assert filings[0]["outcome"] == "rejected"
+    assert filings[0]["reason"] == "count-cap-exceeded"
+
+
+def test_filing_exception_never_crashes_the_weaver(tmp_path, store, plane, monkeypatch):
+    # The weaver is the single serialized writer. file_proposals is contracted
+    # to never raise, but an unexpected filing-side exception (after the GATE
+    # event, before disposition) must never strand the weave at GATED — it is
+    # swallowed (logged) and the ticket lands normally. Filing is additive.
+    import stigmergy.weaver as weaver_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("filing blew up")
+
+    monkeypatch.setattr(weaver_mod, "file_proposals", boom)
+
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t7", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t7", work_product=bundle)
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met", filed_tickets=_CRITIC_FILINGS),
+    )
+    result = weaver.weave(now=1000.0)[0]  # must NOT raise
+    assert result.outcome == "landed"
+    assert store.get_ticket("t7")["state"] == LANDED
