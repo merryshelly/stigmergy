@@ -46,6 +46,17 @@ REDACTED_PLACEHOLDER = "«redacted»"
 # ANTHROPIC_API_KEY is set (SPEC §4 / bead .12 build spec §0 diagram).
 CAPABILITY_HEADER_DEFAULT = "x-api-key"
 
+# --------------------------------------------------------------------------- #
+# bead .55 hardening defaults (F2/F3) — deliberately tight. The capability    #
+# header must NEVER appear in the allowlist (the real key is injected under  #
+# it directly, never copied from the worker's value). Production `.25`      #
+# wiring will set `upstream_headers_pinned={"anthropic-version": "<current>"}`#
+# and may extend the allowlist if a live smoke shows claude-code needs more  #
+# — exact membership is a `.26` concern, not decided here.                   #
+# --------------------------------------------------------------------------- #
+DEFAULT_UPSTREAM_HEADER_ALLOWLIST: frozenset[str] = frozenset({"content-type", "accept"})
+DEFAULT_ALLOWED_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({("POST", "/v1/messages")})
+
 
 class RelayError(Exception):
     """Base for all relay errors (caller bugs, malformed inputs) — distinct
@@ -352,19 +363,41 @@ def prepare_upstream(
     (``relay_transport.serve_relay``, bead .31).
 
     Reuses ``relay``'s own internals (``_find_header``, ``_store.authorize``,
-    ``_key_provider``, ``_capability_header``) so both callers observe
-    IDENTICAL fail-closed behaviour: a missing capability header or a denied
-    capability returns a :class:`DenyResponse` and calls neither
-    ``relay._forwarder`` NOR ``relay._key_provider`` — the real key is never
-    even fetched on a deny path. Only on success is ``key_provider()``
-    invoked and an :class:`UpstreamRequest` built: headers copied from
-    ``request``, the capability header removed (case-insensitively), the
-    real key injected under ``relay._capability_header``; method/path/body
-    pass through unchanged.
+    ``_key_provider``, ``_capability_header``, and the bead .55 hardening
+    config: ``_allowed_endpoints``, ``_upstream_header_allowlist``,
+    ``_upstream_headers_pinned``) so both callers observe IDENTICAL
+    fail-closed behaviour. Order of checks (bead .55 build spec, normative —
+    steps 1-2 must never fetch the real key):
+
+    1. Capability header present? Else :class:`DenyResponse` (401,
+       ``"missing-capability"``).
+    2. ``(method.upper(), path-without-query)`` in
+       ``relay._allowed_endpoints``? Else :class:`DenyResponse` (403,
+       ``"forbidden-endpoint"``) — WITHOUT calling ``authorize`` or
+       ``key_provider`` (F3: a valid capability must not reach the whole
+       provider API).
+    3. ``relay._store.authorize(token)`` — a denied capability returns a
+       :class:`DenyResponse` (401/429) and calls neither ``relay._forwarder``
+       NOR ``relay._key_provider``: the real key is never even fetched on a
+       deny path.
+    4. Only on success: ``key_provider()`` is invoked and an
+       :class:`UpstreamRequest` is built. The upstream header set (F2) is
+       built by allowlist, not by copy-all-minus-capability: ONLY worker
+       headers whose lowercased name is in ``relay._upstream_header_allowlist``
+       are copied, then ``relay._upstream_headers_pinned`` is overlaid (the
+       relay's pinned values WIN over anything the worker sent), then the
+       real key is injected under ``relay._capability_header``. Everything
+       else the worker sent (``authorization``, ``anthropic-beta``, ``host``,
+       ``x-*``, cookies, proxy-*, ...) is dropped. Method/path/body pass
+       through unchanged.
     """
     token = _find_header(request.headers, relay._capability_header)
     if token is None:
         return DenyResponse(status=401, reason="missing-capability")
+
+    endpoint_path = request.path.split("?", 1)[0]
+    if (request.method.upper(), endpoint_path) not in relay._allowed_endpoints:
+        return DenyResponse(status=403, reason="forbidden-endpoint")
 
     try:
         relay._store.authorize(token)
@@ -372,12 +405,25 @@ def prepare_upstream(
         return DenyResponse(status=_deny_status(exc.reason), reason=exc.reason)
 
     real_key = relay._key_provider()
+
+    cap_header_lower = relay._capability_header.lower()
     upstream_headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() != relay._capability_header.lower()
+        if key.lower() != cap_header_lower and key.lower() in relay._upstream_header_allowlist
     }
+    # The relay's pinned headers win over anything the (allowlisted) worker
+    # value already carries — e.g. the worker's own `anthropic-version` is
+    # never allowlisted, but even if it were, the pinned value overlays it.
+    for pinned_name, pinned_value in relay._upstream_headers_pinned.items():
+        upstream_headers = {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() != pinned_name.lower()
+        }
+        upstream_headers[pinned_name] = pinned_value
     upstream_headers[relay._capability_header] = real_key
+
     upstream_request = RelayRequest(
         method=request.method,
         path=request.path,
@@ -407,12 +453,22 @@ class CredentialRelay:
         forwarder: Callable[[RelayRequest], RelayResponse],
         usage_extractor: Callable[[RelayResponse], dict] = extract_usage,
         capability_header: str = CAPABILITY_HEADER_DEFAULT,
+        upstream_header_allowlist: frozenset[str] = DEFAULT_UPSTREAM_HEADER_ALLOWLIST,
+        upstream_headers_pinned: Mapping[str, str] | None = None,
+        allowed_endpoints: frozenset[tuple[str, str]] = DEFAULT_ALLOWED_ENDPOINTS,
     ) -> None:
         self._store = store
         self._key_provider = key_provider
         self._forwarder = forwarder
         self._usage_extractor = usage_extractor
         self._capability_header = capability_header
+        # bead .55 hardening config (F2/F3) — see module-level defaults'
+        # docstring for the production-wiring note on pinned headers.
+        self._upstream_header_allowlist = upstream_header_allowlist
+        self._upstream_headers_pinned: Mapping[str, str] = (
+            upstream_headers_pinned if upstream_headers_pinned is not None else {}
+        )
+        self._allowed_endpoints = allowed_endpoints
 
     def handle(self, request: RelayRequest) -> RelayResponse:
         """Authorize, inject, forward, meter — fail closed at every step.

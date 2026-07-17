@@ -83,6 +83,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from stigmergy.critic_client import _NoRedirectHandler
 from stigmergy.relay import (
@@ -292,6 +293,33 @@ def sse_extract_usage(body: bytes) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Origin-form path validation (F1, bead .55) — layer 1 of the netloc-pinning   #
+# defense: a worker-controlled request path must never be able to steer the   #
+# upstream connection target when string-concatenated onto ``base_url``.      #
+# --------------------------------------------------------------------------- #
+
+
+def _is_origin_form_path(path: str) -> bool:
+    """Strict HTTP origin-form check: exactly one leading ``/`` (never
+    ``//...``, which urllib/browsers can treat as a network-path reference),
+    and none of: whitespace/control characters (including ``\\t``), ``@``
+    (host/userinfo separator), ``\\`` (some HTTP stacks treat this as a path
+    separator), or an embedded scheme (``://``). Legitimate relay paths
+    (``/v1/messages``, ``/v1/messages?beta=1``) all pass; anything a
+    compromised worker could use to redirect the real-key request's netloc
+    (layer 2/3 in :func:`make_urllib_forwarder`) is rejected here first."""
+    if not path.startswith("/") or path.startswith("//"):
+        return False
+    for ch in path:
+        code_point = ord(ch)
+        if code_point < 0x20 or 0x7F <= code_point <= 0x9F or ch.isspace():
+            return False
+    if "@" in path or "\\" in path or "://" in path:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # read_relay_request — bounded, fail-closed request parsing (cases 6-11)      #
 # --------------------------------------------------------------------------- #
 
@@ -356,6 +384,8 @@ async def _read_relay_request_inner(
     method, path, version = parts
     if not method or not path or not version.upper().startswith("HTTP/"):
         raise RelayTransportError("malformed request line")
+    if not _is_origin_form_path(path):
+        raise RelayTransportError("malformed request path")
 
     headers: dict[str, str] = {}
     seen_lower: set[str] = set()
@@ -388,9 +418,12 @@ async def _read_relay_request_inner(
             raise RelayTransportError(f"missing Content-Length for {method_upper} request")
         body_length = 0
     else:
-        if not content_length_str.isdigit():
+        if not (content_length_str.isascii() and content_length_str.isdigit()):
             raise RelayTransportError("malformed Content-Length")
-        body_length = int(content_length_str)
+        try:
+            body_length = int(content_length_str)
+        except ValueError as exc:  # belt-and-braces; the isascii/isdigit guard above
+            raise RelayTransportError("malformed Content-Length") from exc
 
     if body_length > max_body_bytes:
         raise RelayTransportError("request body exceeds max_body_bytes")
@@ -441,7 +474,21 @@ def make_urllib_forwarder(
     forever holding an open upstream socket: it sets a stop flag and
     releases the bridge semaphore, and the worker thread — checked right
     after each semaphore acquire — closes the response and exits.
+
+    **Netloc pinning (F1, bead .55 — the load-bearing guard, defense-in-
+    depth even if a malformed path somehow slips past
+    :func:`_is_origin_form_path`).** ``base_url`` is parsed ONCE, here, at
+    forwarder-build time, to capture the expected netloc (host[:port]). The
+    real-key-bearing request is built with ``url = base_url + path`` exactly
+    as before (``path`` still drives routing for legitimate origin-form
+    paths), but ``_worker`` re-parses the resulting ``url`` and compares its
+    netloc against the pinned expected netloc BEFORE ever calling
+    ``opener.open``. A worker-supplied path that manages to shift the netloc
+    (host suffix hijack, port change, userinfo->host) is refused: no
+    connection is ever opened, and the failure surfaces as the usual
+    :class:`UpstreamError` fail-closed path.
     """
+    expected_netloc = urlsplit(base_url).netloc
 
     async def forwarder(upstream: UpstreamRequest) -> tuple[UpstreamHead, AsyncIterator[bytes]]:
         loop = asyncio.get_running_loop()
@@ -460,6 +507,20 @@ def make_urllib_forwarder(
 
         def _worker() -> None:
             url = base_url.rstrip("/") + upstream.request.path
+
+            # F1 layer 2/3 (bead .55): pin the connection netloc. Never let
+            # opener.open see a URL whose netloc differs from the one
+            # base_url was built from — this is the load-bearing guard even
+            # if a malformed path somehow slipped past the parser's
+            # origin-form check. Fail closed: no connection is opened.
+            if urlsplit(url).netloc != expected_netloc:
+                err = UpstreamError("upstream request failed: netloc mismatch")
+                try:
+                    loop.call_soon_threadsafe(_set_head_exception, err)
+                except RuntimeError:
+                    pass
+                return
+
             try:
                 # `method=` is passed explicitly so `Request.get_method()`
                 # always honours the real HTTP method regardless of `data`
