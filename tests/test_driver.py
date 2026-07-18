@@ -812,35 +812,132 @@ def test_bundle_dir_not_cleaned_up_by_spawn(tmp_path):
 
 
 # ==========================================================================
-# Live smoke (bead .13 build spec §3) -- gated, skipped by default, NOT run
-# this session (no .26 sign-off, no live credentials wired).
+# Live E2E smoke (bead .25 AC13 + AC4) -- gated, skipped by default. Drives
+# the FULL production credential path: a real claude-code haiku dispatch in
+# the .63 worker image, reaching Anthropic THROUGH the wired credential relay
+# (capability token as ANTHROPIC_API_KEY; real key host-side, injected by the
+# relay) with the per-dispatch egress proxy also live. Proves credential-swap
+# (AC13 DONE), key-absence + token-death (AC4). RUNS on diodati with the gate
+# set; skips cleanly where any prerequisite is absent.
 # ==========================================================================
+
+_LIVE_WORKER_IMAGE = "localhost/stigmergy-worker:latest"
+
+
+def _live_worker_image_id() -> str | None:
+    """Bare sha256 image id of the built .63 worker image, or None if absent
+    (so the live test skips cleanly where the image was never built)."""
+    if shutil.which("podman") is None:
+        return None
+    uid = os.getuid()
+    env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"}
+    r = subprocess.run(  # noqa: S603
+        ["podman", "inspect", "--format", "{{.Id}}", _LIVE_WORKER_IMAGE],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    raw = r.stdout.strip()
+    if r.returncode != 0 or not raw:
+        return None
+    return raw if raw.startswith("sha256:") else f"sha256:{raw}"
 
 
 @pytest.mark.skipif(
     not os.environ.get("STIGMERGY_LIVE_SMOKE"),
-    reason="live smoke gated behind STIGMERGY_LIVE_SMOKE=1 -- .26 sign-off not yet granted",
+    reason="live smoke gated behind STIGMERGY_LIVE_SMOKE=1",
 )
 @pytest.mark.skipif(
-    shutil.which("claude") is None or shutil.which("podman") is None,
-    reason="requires real `claude` and `podman` binaries on PATH",
+    shutil.which("podman") is None or shutil.which("op") is None
+    or _live_worker_image_id() is None,
+    reason="requires podman + op + the built localhost/stigmergy-worker:latest image",
 )
 def test_live_smoke_one_trivial_dispatch(tmp_path):
-    """One real claude-code dispatch through `spawn()`: a trivial ticket, a
-    real hardened container, the real `claude` binary, and a dummy/local
-    relay. Documents intent per bead .13 build spec §3 -- does NOT run in
-    the normal suite (both skip guards above must be satisfied: an explicit
-    opt-in env var AND both binaries present) and was NOT executed this
-    session (no `.26` SB prompt/models.toml sign-off yet, no real
-    credentials wired).
-    """
-    pack = _task_pack(tmp_path, prompt_text="Reply with the single word: ok.")
-    work = _make_work_clone(tmp_path, with_work_branch=False)
-    cap = _capability(dispatch_id="live-smoke-1")
-    cfg = _model_cfg(
-        model="claude-3-5-haiku-latest",
-        relay_base_url="http://127.0.0.1:0/",  # a real dummy/local relay, wired by whoever
-        timeout_seconds=120,  # runs this with sign-off -- not this session.
+    """bead .25 AC13 + AC4. One real haiku dispatch through the FULL wired
+    path: capability token in the cage, real key host-side in the relay, the
+    relay swaps it and forwards to api.anthropic.com. Asserts DONE (swap
+    works), the real key is absent from every worker-visible surface (argv/
+    transcript/relay-log), and the capability token is dead after revoke."""
+    import stigmergy.relay_transport as _rt
+    from stigmergy.egress import setup_dispatch_egress
+    from stigmergy.egress_proxy import EgressPolicy
+    from stigmergy.keyprovider import make_op_key_provider
+    from stigmergy.relay import CapabilityDenied, CapabilityStore, CredentialRelay
+
+    # The relay's urllib forwarder runs in THIS process -- don't let an
+    # inherited proxy env var reroute the upstream call.
+    for _v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(_v, None)
+
+    key_provider = make_op_key_provider(
+        "op://shelly/API Credential - stigmergy rig 00/credential"
     )
-    result = spawn(pack, work, cfg, cap, _budgets(output_tokens=1000, driver_turns=5))
-    assert result.status in (DispatchStatus.DONE, DispatchStatus.FAILED)
+    real_key = key_provider()
+    assert real_key and real_key.startswith(("sk-", "sk-ant"))
+
+    image = _live_worker_image_id()
+    did = "live-smoke-25"
+    store = CapabilityStore()
+    cap = store.mint(did, max_output_tokens=200000, max_calls=100)
+    assert real_key not in cap.token  # the worker's ANTHROPIC_API_KEY is NOT the real key
+
+    relay = CredentialRelay(
+        store=store,
+        key_provider=key_provider,
+        forwarder=lambda req: (_ for _ in ()).throw(RuntimeError("sync unused")),
+        upstream_headers_pinned={"anthropic-version": "2023-06-01"},
+        upstream_header_allowlist=frozenset({"content-type", "accept", "anthropic-beta"}),
+    )
+    forwarder = _rt.make_urllib_forwarder(base_url="https://api.anthropic.com")
+
+    egress_rt = tmp_path / "egress_rt"
+    egress_rt.mkdir()
+    relay_rt = tmp_path / "relay_rt"
+    relay_rt.mkdir()
+    # deny-all egress: inference flows via the loopback relay (NO_PROXY-exempt),
+    # so the egress proxy governs nothing legitimate here -- but its socket must
+    # exist (the .63 entrypoint fail-closes without it).
+    policy = EgressPolicy(allowed_hosts=frozenset(), allowed_ports=frozenset({443}))
+    egress_handle = setup_dispatch_egress(did, policy, egress_rt)
+    relay_handle = _rt.start_relay(did, relay_rt, relay, forwarder=forwarder,
+                                   log_path=relay_rt / "relay.jsonl")
+    try:
+        pack = _task_pack(tmp_path, prompt_text="Reply with exactly: OK")
+        work = _make_work_clone(tmp_path, with_work_branch=False)
+        cfg = _model_cfg(
+            model="claude-haiku-4-5-20251001",
+            image=image,
+            egress_socket=egress_handle.socket_path,
+            relay_socket=relay_handle.socket_path,
+            timeout_seconds=180,
+        )
+        result = spawn(pack, work, cfg, cap, _budgets(output_tokens=200000, driver_turns=5))
+
+        # AC13: the credential swap worked end-to-end.
+        assert result.status is DispatchStatus.DONE, (
+            f"expected DONE, got {result.status}: {result.detail!r}"
+        )
+
+        # AC4: the real key is absent from every worker-visible surface.
+        relay_log = (relay_handle.log_path.read_text()
+                     if relay_handle.log_path.exists() else "")
+        assert real_key not in result.transcript
+        assert real_key not in relay_log
+        # the relay actually forwarded at least one call (proof it was used)
+        assert '"decision": "allow"' in relay_log
+    finally:
+        # AC4: token death -- revoke, then a replay must be denied.
+        store.revoke(did)
+        with pytest.raises(CapabilityDenied):
+            store.authorize(cap.token)
+        relay_handle.stop()
+        egress_handle.teardown()
+        uid = os.getuid()
+        penv = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+                "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"}
+        ids = subprocess.run(  # noqa: S603
+            ["podman", "ps", "-aq", "--filter", f"label=stigmergy.dispatch_id={did}"],
+            env=penv, capture_output=True, text=True, check=False,
+        ).stdout.split()
+        if ids:
+            subprocess.run(["podman", "rm", "-f", *ids], env=penv,  # noqa: S603
+                           capture_output=True, text=True, check=False)
