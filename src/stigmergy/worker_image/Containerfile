@@ -1,0 +1,27 @@
+# Stigmergy worker image (bead .63). Base: node:22-bookworm-slim, digest-pinned.
+# The pinned ref lives in BASE_IMAGE.txt; regenerate both together if the base
+# is bumped. build_image()/_check_pinned_bases rejects any non-@sha256 FROM.
+FROM docker.io/library/node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
+
+# python3 = the egress/relay shim runtime (stdlib only). ca-certificates =
+# the system trust store any TLS client in the cage needs to verify upstream
+# (without it, every HTTPS handshake fails CERTIFICATE_VERIFY_FAILED).
+# Build-time apt has the provision station's :registries egress; the RUNTIME
+# worker lane is inference-only (SB .26 decision B — no registry egress out
+# of the cage).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The claude-code driver (the worker command exec'd by the entrypoint).
+RUN npm install -g @anthropic-ai/claude-code
+
+# The shim + entrypoint — the SOLE governed egress path out of the cage.
+COPY shim.py /opt/stigmergy/shim.py
+COPY entrypoint.sh /opt/stigmergy/entrypoint.sh
+RUN chmod +x /opt/stigmergy/entrypoint.sh
+
+# Per-rig project dependencies are appended by the provision station (.25),
+# NOT here — this is the base worker image template.
+
+ENTRYPOINT ["/opt/stigmergy/entrypoint.sh"]

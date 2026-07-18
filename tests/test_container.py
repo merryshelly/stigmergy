@@ -244,6 +244,30 @@ def test_profile_rejects_unpinned_image(tmp_path):
         )
 
 
+def test_profile_accepts_bare_sha256_image_id(tmp_path):
+    # Bead .63: a locally-BUILT worker image has no RepoDigests and is run by
+    # its bare content-addressed id (`sha256:<64hex>`) — as immutable as an
+    # `@sha256:` registry ref. build_run_argv must accept it.
+    bare = "sha256:" + "a" * 64
+    argv = build_run_argv(_profile(tmp_path, image=bare), command=["true"])
+    assert argv[-2] == bare  # image is the second-to-last token (command last)
+
+
+def test_profile_accepts_registry_ref_pinned_by_digest(tmp_path):
+    # The pre-.63 form still works: name@sha256:<64hex>.
+    ref = "docker.io/library/node@sha256:" + "b" * 64
+    argv = build_run_argv(_profile(tmp_path, image=ref), command=["true"])
+    assert ref in argv
+
+
+def test_profile_rejects_bare_sha256_wrong_length(tmp_path):
+    # A near-miss (not exactly 64 hex) is still a mutable/garbage ref.
+    with pytest.raises(ContainerError):
+        build_run_argv(
+            _profile(tmp_path, image="sha256:" + "a" * 63), command=["true"]
+        )
+
+
 # --------------------------------------------------------------------------
 # Deterministic: worker invocation environment (rootless cgroup enforcement)
 # --------------------------------------------------------------------------

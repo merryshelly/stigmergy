@@ -58,6 +58,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}")
+# A bare content digest / local image ID (`sha256:<64hex>`). A locally-BUILT
+# worker image (bead .63) has no RepoDigests, so `build_image` returns — and
+# the daemon runs it by — its immutable `sha256:` id; that is as content-
+# addressed and immutable as a registry `@sha256:` ref. Only mutable tags
+# (`name:tag`) are rejected.
+_BARE_DIGEST_RE = re.compile(r"sha256:[0-9a-fA-F]{64}")
 
 # Bead .34 (SPEC §4 worker containment, §9 crash recovery): the label key a
 # running worker container is tagged with so a real `ContainerReaper`
@@ -101,11 +107,16 @@ class ContainerProfile:
 
 
 def _require_pinned(image: str) -> None:
-    if not _DIGEST_RE.search(image):
-        raise ContainerError(
-            f"image ref {image!r} is not digest-pinned (@sha256:...) — "
-            "supply-chain rule (SPEC §3/§4) rejects mutable tags"
-        )
+    # Accept a registry ref pinned by digest (`name@sha256:...`) OR a bare
+    # content digest / local image id (`sha256:<64hex>`, bead .63 built
+    # images). Both are immutable + content-addressed; only mutable tags are
+    # rejected.
+    if _DIGEST_RE.search(image) or _BARE_DIGEST_RE.fullmatch(image):
+        return
+    raise ContainerError(
+        f"image ref {image!r} is not digest-pinned (@sha256:... or a bare "
+        "sha256:<digest>) — supply-chain rule (SPEC §3/§4) rejects mutable tags"
+    )
 
 
 def _require_valid_env_keys(env: Mapping[str, str]) -> None:
