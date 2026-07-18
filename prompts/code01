@@ -12,8 +12,10 @@ changes against the acceptance criteria below.
   on the `work` branch in /work are ever collected; uncommitted changes and
   work on other branches are discarded.
 - /scratch (read-write): temporary space for experiments and throwaway files.
-- Network access is limited to inference and package registries; there is no
-  other egress.
+- Network access is limited to model inference; there is no other egress.
+  Your dependencies are already installed in this environment — do not expect
+  to reach package registries or the wider internet, and do not add a
+  dependency that is not already available.
 </environment>
 
 <ticket>
@@ -75,6 +77,9 @@ $tier1_checks
   criteria describe, correct for all valid inputs — never hard-code expected
   values or special-case the tests. Checks verify the solution; they are not
   the solution.
+- Write it well. Produce clear, well-factored code that matches the
+  conventions and style of the surrounding codebase; prefer the smallest
+  readable solution over cleverness.
 - Never modify the ticket's acceptance tests, existing test configuration,
   CI or check infrastructure, container definitions, or dependency
   manifests. You may add tests; you may never alter your own pass bar. If a

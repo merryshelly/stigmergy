@@ -120,11 +120,11 @@ def build_verdict_tool() -> dict[str, Any]:
         "input_schema": {
             "type": "object",
             "properties": {
-                "outcome": {
-                    "type": "string",
-                    "enum": ["met", "unmet"],
-                    "description": "Whether the artifact meets the rubric.",
-                },
+                # Field order is deliberate: `reason` precedes `outcome` so the
+                # model emits its evidence-anchored justification BEFORE it
+                # commits to a verdict token (reason-before-verdict; lowers
+                # flip rate per the llm-critic-reliability research; SB .26
+                # sign-off 2026-07-18). Parsing is key-based / order-independent.
                 "tier": {
                     "type": "integer",
                     "description": "Which rubric tier this verdict is judging.",
@@ -132,6 +132,11 @@ def build_verdict_tool() -> dict[str, Any]:
                 "reason": {
                     "type": "string",
                     "description": "Non-empty human-readable justification.",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["met", "unmet"],
+                    "description": "Whether the artifact meets the rubric.",
                 },
                 "severity": {
                     "type": "string",
