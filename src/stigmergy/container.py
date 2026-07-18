@@ -148,6 +148,7 @@ def build_run_argv(
     *,
     command: list[str],
     egress_socket: str | Path | None = None,
+    relay_socket: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     dispatch_id: str | None = None,
 ) -> list[str]:
@@ -168,6 +169,16 @@ def build_run_argv(
     `--network=none` cage. Nothing else about the argv changes. Left at its
     default ``None``, the returned argv is byte-identical to the pre-.11
     argv (regression guard: existing callers/tests are unaffected).
+
+    ``relay_socket`` (bead .63) mirrors ``egress_socket`` exactly: when
+    given, exactly one more `--volume=` bind is appended —
+    ``--volume=<relay_socket>:/run/relay.sock:rw`` — the dispatch's
+    credential-relay unix socket, the SECOND (and last) socket the
+    in-container shim bridges (``ANTHROPIC_BASE_URL`` -> relay). It is
+    emitted immediately AFTER the ``egress_socket`` volume (frozen,
+    deterministic order) and before any ``env`` tokens. Left at its default
+    ``None``, the returned argv is byte-identical to the pre-.63 argv (the
+    daemon supplying this value is ``.25``'s job).
 
     ``env`` (bead .13 build spec §0.2) is the ONE way env vars ever reach
     the worker — no `--env-host` is ever emitted, so the worker's env is
@@ -228,6 +239,8 @@ def build_run_argv(
     argv.append(f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev")
     if egress_socket is not None:
         argv.append(f"--volume={egress_socket}:/run/egress.sock:rw")
+    if relay_socket is not None:
+        argv.append(f"--volume={relay_socket}:/run/relay.sock:rw")
     if env is not None:
         for key in sorted(env):
             argv.append(f"--env={key}={env[key]}")

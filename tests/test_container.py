@@ -100,7 +100,7 @@ def _argv(tmp_path, command=None, **overrides):
     # existing call site only ever passes ContainerProfile fields, so this
     # split is purely additive and does not change any existing test.
     build_kwargs = {}
-    for key in ("egress_socket", "env", "dispatch_id"):
+    for key in ("egress_socket", "relay_socket", "env", "dispatch_id"):
         if key in overrides:
             build_kwargs[key] = overrides.pop(key)
     return build_run_argv(
@@ -483,6 +483,47 @@ def test_dispatch_id_combined_with_egress_socket_and_env_no_interference(tmp_pat
     assert argv[network_index + 1] == label_token
     first_volume_index = next(i for i, a in enumerate(argv) if a.startswith("--volume="))
     assert first_volume_index == network_index + 2
+
+
+# --------------------------------------------------------------------------
+# Bead .63: build_run_argv(relay_socket=) — mirrors egress_socket= exactly.
+# The credential-relay unix socket, mounted at /run/relay.sock, is the second
+# (and last) socket the in-container shim bridges. Cases 17-18 of bead63 spec.
+# --------------------------------------------------------------------------
+
+
+def test_relay_socket_appends_exactly_one_relay_volume(tmp_path):
+    sock = tmp_path / "relay.sock"
+    argv = _argv(tmp_path, relay_socket=sock)
+    relay_token = f"--volume={sock}:/run/relay.sock:rw"
+    assert argv.count(relay_token) == 1
+    # No egress mount unless egress_socket is also given.
+    assert not any(a.endswith(":/run/egress.sock:rw") for a in argv)
+
+
+def test_relay_socket_none_is_byte_identical(tmp_path):
+    # Regression guard: relay_socket=None (default) yields exactly the argv a
+    # caller that never heard of relay_socket would get — same discipline
+    # egress_socket=None / env=None / dispatch_id=None already hold.
+    baseline = _argv(tmp_path)
+    with_default = _argv(tmp_path, relay_socket=None)
+    assert with_default == baseline
+
+
+def test_relay_socket_combined_with_egress_socket_ordered(tmp_path):
+    # Both sockets present: egress volume precedes relay volume (frozen,
+    # deterministic order), both precede any env tokens.
+    egress = tmp_path / "egress.sock"
+    relay = tmp_path / "relay.sock"
+    env = {"ANTHROPIC_API_KEY": "tok"}
+    argv = _argv(tmp_path, egress_socket=egress, relay_socket=relay, env=env)
+    egress_token = f"--volume={egress}:/run/egress.sock:rw"
+    relay_token = f"--volume={relay}:/run/relay.sock:rw"
+    env_token = "--env=ANTHROPIC_API_KEY=tok"
+    assert egress_token in argv and relay_token in argv and env_token in argv
+    assert argv.index(egress_token) < argv.index(relay_token) < argv.index(env_token)
+    # relay volume immediately follows the egress volume.
+    assert argv.index(relay_token) == argv.index(egress_token) + 1
 
 
 # --------------------------------------------------------------------------
