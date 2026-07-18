@@ -12,10 +12,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from stigmergy.triage import TriageError, promote_proposal, record_triage_event
 
 from stigmergy.records import EventType, RecordPlane
 from stigmergy.rig import RigStore
+from stigmergy.triage import TriageError, promote_proposal, record_triage_event
 
 
 @pytest.fixture

@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 
 import pytest
+
+from stigmergy.records import RecordError, RecordPlane
 from stigmergy.relay import (
     REDACTED_PLACEHOLDER,
     Capability,
@@ -37,8 +39,6 @@ from stigmergy.relay import (
     extract_usage,
     worker_credential_env,
 )
-
-from stigmergy.records import RecordError, RecordPlane
 
 # A stand-in for a real provider key — this string must NEVER appear in any
 # worker-facing artifact or any sealed transcript. It is deliberately shaped
@@ -194,6 +194,75 @@ def test_charge_dead_token_raises():
         store.charge(cap.token, output_tokens=1, calls=1)
     with pytest.raises(CapabilityDenied):
         store.charge("unknown-token", output_tokens=1, calls=1)
+
+
+# ==========================================================================
+# charge_unbudgetable (F4, bead .56): a call whose true output-token usage
+# could not be metered saturates the token budget so the next authorize is
+# quota-denied — NEVER charges ~0 (the "unbudgetable, never $0" principle
+# from .51). Fail-closed leash under an unmeterable stream.
+# ==========================================================================
+
+
+def test_charge_unbudgetable_saturates_and_next_authorize_denied():
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=500, max_calls=5)
+    store.authorize(cap.token)
+    store.charge(cap.token, output_tokens=0, calls=1)  # a call reserved, unmeterable
+    store.charge_unbudgetable(cap.token)
+    # used_output_tokens is now saturated to the ceiling ...
+    assert store.usage(cap.token)["output_tokens"] == 500
+    # ... so the leash trips: the next authorize is quota-tokens denied.
+    with pytest.raises(CapabilityDenied) as exc:
+        store.authorize(cap.token)
+    assert exc.value.reason == "quota-tokens"
+
+
+def test_charge_unbudgetable_never_charges_zero_on_fresh_capability():
+    # The whole point: an unmeterable call must not leave the worker with its
+    # full token budget intact (the F4 leash bypass). Even from zero usage,
+    # the capability ends quota-exhausted.
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=1000, max_calls=5)
+    store.charge_unbudgetable(cap.token)
+    assert store.usage(cap.token)["output_tokens"] == 1000
+    assert store.is_live(cap.token) is False
+
+
+def test_charge_unbudgetable_leaves_calls_untouched():
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=500, max_calls=5)
+    store.charge(cap.token, output_tokens=0, calls=1)
+    store.charge_unbudgetable(cap.token)
+    assert store.usage(cap.token)["calls"] == 1  # only tokens saturated, not calls
+
+
+def test_charge_unbudgetable_is_idempotent():
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=500, max_calls=5)
+    store.charge_unbudgetable(cap.token)
+    store.charge_unbudgetable(cap.token)  # second call must not double past the ceiling
+    assert store.usage(cap.token)["output_tokens"] == 500
+
+
+def test_charge_unbudgetable_saturates_from_partial_usage():
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=500, max_calls=5)
+    store.charge(cap.token, output_tokens=120, calls=1)
+    store.charge_unbudgetable(cap.token)
+    assert store.usage(cap.token)["output_tokens"] == 500  # exactly the ceiling, never over
+
+
+def test_charge_unbudgetable_unknown_and_revoked_raise():
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=500, max_calls=5)
+    with pytest.raises(CapabilityDenied) as exc:
+        store.charge_unbudgetable("not-a-real-token")
+    assert exc.value.reason == "unknown"
+    store.revoke("disp-1")
+    with pytest.raises(CapabilityDenied) as exc2:
+        store.charge_unbudgetable(cap.token)
+    assert exc2.value.reason == "revoked"
 
 
 # ==========================================================================

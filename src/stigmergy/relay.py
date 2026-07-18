@@ -219,6 +219,27 @@ class CapabilityStore:
         live.used_output_tokens += output_tokens
         live.used_calls += calls
 
+    def charge_unbudgetable(self, token: str) -> None:
+        """Fail-closed metering (F4, bead .56): for a call whose true output-
+        token usage could not be determined (usage past a parse bound, an
+        over-cap JSON body, or a truncated/timed-out 2xx stream), saturate
+        ``used_output_tokens`` to ``max_output_tokens`` so the capability is
+        quota-exhausted and the next :meth:`authorize` denies (429
+        ``"quota-tokens"``). NEVER charge ~0 for an unmeterable metered call
+        — that is the leash bypass this closes. Same "unbudgetable, never
+        $0" principle as .51's REPORT-event usage. Raises
+        :class:`CapabilityDenied` for an unknown/revoked token (charging a
+        dead token is a caller bug), exactly like :meth:`charge`. Idempotent
+        — touches only ``used_output_tokens``, never ``used_calls``."""
+        live = self._exists(token)
+        if live is None:
+            raise CapabilityDenied("unknown")
+        if live.revoked:
+            raise CapabilityDenied("revoked")
+        live.used_output_tokens = max(
+            live.used_output_tokens, live.capability.max_output_tokens
+        )
+
     def revoke(self, dispatch_id: str) -> None:
         """Kill the capability for ``dispatch_id``. Idempotent: revoking
         twice, or an unknown ``dispatch_id``, is a no-op (never raises) —

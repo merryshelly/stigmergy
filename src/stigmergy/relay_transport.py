@@ -34,8 +34,10 @@ reaches ``forwarder`` and never even fetches the real key
   ``content-type``/``content-encoding`` are preserved verbatim (this module
   never gunzips).
 - *Usage-parser selection by response content-type*: ``text/event-stream``
-  routes through :func:`sse_extract_usage`; anything else routes through
-  ``relay.extract_usage`` on the accumulated (bounded-tee) body.
+  routes through an incremental, bounded :class:`_SseUsageMeter` (bead .56,
+  F4 — fed chunk-by-chunk as they are forwarded, never retaining the whole
+  body); anything else routes through ``relay.extract_usage`` on a bounded
+  JSON accumulator (``_MAX_JSON_METER_BYTES``).
 - *Reserve-then-reconcile metering (§C + concurrency TOCTOU)*: the call slot
   is charged (``calls=1``) NOW — atomically with ``prepare_upstream``'s
   ``authorize`` (no ``await`` between them, so the single-threaded event loop
@@ -50,21 +52,32 @@ reaches ``forwarder`` and never even fetches the real key
   the reserve already landed. A ``DenyResponse`` path charges nothing (never
   authorized). The .12 sync ``handle()`` path needs no reserve — single-shot,
   no concurrency window.
-- *Bounded memory (§D)*: the urllib-reading worker thread is bridged to the
-  async caller via a BOUNDED queue (natural backpressure — a stalled worker
-  cannot make this process buffer the whole upstream response), and usage
-  parsing tees into a capped buffer (past the cap: keep forwarding every
-  byte to the worker, just stop trying to meter it precisely — the
-  documented v0 under-meter gap, see below).
+- *Bounded memory (§D) + fail-closed metering (bead .56, F4)*: the
+  urllib-reading worker thread is bridged to the async caller via a BOUNDED
+  queue (natural backpressure — a stalled worker cannot make this process
+  buffer the whole upstream response). Usage parsing NEVER retains the whole
+  body: SSE is metered incrementally with a bounded pending-event buffer
+  (:class:`_SseUsageMeter`); JSON is accumulated into a capped buffer. When a
+  **2xx** response's true usage cannot be determined (an oversized SSE event,
+  an over-cap JSON body, or a truncated/timed-out stream) the call is charged
+  **unbudgetable** (the remaining ``max_output_tokens`` — see
+  ``CapabilityStore.charge_unbudgetable``), never ~0 — this closes the
+  bead .56 leash-bypass finding (F4) where a truncated tee under-charged a
+  call whose worker still received every token.
+- *Accept cap + stream deadline (bead .56, F5)*: ``serve_relay``'s
+  ``max_in_flight`` (default 1) bounds concurrent ``_handle_connection``s via
+  an ``asyncio.Semaphore`` created inside the running loop; ``stream_deadline``
+  (default ``_DEFAULT_STREAM_DEADLINE``) bounds how long the forward+stream
+  phase may hold an upstream socket open via ``asyncio.timeout``.
 - *Socket perms (§B, deliberately BETTER than ``egress_proxy``, which does
   no explicit chmod)*: the per-dispatch runtime dir is created ``0o700``
   and the socket is ``chmod``'d ``0o600`` immediately after bind.
 
-**Known gaps (logged, not hidden — bead31-build-spec.md):**
-- A truncated/errored stream under-meters usage (best-effort tee parse) —
-  fail-*open* for the USD/token leash. Acceptable at v0; ``max_calls`` still
-  increments so a compromised worker cannot get unlimited free retries.
-- Single-threaded relay daemon (one worker/dispatch at a time, v0).
+**Known gaps (logged, not hidden — bead31-build-spec.md, updated bead .56):**
+- Single-threaded relay daemon (one worker/dispatch at a time, v0);
+  ``max_in_flight`` > 1 / true parallelism (v1) re-opens output-token
+  overshoot (F6) and needs up-front token reservation before it is safe —
+  see :func:`serve_relay`'s docstring.
 - No request-body chunked-transfer-encoding support (claude-code sends
   ``Content-Length``); rejected explicitly, never silently mishandled.
 """
@@ -74,7 +87,9 @@ from __future__ import annotations
 import asyncio
 import http.client
 import json
+import math
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -90,6 +105,7 @@ from stigmergy.relay import (
     CapabilityDenied,
     CredentialRelay,
     DenyResponse,
+    RelayError,
     RelayRequest,
     RelayResponse,
     UpstreamRequest,
@@ -130,13 +146,29 @@ _DEFAULT_MAX_HEAD_BYTES = 65536
 _DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024
 _DEFAULT_REQUEST_TIMEOUT = 30.0
 
-# Bound on how much of the upstream response body this module will tee for
-# usage parsing (bead31 amendment §D) — past this cap, chunks are still
-# forwarded to the worker in full, just no longer accumulated for parsing.
-# A response whose final cumulative usage field lands past this cap
-# under-meters (the documented, logged v0 gap); it never truncates the
-# worker's actual answer.
-_MAX_TEE_BYTES = 8 * 1024 * 1024
+# Bound on how much of a non-SSE (JSON) upstream response body this module
+# will accumulate for usage parsing (bead31 amendment §D; renamed from
+# `_MAX_TEE_BYTES` in bead .56 — the SSE path no longer tees the whole body,
+# see `_SseUsageMeter`, so "tee" is now a JSON-only name) — past this cap,
+# chunks are still forwarded to the worker in full, just no longer
+# accumulated for parsing. Bead .56 (F4): a JSON body whose usage field
+# lands past this cap is no longer silently under-charged — it is now
+# charged UNBUDGETABLE (fail-closed), never ~0.
+_MAX_JSON_METER_BYTES = 8 * 1024 * 1024
+
+# Bound on a single pending (not-yet-terminated) SSE event `_SseUsageMeter`
+# will hold before giving up on it as unparseable (bead .56, F4). 1 MiB is
+# enormously generous vs real Anthropic events (<64 KiB) — this fires only
+# on genuinely malformed/adversarial framing, at which point the meter goes
+# `_unmeterable` (fail-closed: the caller charges the remaining budget).
+_MAX_SSE_EVENT_BYTES = 1 * 1024 * 1024
+
+# Default wall-clock deadline (seconds) on the forward+stream phase of one
+# connection (bead .56, F5) — generous so as not to cut a legitimate long
+# generation short; a deadline breach tears down the upstream socket and
+# (on an in-flight 2xx) charges the capability unbudgetable rather than
+# holding a real-key-bearing connection open indefinitely.
+_DEFAULT_STREAM_DEADLINE = 300.0
 
 # Bound on the bridge queue between the blocking urllib-reading thread and
 # the async consumer (bead31 amendment §D) — natural backpressure: a
@@ -197,8 +229,142 @@ _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 # --------------------------------------------------------------------------- #
-# sse_extract_usage — PURE, never raises (bead31 build spec cases 12-18)       #
+# sse_extract_usage / _SseUsageMeter — PURE, never raise (bead31 build spec    #
+# cases 12-18; bead .56 F4 adds the incremental, bounded, cross-chunk meter)   #
 # --------------------------------------------------------------------------- #
+
+# Recognizes an SSE event terminator (a blank line) tolerantly across five
+# framings: CRLF (`\r\n\r\n`), the two MIXED blank-line pairs
+# (`\r\n\n`, `\n\r\n`), LF (`\n\n`), and bare-CR (`\r\r`). The `\r\n`-
+# containing alternatives are matched FIRST (regex alternation tries
+# left-to-right at each position) so a split `\r\n` across a chunk boundary
+# never forms a false boundary via a shorter alternative matching first.
+# Matched against RAW (never pre-normalized) bytes — normalizing `\r`->`\n`
+# before searching for boundaries would let a `\r\n` split across a chunk
+# boundary (the trailing `\r` normalized alone, then the next chunk's
+# leading `\n` joins it) masquerade as a false `\n\n` blank line. Matching
+# raw bytes over the full cumulative pending buffer sidesteps that
+# entirely: an unresolved/ambiguous trailing `\r` simply never matches any
+# alternative here and stays in `pending` until more bytes arrive to
+# disambiguate it. Bead .56 round 2 (review-56-codex.md, MINOR "mixed
+# newline"): exotic/mixed framing that this still fails to recognize does
+# NOT silently under-charge — the tri-state metering (§8 fix A) makes a
+# missed final delta fail CLOSED (finalize() -> None -> unbudgetable),
+# never a silent zero/placeholder charge. This is no longer a claim of
+# "behaviorally identical to the batch parser" for every exotic input, only
+# that recognized framings are parsed identically and unrecognized framings
+# fail closed rather than under-charge.
+_SSE_EVENT_TERMINATOR = re.compile(rb"\r\n\r\n|\r\n\n|\n\r\n|\n\n|\r\r")
+
+
+def _sse_event_usage_update(
+    block: str, input_tokens: int | None, output_tokens: int | None
+) -> tuple[int | None, int | None, str | None]:
+    """Shared per-event body -> usage-update logic used by BOTH
+    :func:`sse_extract_usage` (batch) and :class:`_SseUsageMeter`
+    (incremental) so the two parsers stay behaviorally identical (bead .56).
+
+    ``block`` is one already-delimited SSE event's text, LF-normalized
+    (``\\r\\n``/``\\r`` already collapsed to ``\\n``) — collects its
+    ``data:`` lines (skipping blank lines and ``:``-prefixed comments),
+    ignores the ``data: [DONE]`` sentinel, and updates the running
+    ``input_tokens``/``output_tokens`` per Anthropic's two usage shapes:
+    ``message.usage.{input_tokens,output_tokens}`` (``output_tokens`` only
+    if still ``None`` — the ``message_start`` placeholder) and top-level
+    ``usage.{output_tokens,input_tokens}`` (``output_tokens`` ALWAYS
+    overwrites — cumulative, last ``message_delta`` wins). Ints only;
+    ``bool`` is rejected. Never raises: an unparseable event returns the
+    running totals unchanged.
+
+    Returns a 3-tuple ``(input_tokens, output_tokens, final_kind)`` where
+    ``final_kind`` is the tri-state "positively determined" signal for
+    THIS event's TOP-LEVEL ``usage.output_tokens`` (bead .56 round 3, §9
+    fix H — latest-usage VALIDITY, not sticky-OR):
+
+    - a valid non-negative int -> ``"valid"`` (recorded into
+      ``output_tokens``, the cumulative ``message_delta`` measurement).
+    - present but a negative int -> the value IS still recorded into
+      ``output_tokens`` (BATCH-COMPAT: :func:`sse_extract_usage` must keep
+      surfacing a negative value exactly as before — see its own
+      docstring/tests), but the signal is ``"invalid"`` — a later,
+      genuinely final delta that regresses to negative must not let an
+      earlier valid value keep being trusted by the incremental meter.
+    - present but not an int (or is a ``bool``) -> NOT recorded (also
+      batch-compat — a non-int/bool never overwrote ``output_tokens``
+      before either) and the signal is ``"invalid"``.
+    - top-level ``usage`` present without an ``output_tokens`` key, OR the
+      ``message_start`` (``message.usage``) placeholder path, OR no usage
+      at all -> ``None`` (no opinion this event; the running
+      "positively determined"/"unmeterable" state carries over unchanged).
+
+    :func:`sse_extract_usage` ignores this 3rd element entirely, so its own
+    observable behavior (INCLUDING surfacing a negative top-level value) is
+    byte-identical to before round 3. :class:`_SseUsageMeter` uses it to
+    track LATEST validity (not sticky-OR): ``"valid"`` sets
+    ``_final_output_seen``; ``"invalid"`` sets ``_unmeterable`` (STICKY — a
+    later valid value must never rescue an earlier invalid one, because the
+    invalid one might itself have been the true, corrupt final answer).
+    """
+    data_lines: list[str] = []
+    for line in block.split("\n"):
+        if not line or line.startswith(":"):
+            continue  # blank / keep-alive comment
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+        # `event:` and any other field lines are informational only — this
+        # parser keys off the parsed JSON shape, not the event name.
+
+    if not data_lines:
+        return input_tokens, output_tokens, None
+    data_str = "\n".join(data_lines)
+    if data_str == "[DONE]":
+        return input_tokens, output_tokens, None
+
+    try:
+        parsed = json.loads(data_str)
+    except Exception:  # noqa: BLE001 - never raise (bead .56 round 3, §9 fix J);
+        # broadened from (JSONDecodeError, ValueError) so a RecursionError or
+        # Python's int-string-digit-limit ValueError on a bounded event never
+        # escapes this helper — that event simply contributes nothing.
+        return input_tokens, output_tokens, None
+    if not isinstance(parsed, dict):
+        return input_tokens, output_tokens, None
+
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            it = usage.get("input_tokens")
+            if isinstance(it, int) and not isinstance(it, bool):
+                input_tokens = it
+            if output_tokens is None:
+                ot = usage.get("output_tokens")
+                if isinstance(ot, int) and not isinstance(ot, bool):
+                    output_tokens = ot
+        return input_tokens, output_tokens, None
+
+    usage = parsed.get("usage")
+    final_kind: str | None = None
+    if isinstance(usage, dict) and "output_tokens" in usage:
+        # NB: membership check (not `.get()`), so a present-but-``null``
+        # value is distinguished from an ABSENT key — both decode to Python
+        # ``None`` via `.get()`, but only the former is a genuinely present,
+        # invalid measurement (round 3, §9 fix H: `null` must signal
+        # "invalid", not "no opinion").
+        ot = usage["output_tokens"]
+        if isinstance(ot, int) and not isinstance(ot, bool):
+            output_tokens = ot  # cumulative -> last wins, always overwrite
+            final_kind = "valid" if ot >= 0 else "invalid"
+        else:
+            final_kind = "invalid"
+        it = usage.get("input_tokens")
+        if isinstance(it, int) and not isinstance(it, bool):
+            input_tokens = it
+    elif isinstance(usage, dict):
+        it = usage.get("input_tokens")
+        if isinstance(it, int) and not isinstance(it, bool):
+            input_tokens = it
+    return input_tokens, output_tokens, final_kind
 
 
 def sse_extract_usage(body: bytes) -> dict:
@@ -225,6 +391,14 @@ def sse_extract_usage(body: bytes) -> dict:
     function then finds no ``data:`` lines and returns ``{}``, so the
     caller (:func:`serve_relay`) falls back to
     ``stigmergy.relay.extract_usage`` for that content-type.
+
+    This function's own observable behavior is unchanged by bead .56 — it
+    still parses the WHOLE ``body`` in one pass (batch parser). Its
+    per-event logic is now shared with the incremental
+    :class:`_SseUsageMeter` via :func:`_sse_event_usage_update` so the two
+    stay behaviorally identical, but ``sse_extract_usage`` itself is not
+    bounded/incremental (callers that must avoid whole-body retention use
+    :class:`_SseUsageMeter` instead).
     """
     if not body:
         return {}
@@ -240,49 +414,9 @@ def sse_extract_usage(body: bytes) -> dict:
     output_tokens: int | None = None
 
     for block in blocks:
-        data_lines: list[str] = []
-        for line in block.split("\n"):
-            if not line or line.startswith(":"):
-                continue  # blank / keep-alive comment
-            if line.startswith("data:"):
-                data_lines.append(line[len("data:") :].strip())
-            # `event:` and any other field lines are informational only —
-            # this parser keys off the parsed JSON shape, not the event name.
-
-        if not data_lines:
-            continue
-        data_str = "\n".join(data_lines)
-        if data_str == "[DONE]":
-            continue
-
-        try:
-            parsed = json.loads(data_str)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-
-        message = parsed.get("message")
-        if isinstance(message, dict):
-            usage = message.get("usage")
-            if isinstance(usage, dict):
-                it = usage.get("input_tokens")
-                if isinstance(it, int) and not isinstance(it, bool):
-                    input_tokens = it
-                if output_tokens is None:
-                    ot = usage.get("output_tokens")
-                    if isinstance(ot, int) and not isinstance(ot, bool):
-                        output_tokens = ot
-            continue
-
-        usage = parsed.get("usage")
-        if isinstance(usage, dict):
-            ot = usage.get("output_tokens")
-            if isinstance(ot, int) and not isinstance(ot, bool):
-                output_tokens = ot  # cumulative -> last wins, always overwrite
-            it = usage.get("input_tokens")
-            if isinstance(it, int) and not isinstance(it, bool):
-                input_tokens = it
+        input_tokens, output_tokens, _final_seen = _sse_event_usage_update(
+            block, input_tokens, output_tokens
+        )
 
     result: dict = {}
     if input_tokens is not None:
@@ -290,6 +424,151 @@ def sse_extract_usage(body: bytes) -> dict:
     if output_tokens is not None:
         result["output_tokens"] = output_tokens
     return result
+
+
+class _SseUsageMeter:
+    """Stateful, bounded, cross-chunk incremental SSE usage parser (bead .56,
+    F4) — the fail-closed alternative to metering only after the WHOLE
+    response body has been accumulated (the leash-bypass this bead closes:
+    a final ``message_delta``'s cumulative ``output_tokens`` landing past a
+    byte cap was silently dropped, under-charging a call whose worker still
+    received every token). Feed forwarded chunks as they stream; call
+    :meth:`finalize` once the stream ends.
+
+    Only a BOUNDED ``pending`` buffer (bytes not yet forming a complete SSE
+    event) is ever retained — never the whole body. An event is terminated
+    by a blank line, recognized tolerantly via :data:`_SSE_EVENT_TERMINATOR`
+    (``\\n\\n``, ``\\r\\n\\r\\n``, mixed ``\\r\\n\\n``/``\\n\\r\\n``, or
+    ``\\r\\r`` framing) matched against RAW, cumulative ``pending`` bytes —
+    never pre-normalized, so a split ``\\r\\n`` is never mistaken for a
+    blank line (see :data:`_SSE_EVENT_TERMINATOR`'s docstring). Usage is
+    tracked with IDENTICAL shape logic to :func:`sse_extract_usage` (both
+    call :func:`_sse_event_usage_update`) so the two parsers stay
+    behaviorally identical on any recognized framing.
+
+    Pure/never-raise, mirroring :func:`sse_extract_usage`'s tolerance: any
+    decode/parse failure on one event is swallowed (that event contributes
+    nothing), never raised; non-``bytes``/``bytearray`` input to
+    :meth:`feed` also never raises — it transitions the meter to
+    ``_unmeterable`` instead (bead .56 round 2, §8 fix F). A single COMPLETE
+    (delimited) event whose own bytes exceed ``_MAX_SSE_EVENT_BYTES``, or an
+    unterminated pending tail past the same bound, is unparseable — the
+    meter goes ``_unmeterable`` and drops its buffer; the caller MUST then
+    treat usage as unknown (:meth:`finalize` returns ``None``) and charge
+    the capability unbudgetable (never ~0).
+
+    **Tri-state (bead .56 round 2, §8 fix A).** ``finalize()`` returns an
+    ``int`` ONLY when a valid final usage was POSITIVELY determined — a
+    top-level ``usage.output_tokens`` (the cumulative ``message_delta``
+    value) parsed as a valid non-negative int at least once. This is
+    tracked via ``_final_output_seen``, set only by
+    :func:`_sse_event_usage_update`'s 3rd return value (``"valid"``). The
+    ``message_start`` placeholder (``message.usage.output_tokens``) never
+    sets it. A stream that ends without ever positively determining a final
+    usage — even if it parsed cleanly and hit EOF — is UNMETERABLE
+    (``finalize()`` returns ``None``), never charged at the placeholder or
+    at 0. This closes the residual F4 leash-bypass a cross-family review
+    found in round 1: conflating "parser didn't raise and the iterator
+    ended" with "true usage was determined".
+
+    **Latest-usage validity, not sticky-OR (bead .56 round 3, §9 fix H).**
+    ``output_tokens`` is CUMULATIVE — the last ``message_delta`` is
+    authoritative. So an ``"invalid"`` ``final_kind`` (a present-but-
+    negative/non-int/bool top-level ``output_tokens``, INCLUDING an
+    explicit JSON ``null``) sets ``_unmeterable`` STICKILY: the concern is
+    a genuinely LATER, corrupted cumulative delta being silently ignored in
+    favor of an earlier, lower valid one (which would under-charge) — so
+    once a final-usage signal has been invalid, no later valid value
+    "rescues" the meter. Once ``_unmeterable``, :meth:`finalize` always
+    returns ``None`` regardless of any further updates to ``output_tokens``.
+    """
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+        self._unmeterable = False
+        self._final_output_seen = False
+
+    def feed(self, chunk: bytes) -> None:
+        """Append ``chunk`` and extract every complete SSE event now
+        available; a no-op once :meth:`finalize`-triggering unmeterable
+        state has been reached (bytes are still forwarded to the worker by
+        the caller regardless — metering just stays failed-closed). Never
+        raises: non-``bytes``/``bytearray`` input transitions to
+        ``_unmeterable`` instead (bead .56 round 2, §8 fix F)."""
+        if self._unmeterable:
+            return
+        if not isinstance(chunk, (bytes, bytearray)):
+            self._unmeterable = True
+            self.pending = bytearray()
+            return
+
+        try:
+            self.pending.extend(chunk)
+
+            data = bytes(self.pending)
+            pos = 0
+            for match in _SSE_EVENT_TERMINATOR.finditer(data):
+                # §8 fix F: the per-event size bound applies to a COMPLETE
+                # (delimited) event too, not only an unterminated pending
+                # tail — a single event whose own length exceeds the bound
+                # is malformed/adversarial regardless of whether it was
+                # eventually terminated.
+                if match.start() - pos > _MAX_SSE_EVENT_BYTES:
+                    self._unmeterable = True
+                    self.pending = bytearray()
+                    return
+                self._consume_event(data[pos : match.start()])
+                pos = match.end()
+            if pos:
+                del self.pending[:pos]
+
+            if len(self.pending) > _MAX_SSE_EVENT_BYTES:
+                self._unmeterable = True
+                self.pending = bytearray()
+        except Exception:  # noqa: BLE001 - never raise; fail closed instead
+            self._unmeterable = True
+            self.pending = bytearray()
+
+    def _consume_event(self, event_bytes: bytes) -> None:
+        try:
+            text = event_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - never raise, that event contributes nothing
+            return
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        self.input_tokens, self.output_tokens, final_kind = _sse_event_usage_update(
+            normalized, self.input_tokens, self.output_tokens
+        )
+        # Round 3, §9 fix H: latest-usage VALIDITY, not sticky-OR. A
+        # "valid" signal marks a final usage as positively determined;
+        # an "invalid" signal (a present-but-negative/non-int/bool/null
+        # top-level output_tokens) is STICKY-unmeterable — a later valid
+        # value must never rescue an earlier invalid one, because usage is
+        # cumulative and the invalid one may be the genuinely later,
+        # corrupt final answer.
+        if final_kind == "valid":
+            self._final_output_seen = True
+        elif final_kind == "invalid":
+            self._unmeterable = True
+
+    def finalize(self) -> int | None:
+        """Process any remaining ``pending`` as a final (best-effort,
+        possibly unterminated) event, then return the metered
+        ``output_tokens`` — but ONLY if a valid final usage was positively
+        determined (``_final_output_seen``) and the meter never went
+        unmeterable; otherwise ``None`` (the caller must then charge
+        unbudgetable, never ~0 — bead .56 round 2, §8 fix A tri-state)."""
+        if not self._unmeterable and self.pending:
+            tail = bytes(self.pending)
+            self.pending = bytearray()
+            if len(tail) > _MAX_SSE_EVENT_BYTES:
+                self._unmeterable = True
+            else:
+                self._consume_event(tail)
+        if self._unmeterable or not self._final_output_seen:
+            return None
+        return self.output_tokens if self.output_tokens is not None else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -393,7 +672,18 @@ async def _read_relay_request_inner(
         if not line or ":" not in line:
             raise RelayTransportError("malformed header line")
         name, _, value = line.partition(":")
+        # F9 (bead .56, LOW) + round-2 §8 fix G: the head was partitioned on
+        # `\r\n\r\n` then split on `\r\n`, so a bare `\n` (or a stray `\r`
+        # not part of a `\r\n` pair) embedded inside a header VALUE *or
+        # NAME* survives into this raw (pre-strip) segment instead of
+        # ending the line. Reject both here as a clean 400 rather than
+        # passing a control character through to `forwarder`/`key_provider`
+        # (neither of which is ever reached on this path).
+        if "\n" in name or "\r" in name:
+            raise RelayTransportError("malformed header name")
         name = name.strip()
+        if "\n" in value or "\r" in value:
+            raise RelayTransportError("malformed header value")
         value = value.strip()
         if not name:
             raise RelayTransportError("malformed header line")
@@ -428,6 +718,11 @@ async def _read_relay_request_inner(
     if body_length > max_body_bytes:
         raise RelayTransportError("request body exceeds max_body_bytes")
 
+    # F10 (bead .56, LOW, doc-only): any bytes in `rest` beyond
+    # `body_length` are dropped here, never buffered/replayed. Safe for the
+    # v0 one-request-per-connection model (every response sets
+    # `Connection: close`, so there is never a next request to misparse on
+    # this connection) — revisit only if HTTP/1.1 pipelining is ever added.
     body = bytearray(rest[:body_length])
     while len(body) < body_length:
         remaining = body_length - len(body)
@@ -608,7 +903,30 @@ def make_urllib_forwarder(
         )
         thread.start()
 
-        head = await head_future
+        try:
+            head = await head_future
+        except BaseException:
+            # §9 fix K (bead .56 round 3 — the one genuinely-new bug from
+            # the round-2 fix-C restructure): a cancellation/timeout HERE
+            # (e.g. the stream_deadline firing BEFORE the head ever
+            # arrives) means this coroutine never returns a generator, so
+            # `_handle_connection` has no `chunks` to `aclose()` — its
+            # `finally` (which normally sets `stop_event`/releases `sem` via
+            # `_gen`'s own `finally`) never runs either. Without this,
+            # `_worker` (already started) later fills the bounded bridge
+            # queue and blocks FOREVER on `sem.acquire()` (no consumer ever
+            # drains the queue), holding the real-key-bearing upstream
+            # socket open indefinitely. Setting `stop_event` here makes
+            # `_worker` break out at the top of its read loop (checked
+            # right after each acquire, and before the first `resp.read`
+            # once the head is set); releasing `sem` unblocks it
+            # immediately if it is already parked on `acquire()`.
+            # `threading.Semaphore` is NOT bounded, so an extra `release()`
+            # here (on top of whatever `_gen`'s `finally` would have done,
+            # which never runs on this path) is safe.
+            stop_event.set()
+            sem.release()
+            raise
 
         async def _gen() -> AsyncIterator[bytes]:
             try:
@@ -689,6 +1007,7 @@ async def _handle_connection(
     forwarder: Forwarder,
     log_path: str | Path,
     dispatch_id: str | None,
+    stream_deadline: float,
 ) -> None:
     decision = "error"
     reason = "handler-exception"
@@ -741,76 +1060,200 @@ async def _handle_connection(
             await _write_deny_response(writer, status)
             return
 
-        try:
-            head, chunks = await forwarder(prepared)
-        except Exception:  # noqa: BLE001 - any forwarder failure -> 502, fail closed
-            status = 502
-            decision = "error"
-            reason = "upstream-error"
-            # The call slot was already reserved (calls=1) above — do NOT
-            # double-charge here; §C's "no unmetered retries" is preserved
-            # by the reserve, not by a charge on this path.
-            await _write_deny_response(writer, status)
-            return
-
-        content_type = _lookup_header(head.headers, "content-type") or ""
-
-        tee = bytearray()
+        # F5 round 2 (bead .56, §8 fix C / review-56-codex.md MAJOR-3): the
+        # `stream_deadline` must bound `await forwarder(prepared)` too, not
+        # only head-write + stream iteration — otherwise a forwarder that
+        # stalls before ever returning a head can hold the real-key-bearing
+        # request (and the sole in-flight slot) open indefinitely, past any
+        # configured deadline. `head`/`chunks` start unset so the `finally`
+        # below can tell whether a forwarder result ever existed.
+        head = None
+        chunks = None
         stream_error = False
         try:
-            writer.write(_build_response_head(head.status, head.headers))
-            head_written = True
-            await writer.drain()
-            async for chunk in chunks:
-                writer.write(chunk)
+            async with asyncio.timeout(stream_deadline):
+                head, chunks = await forwarder(prepared)
+
+                # §9 fix I (bead .56 round 3): classify the media type by
+                # its TOKEN (the part before any `;` parameter), not a
+                # substring match — `text/plain; note=text/event-stream`
+                # must NOT be metered as SSE just because the substring
+                # "text/event-stream" appears somewhere in the header.
+                content_type = _lookup_header(head.headers, "content-type") or ""
+                mtype = content_type.split(";", 1)[0].strip().lower()
+                is_sse = mtype == "text/event-stream"
+                is_json = mtype == "application/json"
+
+                # §9 fix I: collect ALL Content-Encoding occurrences (a
+                # forwarder — or a lookup helper that only returns the
+                # FIRST match — could let a later, real encoding hide
+                # behind an earlier "identity"). A present-but-empty value
+                # counts as non-identity too.
+                encodings = [
+                    v.strip().lower() for (k, v) in head.headers if k.lower() == "content-encoding"
+                ]
+                # §8 fix B: an unsupported/compressed 2xx representation is
+                # never trusted for metering — this relay never decompresses,
+                # so a non-identity Content-Encoding means the parser (SSE or
+                # JSON) would be fed compressed bytes and must not be
+                # trusted even if it happens to "parse". Gated explicitly
+                # here (rather than relying only on the parse failing) for
+                # defense-in-depth + legibility.
+                unsupported_encoding = any(e != "identity" for e in encodings)
+
+                # F4 (bead .56): branch metering strategy on content-type
+                # BEFORE the stream loop, and never retain the whole body.
+                # SSE is metered by a bounded, incremental, cross-chunk
+                # `_SseUsageMeter`; JSON is accumulated into a bounded buffer
+                # (`json_tee`), and once it would exceed
+                # `_MAX_JSON_METER_BYTES`, accumulation stops
+                # (`json_overflow = True`) while every byte still gets
+                # forwarded to the worker. §9 fix I: any OTHER (or absent)
+                # media type is fed to neither accumulator — nothing is
+                # retained for it, and it is unbudgetable below.
+                meter = _SseUsageMeter() if is_sse else None
+                json_tee = bytearray()
+                json_overflow = False
+
+                writer.write(_build_response_head(head.status, head.headers))
+                head_written = True
                 await writer.drain()
-                if len(tee) < _MAX_TEE_BYTES:
-                    room = _MAX_TEE_BYTES - len(tee)
-                    tee.extend(chunk[:room])
-        except Exception:  # noqa: BLE001 - a mid-stream failure truncates, never crashes
-            # The 200 (or whatever) head was already sent; this can no
-            # longer become a 502. Stop writing and close — close-delimited
-            # framing means the worker sees a truncated body at EOF (the
-            # documented under-meter gap; never silently corrupt further).
+                async for chunk in chunks:
+                    writer.write(chunk)
+                    await writer.drain()
+                    if is_sse:
+                        meter.feed(chunk)
+                    elif is_json and not json_overflow:
+                        if len(json_tee) + len(chunk) > _MAX_JSON_METER_BYTES:
+                            json_overflow = True
+                            json_tee = bytearray()
+                        else:
+                            json_tee.extend(chunk)
+        except Exception:  # noqa: BLE001 - forwarder/stream failure or deadline, fail closed
+            if not head_written:
+                # A timeout/failure BEFORE the head was ever written toward
+                # the worker (forwarder stall/failure) — the call slot was
+                # already reserved (calls=1) above; do NOT double-charge.
+                # Nothing was generated, so this is NOT unbudgetable either
+                # (§8 fix C: distinguished from a post-head failure via
+                # `head_written`).
+                status = 502
+                decision = "error"
+                reason = "upstream-error"
+                # `finally` below closes `chunks` if the forwarder somehow
+                # returned one before this branch was reached (it did not
+                # here, but kept uniform for any future forwarder shape).
+                await _write_deny_response(writer, status)
+                return
+            # A timeout/failure AFTER the head was already sent (mid-stream
+            # truncation, or the deadline firing during the stream loop):
+            # this can no longer become a 502. Stop writing and close —
+            # close-delimited framing means the worker sees a truncated
+            # body at EOF. On a 2xx response this becomes unbudgetable
+            # below (F4 backstop) rather than the old silent under-meter.
             stream_error = True
         finally:
             # Deterministically (not just at GC/loop-teardown time) unblock
             # an abandoned upstream-reading worker thread on ANY early exit
-            # from this loop (worker disconnect, write error, etc.) — the
-            # forwarder generator's own `finally` sets the stop flag and
-            # releases the bridge semaphore so the thread closes its
-            # response and exits instead of blocking on the semaphore
+            # from this loop (worker disconnect, write error, deadline,
+            # etc.) — the forwarder generator's own `finally` sets the stop
+            # flag and releases the bridge semaphore so the thread closes
+            # its response and exits instead of blocking on the semaphore
             # forever while holding an open upstream socket + the real key.
-            aclose = getattr(chunks, "aclose", None)
-            if aclose is not None:
+            if chunks is not None:
+                aclose = getattr(chunks, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if head_written:
                 try:
-                    await aclose()
-                except Exception:  # noqa: BLE001
+                    writer.write_eof()
+                except (OSError, RuntimeError):
                     pass
-            try:
-                writer.write_eof()
-            except (OSError, RuntimeError):
-                pass
 
-        if "text/event-stream" in content_type.lower():
-            usage = sse_extract_usage(bytes(tee))
+        is_success = 200 <= head.status < 300
+        if not is_success:
+            # Non-2xx: upstream generated nothing chargeable — the call slot
+            # was already reserved (calls=1); do NOT penalize the leash for
+            # an upstream error/redirect/etc.
+            status = head.status
+            decision = "allow"
+            reason = "stream-error" if stream_error else "forwarded"
         else:
-            usage = extract_usage(RelayResponse(status=head.status, headers={}, body=bytes(tee)))
-        output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
-        if not isinstance(output_tokens, int) or isinstance(output_tokens, bool) or (
-            output_tokens < 0
-        ):
-            output_tokens = 0
-        # Reconcile output tokens only — the call slot was reserved (calls=1)
-        # before the forward, so this must NOT re-count the call (calls=0).
-        try:
-            relay._store.charge(prepared.token, output_tokens=output_tokens, calls=0)
-        except CapabilityDenied:
-            pass
+            # §9 fix J (bead .56 round 3): a bounded parser can still raise
+            # AFTER a 2xx has already been delivered to the worker (e.g. a
+            # >4300-digit int hitting Python's int-string-conversion limit
+            # in `json.loads`/int coercion). That must fail closed
+            # (unbudgetable), never escape to the generic handler-exception
+            # `except` below (which would synthesize a 500 and, worse,
+            # leave the capability's usage un-reconciled/live).
+            try:
+                if unsupported_encoding:
+                    # §8 fix B: never trust a parsed usage value from a
+                    # compressed/unrecognized 2xx representation.
+                    output_tokens = None
+                elif is_sse:
+                    output_tokens = meter.finalize()
+                elif is_json:
+                    if json_overflow:
+                        output_tokens = None
+                    else:
+                        usage = extract_usage(
+                            RelayResponse(status=head.status, headers={}, body=bytes(json_tee))
+                        )
+                        output_tokens = (
+                            usage.get("output_tokens") if isinstance(usage, dict) else None
+                        )
+                        # §8 fix A (JSON path): require a POSITIVELY-
+                        # determined valid non-negative int;
+                        # absent/non-int/bool/negative is NOT a measurement
+                        # -> unmeterable (None), never a silent
+                        # default-to-0 under-charge.
+                        if (
+                            not isinstance(output_tokens, int)
+                            or isinstance(output_tokens, bool)
+                            or output_tokens < 0
+                        ):
+                            output_tokens = None
+                else:
+                    # §9 fix I: any media type other than the two supported
+                    # representations (text/event-stream, application/json)
+                    # is unmeterable — nothing was accumulated for it, and
+                    # this relay must never guess.
+                    output_tokens = None
+            except Exception:  # noqa: BLE001 - bounded-parser failure after a
+                # delivered 200 fails closed (unbudgetable), never a 500 that
+                # would leave the capability's usage un-reconciled/live.
+                output_tokens = None
 
-        status = head.status
-        decision = "allow"
-        reason = "stream-error" if stream_error else "forwarded"
+            if stream_error:
+                # A 2xx cut short (worker abort, F5 deadline, or a benign
+                # upstream blip) is unbudgetable — closes the
+                # truncate-to-avoid-charge bypass (a compromised worker
+                # aborting right before the final usage delta must not
+                # dodge metering).
+                output_tokens = None
+
+            if output_tokens is None:
+                try:
+                    relay._store.charge_unbudgetable(prepared.token)
+                except CapabilityDenied:
+                    pass
+                reason = "unbudgetable"
+            else:
+                # Reconcile output tokens only — the call slot was reserved
+                # (calls=1) before the forward, so this must NOT re-count
+                # the call (calls=0).
+                try:
+                    relay._store.charge(prepared.token, output_tokens=output_tokens, calls=0)
+                except CapabilityDenied:
+                    pass
+                reason = "stream-error" if stream_error else "forwarded"
+
+            status = head.status
+            decision = "allow"
     except Exception:  # noqa: BLE001 - a handler bug must never hang or leak the real key
         decision = "error"
         reason = "handler-exception"
@@ -842,6 +1285,34 @@ async def _handle_connection(
             pass
 
 
+def _validate_serve_config(max_in_flight: int, stream_deadline: float) -> None:
+    """Reject unsafe/invalid config BEFORE any socket I/O (bead .56 round 2,
+    §8 fix E). ``max_in_flight`` must be exactly ``1`` in v0 — the
+    docstrings on :func:`serve_relay`/:func:`start_relay` already say any
+    other value reopens F6 (output-token overshoot); an API that silently
+    accepts a known-unsafe value is unsafe-by-configuration. A non-``int``
+    or ``bool`` is rejected too (``bool`` is an ``int`` subclass in Python
+    but is never a meaningful concurrency count here).
+    ``stream_deadline`` must be a positive, finite number — ``<= 0``,
+    ``NaN``, or infinite all defeat the wall-clock bound F5 exists to
+    provide."""
+    if isinstance(max_in_flight, bool) or not isinstance(max_in_flight, int):
+        raise RelayError(f"max_in_flight must be an int (got {max_in_flight!r})")
+    if max_in_flight != 1:
+        raise RelayError(
+            f"max_in_flight must be exactly 1 in v0 (got {max_in_flight!r}) — "
+            "raising it reopens F6 output-token overshoot; see serve_relay's docstring"
+        )
+    if isinstance(stream_deadline, bool) or not isinstance(stream_deadline, (int, float)):
+        raise RelayError(
+            f"stream_deadline must be a positive finite number (got {stream_deadline!r})"
+        )
+    if math.isnan(stream_deadline) or math.isinf(stream_deadline) or stream_deadline <= 0:
+        raise RelayError(
+            f"stream_deadline must be a positive finite number (got {stream_deadline!r})"
+        )
+
+
 async def serve_relay(
     socket_path: str | Path,
     relay: CredentialRelay,
@@ -849,31 +1320,63 @@ async def serve_relay(
     forwarder: Forwarder,
     log_path: str | Path,
     dispatch_id: str | None = None,
+    max_in_flight: int = 1,
+    stream_deadline: float = _DEFAULT_STREAM_DEADLINE,
 ) -> asyncio.Server:
     """Start the credential-relay HTTP server listening on a unix domain
     socket. Mirrors ``egress_proxy.serve``'s shape: per-connection, read ->
     :func:`prepare_upstream` -> (``DenyResponse``: write the synthesized
     deny, log, done) | (``UpstreamRequest``: ``forwarder`` -> frame + stream
-    to the worker, tee for usage parsing, ``store.charge``).
+    to the worker, meter usage incrementally/boundedly, ``store.charge`` /
+    ``store.charge_unbudgetable``).
 
     Immediately after the socket binds, ``chmod``s it to ``0o600`` (bead31
     amendment §B — deliberately BETTER than ``egress_proxy``, which relies
     only on process umask + the runtime dir's own permissions).
+
+    **F5 (bead .56) — accept cap + stream deadline.** ``max_in_flight``
+    (default 1, the v0-safe single-in-flight model) bounds how many
+    connections may be inside :func:`_handle_connection` concurrently: an
+    ``asyncio.Semaphore(max_in_flight)`` is created HERE (inside the
+    running loop, so it binds to it correctly) and acquired in
+    ``_on_connect`` around the ENTIRE handler call — this bounds both
+    concurrent request-body buffering (memory) and concurrent forwards.
+    ``stream_deadline`` (default :data:`_DEFAULT_STREAM_DEADLINE`) bounds
+    the wall-clock time the forward+stream phase may hold an upstream
+    socket (and the real key) open; a breach tears the connection down and
+    (on an in-flight 2xx) charges the capability unbudgetable rather than
+    hanging indefinitely.
+
+    **F6 (bead .56) note — no request-body parsing added.** With
+    ``max_in_flight=1``, only one call is ever in flight against a
+    capability, so concurrent output-token overshoot cannot occur (the v0
+    fix is structural serialization, not up-front reservation). Raising
+    ``max_in_flight`` above 1 — or any future true-parallelism (v1) design —
+    RE-OPENS the output-token overshoot finding and requires up-front
+    output-token reservation (parsed from the worker's declared request,
+    e.g. ``max_tokens``) plus a reconcile-down step before it is safe;
+    that is explicitly NOT built here.
     """
+    _validate_serve_config(max_in_flight, stream_deadline)
+
     socket_path = Path(socket_path)
     if socket_path.exists():
         socket_path.unlink()
 
+    sem = asyncio.Semaphore(max_in_flight)
+
     async def _on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            await _handle_connection(
-                reader,
-                writer,
-                relay=relay,
-                forwarder=forwarder,
-                log_path=log_path,
-                dispatch_id=dispatch_id,
-            )
+            async with sem:
+                await _handle_connection(
+                    reader,
+                    writer,
+                    relay=relay,
+                    forwarder=forwarder,
+                    log_path=log_path,
+                    dispatch_id=dispatch_id,
+                    stream_deadline=stream_deadline,
+                )
         except Exception:  # noqa: BLE001 - a handler bug must never leak an open connection
             try:
                 writer.close()
@@ -941,6 +1444,8 @@ def start_relay(
     *,
     forwarder: Forwarder,
     log_path: str | Path,
+    max_in_flight: int = 1,
+    stream_deadline: float = _DEFAULT_STREAM_DEADLINE,
 ) -> RelayHandle:
     """Start the credential relay for one dispatch on a dedicated
     background event-loop thread and return its handle once actually
@@ -953,7 +1458,19 @@ def start_relay(
     other path is treated as a per-dispatch runtime directory, created
     ``0o700`` (bead31 amendment §B), under which
     ``relay-<dispatch_id>.sock`` is created.
+
+    ``max_in_flight``/``stream_deadline`` (bead .56, F5) are passed straight
+    through to :func:`serve_relay` — exposed here so ``.25``/``.32``
+    wiring can tune them without editing this module; the defaults
+    (1 / :data:`_DEFAULT_STREAM_DEADLINE`) preserve today's behaviour.
+
+    Bead .56 round 2 (§8 fix E): config is validated up front, before any
+    directory creation or socket I/O — a bad ``max_in_flight``/
+    ``stream_deadline`` raises :class:`stigmergy.relay.RelayError`
+    immediately rather than after standing up a runtime directory/thread.
     """
+    _validate_serve_config(max_in_flight, stream_deadline)
+
     given = Path(socket_path_or_runtime_dir)
     if given.suffix == ".sock":
         socket_path = given
@@ -963,6 +1480,14 @@ def start_relay(
         socket_path = runtime_dir / f"relay-{dispatch_id}.sock"
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    # F8 (bead .56, LOW, doc-only): this chmod is the LOAD-BEARING half of
+    # the socket-permission guarantee. The socket itself is chmod'd 0o600
+    # right after bind (see serve_relay) restricting *open*, but a unix
+    # socket's connect() is also gated by directory-traversal permission on
+    # every ancestor directory — without this 0o700 here, another local
+    # user could still reach the socket via a permissive parent directory.
+    # Together, 0o700 (dir) + 0o600 (socket) are the fail-closed connector
+    # restriction; neither alone is sufficient.
     os.chmod(runtime_dir, 0o700)
 
     ready = threading.Event()
@@ -981,6 +1506,8 @@ def start_relay(
                     forwarder=forwarder,
                     log_path=log_path,
                     dispatch_id=dispatch_id,
+                    max_in_flight=max_in_flight,
+                    stream_deadline=stream_deadline,
                 )
             )
         except BaseException as exc:  # noqa: BLE001 - relay to the starting thread
