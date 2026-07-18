@@ -478,6 +478,19 @@ def test_spawn_exit_137_unparseable_returns_wedged(tmp_path):
     assert result.status is DispatchStatus.WEDGED
 
 
+def test_spawn_exit_69_cage_unavailable_returns_infra(tmp_path):
+    # Bead .64: the worker-image entrypoint exits 69 on ANY fail-closed path
+    # (egress socket absent / a shim never came up). That is a broken-cage INFRA
+    # condition, not a capability FAILED — an EXPLICIT dead-cage -> INFRA signal
+    # that does NOT depend on claude-code emitting an _INFRA_MARKERS substring.
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout="", returncode=69)
+    result = spawn(pack, work, _model_cfg(), _capability(), _budgets(), run_one=runner)
+    assert result.status is DispatchStatus.INFRA
+    assert "cage egress setup failed" in result.detail
+
+
 def test_spawn_subprocess_timeout_returns_wedged(tmp_path):
     pack = _task_pack(tmp_path)
     work = _make_work_clone(tmp_path, with_work_branch=False)

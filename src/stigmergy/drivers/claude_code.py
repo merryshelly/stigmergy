@@ -76,6 +76,14 @@ _WORK_BRANCH_REF = "refs/heads/work"
 # just the containerized command) must not hang this process forever.
 _SUBPROCESS_TIMEOUT_SLACK_SECONDS = 30
 
+# Sentinel exit code the worker-image entrypoint (bead .63 entrypoint.sh) uses
+# for EVERY fail-closed path: the cage's egress could not be set up (egress
+# socket absent, or a shim never came up), so no dispatch ran. This is a broken
+# INFRA condition, not a capability/quality FAILED — an EXPLICIT dead-cage ->
+# INFRA path (bead .64), independent of claude-code ever emitting an
+# _INFRA_MARKERS substring. Must match `EXIT_CAGE_UNAVAILABLE` in entrypoint.sh.
+_CAGE_UNAVAILABLE_EXIT = 69
+
 # Closed, conservative infra-marker vocabulary (bead .13 build spec §1.2).
 # Unknown subtypes/markers never resolve to `infra` — see `_classify`.
 _INFRA_MARKERS: tuple[str, ...] = (
@@ -472,6 +480,12 @@ def spawn(
             if result.returncode == 137:
                 status = DispatchStatus.WEDGED
                 detail = "podman --timeout killed the container (exit 137), no parseable result"
+            elif result.returncode == _CAGE_UNAVAILABLE_EXIT:
+                status = DispatchStatus.INFRA
+                detail = (
+                    "worker cage egress setup failed — entrypoint fail-closed "
+                    f"(exit {_CAGE_UNAVAILABLE_EXIT}); no dispatch ran"
+                )
             else:
                 status = DispatchStatus.FAILED
                 detail = f"no parseable claude-code result JSON (exit {result.returncode})"

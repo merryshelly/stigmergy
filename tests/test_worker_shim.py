@@ -454,7 +454,9 @@ def test_entrypoint_fail_closed_when_egress_socket_absent(shim_image, tmp_path):
         argv, env=_worker_podman_env(), capture_output=True, text=True, timeout=120
     )
     try:
-        assert result.returncode != 0, result.stdout
+        # Sentinel exit 69 (EXIT_CAGE_UNAVAILABLE) — the driver maps it to INFRA
+        # (bead .64), distinct from a generic non-zero exit.
+        assert result.returncode == 69, f"{result.returncode}: {result.stdout}\n{result.stderr}"
         assert not (work / "ran").exists(), "worker executed despite absent egress socket"
         assert "egress socket" in result.stderr.lower()
     finally:

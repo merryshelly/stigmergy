@@ -19,6 +19,11 @@ RELAY_SOCKET=/run/relay.sock
 EGRESS_PORT=18080
 RELAY_PORT=18081
 READY_TIMEOUT=10 # seconds
+# Sentinel exit code for EVERY fail-closed path: the cage's egress could not be
+# set up, so no worker ran. The driver (claude_code.py `_CAGE_UNAVAILABLE_EXIT`)
+# maps this to DispatchStatus.INFRA (a broken-infra condition, not a
+# capability FAILED) — an explicit dead-cage -> INFRA signal (bead .64).
+EXIT_CAGE_UNAVAILABLE=69
 
 # Block until 127.0.0.1:$1 accepts a TCP connection; return non-zero on timeout.
 wait_ready() {
@@ -48,12 +53,12 @@ PY
 # --- Egress is MANDATORY -----------------------------------------------------
 if [ ! -S "$EGRESS_SOCKET" ]; then
     echo "stigmergy-entrypoint: egress socket $EGRESS_SOCKET absent — refusing to start (fail-closed)" >&2
-    exit 1
+    exit "$EXIT_CAGE_UNAVAILABLE"
 fi
 "$PYTHON" "$SHIM" egress &
 if ! wait_ready "$EGRESS_PORT"; then
     echo "stigmergy-entrypoint: egress shim never came up on 127.0.0.1:$EGRESS_PORT — fail-closed" >&2
-    exit 1
+    exit "$EXIT_CAGE_UNAVAILABLE"
 fi
 export HTTPS_PROXY="http://127.0.0.1:$EGRESS_PORT"
 export https_proxy="http://127.0.0.1:$EGRESS_PORT"
@@ -63,7 +68,7 @@ if [ -S "$RELAY_SOCKET" ]; then
     "$PYTHON" "$SHIM" relay &
     if ! wait_ready "$RELAY_PORT"; then
         echo "stigmergy-entrypoint: relay socket present but relay shim never came up — fail-closed" >&2
-        exit 1
+        exit "$EXIT_CAGE_UNAVAILABLE"
     fi
     export ANTHROPIC_BASE_URL="http://127.0.0.1:$RELAY_PORT"
 fi
