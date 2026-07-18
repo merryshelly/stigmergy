@@ -42,6 +42,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -405,11 +406,19 @@ def test_proxy_never_pipes_on_deny(tmp_path):
         socket_path = tmp_path / "egress12.sock"
         log_path = tmp_path / "egress12.jsonl"
 
-        # A sentinel "target" TCP listener -- if a deny path ever opened a
-        # real upstream connection, it would show up here.
-        sentinel = await asyncio.start_server(lambda r, w: None, host="127.0.0.1", port=0)
+        # A sentinel "target" TCP listener -- if a deny path ever opened a real
+        # upstream connection to the resolver's address, this Event fires. The
+        # fake resolver points AT the sentinel, so a connect-before-classify
+        # regression is observable. (Previously the callback was a no-op and
+        # `connections_seen` was never mutated -> the assertion was vacuous.)
+        connected = asyncio.Event()
+
+        async def _on_sentinel(reader, writer):
+            connected.set()
+            writer.close()
+
+        sentinel = await asyncio.start_server(_on_sentinel, host="127.0.0.1", port=0)
         sentinel_port = sentinel.sockets[0].getsockname()[1]
-        connections_seen = 0
 
         async def _fake_resolver(host, port):
             return ["127.0.0.1"]
@@ -417,7 +426,10 @@ def test_proxy_never_pipes_on_deny(tmp_path):
         # allowlist "sentinel.example.com" -> but request a DIFFERENT,
         # non-allowlisted host, so classify_host denies before any resolve
         # or connect ever happens.
-        policy = EgressPolicy(allowed_hosts=frozenset({"sentinel.example.com"}))
+        policy = EgressPolicy(
+            allowed_hosts=frozenset({"sentinel.example.com"}),
+            allowed_ports=frozenset({443, sentinel_port}),
+        )
         server = await serve(socket_path, policy, log_path, resolver=_fake_resolver)
         try:
             status_line, writer = await _send_connect(
@@ -438,7 +450,8 @@ def test_proxy_never_pipes_on_deny(tmp_path):
             server.close()
             await server.wait_closed()
 
-        assert connections_seen == 0
+        # No deny path ever opened an upstream connection to the sentinel.
+        assert not connected.is_set()
 
     asyncio.run(_run())
 
@@ -451,21 +464,39 @@ def test_proxy_never_pipes_on_resolved_private_deny(tmp_path):
         socket_path = tmp_path / "egress12b.sock"
         log_path = tmp_path / "egress12b.jsonl"
 
-        sentinel = await asyncio.start_server(lambda r, w: None, host="127.0.0.1", port=0)
+        # The sentinel IS the resolver's target: the fake resolver returns the
+        # sentinel's own loopback address, which classify_resolved must deny
+        # (loopback is private). classify_host passes (host allowlisted, port
+        # allowed), so the ONLY gate between the request and the sentinel is
+        # the resolved-private check -- a connect-before-classify regression
+        # would light up the sentinel. (Previously the sentinel was on
+        # 127.0.0.1 but the resolver returned 10.0.10.5, so it could never
+        # observe a wrongful connect.)
+        connected = asyncio.Event()
+
+        async def _on_sentinel(reader, writer):
+            connected.set()
+            writer.close()
+
+        sentinel = await asyncio.start_server(_on_sentinel, host="127.0.0.1", port=0)
         sentinel_port = sentinel.sockets[0].getsockname()[1]
 
         async def _fake_resolver(host, port):
-            return ["10.0.10.5"]  # resolves to a private/validator-subnet IP
+            return ["127.0.0.1"]  # loopback -> classify_resolved denies (private)
 
-        policy = EgressPolicy(allowed_hosts=frozenset({"rebind.example.com"}))
+        policy = EgressPolicy(
+            allowed_hosts=frozenset({"rebind.example.com"}),
+            allowed_ports=frozenset({443, sentinel_port}),
+        )
         server = await serve(socket_path, policy, log_path, resolver=_fake_resolver)
         try:
             status_line, writer = await _send_connect(
-                socket_path, f"rebind.example.com:{sentinel_port if sentinel_port == 443 else 443}"
+                socket_path, f"rebind.example.com:{sentinel_port}"
             )
-            # port 443 is allowed by default policy; the resolved IP is private.
+            # classify_host passes; the resolved loopback IP is private -> deny.
             assert status_line.startswith(b"HTTP/1.1 403")
             writer.close()
+            await asyncio.sleep(0.2)
         finally:
             sentinel.close()
             await sentinel.wait_closed()
@@ -476,6 +507,8 @@ def test_proxy_never_pipes_on_resolved_private_deny(tmp_path):
         deny_entries = [e for e in entries if e["decision"] == "deny"]
         assert len(deny_entries) == 1
         assert deny_entries[0]["reason"] == "resolved-private"
+        # And the resolved-private deny NEVER connected to the target.
+        assert not connected.is_set()
 
     asyncio.run(_run())
 
@@ -687,3 +720,342 @@ def test_setup_dispatch_egress_starts_serving_and_teardown_stops_it(tmp_path):
             await asyncio.open_unix_connection(path=str(handle.socket_path))
 
     asyncio.run(_probe_after_stop())
+
+
+# --------------------------------------------------------------------------
+# bead .32 -- LIVE end-to-end egress proof, Option A (SB-approved 2026-07-16):
+# a REAL hardened --network=none worker container whose ONLY exit is the
+# bind-mounted egress unix socket, driven through the REAL per-dispatch proxy
+# (setup_dispatch_egress + build_run_argv, exactly as daemon.py stands one up).
+# Proves Option-A items (a) allowlisted egress works, (b) non-allowlisted +
+# IP-literal denied and logged, that the proxy socket is the container's ONLY
+# exit (direct AF_INET egress is impossible under --network=none), and
+# (d)/(c-fail-closed) once the proxy is torn down mid-dispatch, new egress
+# attempts from inside the cage fail closed.
+# The remaining .32 half -- item (c)'s "dispatch classifies INFRA" via a real
+# claude-code run -- is gated on .63 (in-container shim) + .26 (SB sign-off)
+# and tracked in bead .64. These tests substitute a stdlib CONNECT probe for
+# claude-code because the subject under test is the egress cage, not the coder;
+# the probe speaks the exact same raw CONNECT the worker's HTTPS client would.
+# --------------------------------------------------------------------------
+
+_WORKER_BASE_IMAGE = "docker.io/library/python:3.12-alpine"
+
+# Raw-CONNECT probe: AF_UNIX -> the mounted egress socket, one CONNECT per
+# target, prints "<authority> => <status-line-or-error>". stdlib only, no
+# writes to the read-only rootfs, no container network namespace needed
+# (the unix socket is a filesystem object, reachable under --network=none).
+_EGRESS_PROBE = r'''
+import socket
+
+
+def _probe(auth):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(15)
+    try:
+        s.connect("/run/egress.sock")
+    except OSError as exc:
+        return "CONNECT_ERR:" + type(exc).__name__
+    try:
+        s.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (auth, auth)).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp and len(resp) < 4096:
+            chunk = s.recv(256)
+            if not chunk:
+                break
+            resp += chunk
+    except OSError as exc:
+        return "RECV_ERR:" + type(exc).__name__
+    finally:
+        s.close()
+    if not resp:
+        return "EMPTY"
+    return resp.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+
+
+for _auth in ["example.com:443", "evil.example.com:443", "1.1.1.1:443"]:
+    print(_auth + " => " + _probe(_auth), flush=True)
+
+# The proxy socket must be the ONLY exit: a DIRECT AF_INET connection (not via
+# the proxy) must be impossible under --network=none. REACHED here == a cage
+# breach; the test fails on it unconditionally.
+_direct = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+_direct.settimeout(5)
+try:
+    _direct.connect(("1.1.1.1", 443))
+    print("DIRECT => REACHED", flush=True)
+except OSError as _exc:
+    print("DIRECT => BLOCKED:" + type(_exc).__name__, flush=True)
+finally:
+    _direct.close()
+'''
+
+# Fail-closed probe: probe once (proxy up) -> write /work/first-done, then
+# block until the host touches /work/kill (host tears the proxy down first),
+# then probe again -> must fail closed. Prints one JSON line {first, second}.
+_FAILCLOSED_PROBE = r'''
+import json
+import os
+import socket
+import time
+
+
+def _probe(auth):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(15)
+    try:
+        s.connect("/run/egress.sock")
+    except OSError as exc:
+        return "CONNECT_ERR:" + type(exc).__name__
+    try:
+        s.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (auth, auth)).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp and len(resp) < 4096:
+            chunk = s.recv(256)
+            if not chunk:
+                break
+            resp += chunk
+    except OSError as exc:
+        return "RECV_ERR:" + type(exc).__name__
+    finally:
+        s.close()
+    if not resp:
+        return "EMPTY"
+    return resp.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+
+
+first = _probe("example.com:443")
+# Publish first-done ATOMICALLY (write+rename) so the host never reads a
+# half-written file.
+with open("/work/first-done.tmp", "w") as fh:
+    fh.write(first)
+os.replace("/work/first-done.tmp", "/work/first-done")
+
+# Block until the host has torn the proxy down and signalled via /work/kill.
+# Do NOT fall through to a second CONNECT on timeout -- a fall-through request
+# could race an in-progress teardown and reach upstream, a false "fail-closed".
+# If the signal never comes, report it distinctly (the test treats it as a
+# failure, not as proof).
+deadline = time.monotonic() + 120
+while not os.path.exists("/work/kill") and time.monotonic() < deadline:
+    time.sleep(0.05)
+
+if os.path.exists("/work/kill"):
+    second = _probe("example.com:443")
+else:
+    second = "BARRIER_TIMEOUT"
+print(json.dumps({"first": first, "second": second}), flush=True)
+'''
+
+
+def _worker_podman_env() -> dict:
+    uid = os.getuid()
+    return {
+        **os.environ,
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+    }
+
+
+def _pinned_worker_image() -> str:
+    """Pull the worker base image and resolve its digest-pinned ref
+    (build_run_argv rejects an unpinned image). Idempotent/cheap after the
+    first pull. FAILS LOUDLY (never skips) when podman is present but image
+    prep fails -- a certification test must not silently degrade to a skip."""
+    env = _worker_podman_env()
+    pull = subprocess.run(
+        ["podman", "pull", _WORKER_BASE_IMAGE],
+        env=env, capture_output=True, text=True, timeout=180,
+    )
+    out = subprocess.run(
+        ["podman", "inspect", "--format", "{{index .RepoDigests 0}}", _WORKER_BASE_IMAGE],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    digest = out.stdout.strip()
+    if "@sha256:" not in digest:
+        pytest.fail(
+            f"could not prepare a digest-pinned worker image ({_WORKER_BASE_IMAGE}); "
+            f"pull rc={pull.returncode} stderr={pull.stderr!r}; "
+            f"inspect stderr={out.stderr!r}"
+        )
+    return digest
+
+
+def _reap_dispatch(dispatch_id: str) -> None:
+    """Best-effort removal of any container lingering for this dispatch label
+    (normal exits use --rm; this covers exceptional/timeout paths)."""
+    env = _worker_podman_env()
+    try:
+        listed = subprocess.run(
+            ["podman", "ps", "-aq", "--filter", f"label=stigmergy.dispatch_id={dispatch_id}"],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        for cid in listed.stdout.split():
+            subprocess.run(
+                ["podman", "rm", "-f", cid],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+    except OSError:
+        pass
+
+
+@requires_podman
+@requires_network
+def test_live_e2e_worker_container_egress_governed_by_proxy(tmp_path):
+    image = _pinned_worker_image()
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    policy = EgressPolicy(
+        allowed_hosts=frozenset({_REAL_HOST_FOR_LIVE_TEST}),
+        allowed_ports=frozenset({443}),
+    )
+    handle = setup_dispatch_egress("disp-live-egress", policy, runtime)
+    try:
+        profile = _profile(tmp_path, image=image, network="none")
+        argv = build_run_argv(
+            profile,
+            command=["python3", "-c", _EGRESS_PROBE],
+            egress_socket=handle.socket_path,
+            dispatch_id="disp-live-egress",
+        )
+        result = subprocess.run(
+            argv, env=_worker_podman_env(), capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, (
+            f"probe container failed rc={result.returncode}\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        lines = {
+            ln.split(" => ", 1)[0]: ln.split(" => ", 1)[1]
+            for ln in result.stdout.splitlines()
+            if " => " in ln
+        }
+        # (a) allowlisted host tunnels: the proxy writes 200 ONLY after a real
+        # upstream TCP connect to the resolved public IP succeeds.
+        assert lines.get(f"{_REAL_HOST_FOR_LIVE_TEST}:443", "").startswith(
+            "HTTP/1.1 200"
+        ), result.stdout
+        # (b) non-allowlisted host + bare IP literal are both denied (403).
+        assert lines.get("evil.example.com:443", "").startswith("HTTP/1.1 403"), result.stdout
+        assert lines.get("1.1.1.1:443", "").startswith("HTTP/1.1 403"), result.stdout
+        # The proxy socket is the ONLY exit: a direct AF_INET connection from
+        # inside the cage must be blocked (--network=none). REACHED would mean
+        # the container has an egress path the proxy does not govern.
+        assert lines.get("DIRECT", "").startswith("BLOCKED"), result.stdout
+    finally:
+        handle.teardown()
+        _reap_dispatch("disp-live-egress")
+
+    # Every decision is recorded in the proxy's JSONL egress log (survives
+    # teardown -- only the socket is unlinked). Pin the COMPLETE per-dispatch
+    # audit records so a mis-correlated / mis-metadata'd log can't stay green.
+    entries = _read_jsonl(handle.log_path)
+    assert len(entries) == 3, entries
+    for e in entries:
+        assert e["dispatch_id"] == "disp-live-egress", e
+        assert e["port"] == 443, e
+    allow = [e for e in entries if e["decision"] == "allow"]
+    deny = [e for e in entries if e["decision"] == "deny"]
+    assert len(allow) == 1, entries
+    assert allow[0]["reason"] == "allow"
+    assert allow[0]["host"] == _REAL_HOST_FOR_LIVE_TEST
+    assert allow[0]["resolved_ip"]  # a real public IP was resolved AND connected
+    assert len(deny) == 2, entries
+    by_reason = {d["reason"]: d for d in deny}
+    assert set(by_reason) == {"not-allowlisted", "ip-literal"}, entries
+    # Pre-resolution denies never resolve a target -> resolved_ip is null.
+    assert by_reason["not-allowlisted"]["host"] == "evil.example.com"
+    assert by_reason["not-allowlisted"]["resolved_ip"] is None
+    assert by_reason["ip-literal"]["host"] == "1.1.1.1"
+    assert by_reason["ip-literal"]["resolved_ip"] is None
+
+
+@requires_podman
+@requires_network
+def test_live_e2e_egress_fail_closed_when_proxy_killed_mid_dispatch(tmp_path):
+    image = _pinned_worker_image()
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    task = tmp_path / "task"
+    task.mkdir()
+    policy = EgressPolicy(
+        allowed_hosts=frozenset({_REAL_HOST_FOR_LIVE_TEST}),
+        allowed_ports=frozenset({443}),
+    )
+    handle = setup_dispatch_egress("disp-failclosed", policy, runtime)
+    profile = ContainerProfile(
+        image=image,
+        work_clone=work,
+        task_pack=task,
+        scratch_size="64m",
+        pids_limit=64,
+        memory="256m",
+        cpus="1",
+        timeout_seconds=90,
+        network="none",
+    )
+    argv = build_run_argv(
+        profile,
+        command=["python3", "-c", _FAILCLOSED_PROBE],
+        egress_socket=handle.socket_path,
+        dispatch_id="disp-failclosed",
+    )
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv, env=_worker_podman_env(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # Wait until the in-flight dispatch has made its first (successful)
+        # probe and ATOMICALLY published the result.
+        first_done = work / "first-done"
+        deadline = time.monotonic() + 60
+        while not first_done.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert first_done.exists(), f"container never completed its first probe; rc={proc.poll()!r}"
+        assert first_done.read_text().startswith("HTTP/1.1 200"), first_done.read_text()
+
+        # Kill the proxy MID-DISPATCH. teardown() stops the loop, closes the
+        # server, JOINS the thread, and unlinks the socket before returning.
+        handle.teardown()
+        assert not handle.socket_path.exists()  # completed-stop postcondition
+        # Only NOW release the container's second probe -- strict happens-after:
+        # the proxy is fully down before the second CONNECT is ever issued, so
+        # the two never race.
+        (work / "kill").write_text("1")
+
+        out, err = proc.communicate(timeout=90)
+        assert proc.returncode == 0, f"rc={proc.returncode}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+        payload = next(
+            (json.loads(ln) for ln in out.splitlines()
+             if ln.strip().startswith("{") and "second" in ln),
+            None,
+        )
+        assert payload is not None, f"no JSON result line in probe output:\n{out}"
+        assert payload["first"].startswith("HTTP/1.1 200"), payload
+        # Fail-closed: the proxy is fully torn down, so the container's sole
+        # exit refuses the connection at the unix layer (CONNECT_ERR). A
+        # RECV_ERR would mean the connect SUCCEEDED (proxy still up) and the
+        # request may have reached upstream -- NOT acceptable as fail-closed.
+        assert payload["second"].startswith("CONNECT_ERR"), payload
+
+        # Independent proof no SECOND egress happened: the per-dispatch egress
+        # log holds exactly the first allow and no second decision.
+        entries = _read_jsonl(handle.log_path)
+        assert len(entries) == 1, entries
+        assert entries[0]["decision"] == "allow"
+        assert entries[0]["host"] == _REAL_HOST_FOR_LIVE_TEST
+        assert entries[0]["dispatch_id"] == "disp-failclosed"
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+        handle.teardown()
+        _reap_dispatch("disp-failclosed")
