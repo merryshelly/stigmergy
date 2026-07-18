@@ -102,6 +102,17 @@ _INFRA_MARKERS: tuple[str, ...] = (
     "temporarily unavailable",
 )
 
+# HTTP statuses that are unambiguously provider/infra conditions, NOT worker
+# capability failures (SPEC rev2 D9: "rate limits ≠ capability failures").
+# Observed live (bead .64): real claude-code reports an API/transport failure as
+# subtype="success" + is_error=true + an integer `api_error_status` (NOT
+# subtype="error_during_execution"), so the _INFRA_MARKERS path alone never
+# fired for it. Auth statuses (401/403) are DELIBERATELY excluded pending an SB
+# policy call (bead .64 comment) — in the credential-relay model they are
+# arguably infra, but auto-INFRA there could mask a persistent misconfig, so
+# they currently fall through to FAILED.
+_INFRA_HTTP_STATUSES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504, 529})
+
 
 class DriverError(Exception):
     """Raised on a structural task-pack/work-clone contract violation
@@ -333,6 +344,31 @@ def _classify(
             None,
             "error_during_execution with no infra marker — genuine execution bug",
         )
+
+    # Real claude-code reports an API/transport error as subtype="success" +
+    # is_error=True + an integer `api_error_status` + terminal_reason="api_error"
+    # (observed live, bead .64) — NOT error_during_execution. Route the
+    # unambiguous provider/infra statuses to INFRA (SPEC D9), and still honor an
+    # infra-flavored marker in the result text (covers a transport failure that
+    # carried no status). Everything else with is_error stays FAILED.
+    if is_error:
+        api_status = result_obj.get("api_error_status")
+        if isinstance(api_status, int) and not isinstance(api_status, bool):
+            if api_status in _INFRA_HTTP_STATUSES:
+                return (
+                    DispatchStatus.INFRA,
+                    None,
+                    f"claude-code api_error_status={api_status} — provider/infra condition",
+                )
+        result_text = result_obj.get("result")
+        if isinstance(result_text, str) and any(
+            marker in result_text.lower() for marker in _INFRA_MARKERS
+        ):
+            return (
+                DispatchStatus.INFRA,
+                None,
+                "is_error result matched an infra-flavored marker",
+            )
 
     return (
         DispatchStatus.FAILED,

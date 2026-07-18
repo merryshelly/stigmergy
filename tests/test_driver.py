@@ -365,6 +365,80 @@ def test_spawn_is_error_missing_defaults_to_failed(tmp_path):
 
 
 # ==========================================================================
+# Bead .64: API-error classification (subtype="success" + is_error=true +
+# api_error_status), the shape REAL claude-code emits on an API/transport
+# failure (observed live 2026-07-18). The pre-.64 classifier fell these through
+# to FAILED; the unambiguous provider/infra statuses must be INFRA (SPEC D9).
+# ==========================================================================
+
+
+def _run_result(stdout_obj, tmp_path, budgets=None):
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout=json.dumps(stdout_obj))
+    return spawn(pack, work, _model_cfg(), _capability(), budgets or _budgets(), run_one=runner)
+
+
+def test_spawn_api_error_status_500_returns_infra(tmp_path):
+    # Discriminates the api_error_status path SPECIFICALLY: 500 is in
+    # _INFRA_HTTP_STATUSES but "500" is NOT an _INFRA_MARKERS substring, and the
+    # result text carries no marker -> INFRA can only come from the status path.
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "api_error_status": 500, "result": "the upstream request did not complete",
+         "terminal_reason": "api_error"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.INFRA
+
+
+def test_spawn_api_error_status_408_returns_infra(tmp_path):
+    # 408 likewise is a status-path-only signal (no "408" marker, marker-free text).
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "api_error_status": 408, "result": "the request did not complete in time"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.INFRA
+
+
+def test_spawn_api_error_status_403_stays_failed_pending_sb_policy(tmp_path):
+    # Observed-live denied-egress shape. 401/403 are DELIBERATELY not auto-INFRA
+    # (bead .64 SB policy flag) -> stays FAILED for now. If SB rules auth
+    # statuses are infra, add {401,403} to _INFRA_HTTP_STATUSES and flip this.
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "api_error_status": 403,
+         "result": "Failed to authenticate. API Error: 403 status code (no body)",
+         "terminal_reason": "api_error"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.FAILED
+
+
+def test_spawn_api_error_status_400_returns_failed(tmp_path):
+    # A client/request error (e.g. malformed request, context too long) is a
+    # capability failure, NOT infra.
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "api_error_status": 400, "result": "API Error: 400 bad_request"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.FAILED
+
+
+def test_spawn_is_error_success_with_connection_marker_returns_infra(tmp_path):
+    # A transport failure that carried NO status but a marker-bearing result
+    # text (e.g. a dead egress surfaced as a connection error) -> INFRA.
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "result": "request failed: Connection refused"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.INFRA
+
+
+# ==========================================================================
 # Status classification -- ceiling trips (SPEC §9). Cases 15-16.
 # ==========================================================================
 
