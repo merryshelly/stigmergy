@@ -85,7 +85,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 # A module-level opener that verifies TLS (urllib default) and does NOT follow
 # redirects. Injected transports in tests replace `open` on this object.
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+# bead .25 audit (F-1): explicit empty ProxyHandler so an inherited HTTPS_PROXY
+# cannot reroute this KEY-BEARING critic call (same hole/fix as the relay
+# forwarder; this call carries the critic's real Anthropic key).
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler
+)
 
 
 class CriticClientError(Exception):

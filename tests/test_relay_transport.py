@@ -738,6 +738,38 @@ class TestNoRedirectUpstream:
                 None, 302, "Found", {}, "https://evil.example.com",
             )
 
+    def test_forwarder_opener_ignores_proxy_env(self, monkeypatch):
+        # bead .25 audit F-1 (HIGH, opus+codex convergent): the production
+        # opener carries the REAL key on a DIRECT host call; it must NOT honor
+        # an inherited *_proxy env var. Reload the module UNDER a proxied env
+        # and assert the built opener installs no env-derived ProxyHandler
+        # (the explicit ProxyHandler({}) guard suppresses build_opener's
+        # default env-reading one). Auto-catches a revert to the unguarded
+        # build_opener(_NoRedirectHandler).
+        import importlib
+        import urllib.request as _ur
+
+        from stigmergy import relay_transport
+
+        monkeypatch.setenv("HTTPS_PROXY", "http://should-not-be-used.example:9")
+        monkeypatch.setenv("https_proxy", "http://should-not-be-used.example:9")
+        reloaded = importlib.reload(relay_transport)
+        try:
+            leaked = [
+                h for h in reloaded._NO_REDIRECT_OPENER.handlers
+                if isinstance(h, _ur.ProxyHandler) and h.proxies
+            ]
+            assert not leaked, f"relay opener honors inherited HTTPS_PROXY: {leaked}"
+            # contrast (non-vacuous): the UNGUARDED default WOULD pick it up.
+            unguarded = _ur.build_opener(reloaded._NoRedirectHandler)
+            assert any(
+                isinstance(h, _ur.ProxyHandler) and h.proxies
+                for h in unguarded.handlers
+            ), "sanity: unguarded opener picks up HTTPS_PROXY (proves the guard matters)"
+        finally:
+            monkeypatch.undo()
+            importlib.reload(relay_transport)  # restore the clean-env module opener
+
 
 # =========================================================================== #
 # Capability lifecycle integration (cases 23-25)                                #

@@ -1181,6 +1181,34 @@ def test_relay_r5_teardown_independence_relay_failure_still_tears_egress(env: En
     assert egress_setup.handles[0].stop_calls == 1            # egress still torn down
 
 
+def test_relay_egress_policy_uses_current_rung_not_entry_lane(env: Env, monkeypatch) -> None:
+    """bead .25 audit (codex HIGH): a stepped-up ticket's egress policy must be
+    resolved for its CURRENT RUNG, not the entry lane. Before the fix,
+    _claim_and_prepare resolved the egress lane WITHOUT rung while
+    prepare_dispatch used the rung -> mismatch. Spy policy_for_lane's lane_name."""
+    import stigmergy.egress as egress_mod
+
+    captured: list[str] = []
+    real = egress_mod.policy_for_lane
+
+    def spy(charter_raw, lane_name, **kw):
+        captured.append(lane_name)
+        return real(charter_raw, lane_name, **kw)
+
+    monkeypatch.setattr(egress_mod, "policy_for_lane", spy)
+
+    add_dispatchable_ticket(env, "t-rung", current_rung="exquisite")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    daemon = make_daemon(env, spawn_fn=spawn,
+                         relay_setup_fn=FakeSetup("relay"),
+                         egress_setup_fn=FakeSetup("egress"))
+    daemon.poll_once()
+
+    assert captured == ["exquisite"], f"egress resolved wrong lane: {captured}"
+    # sanity: the dispatch actually ran the exquisite rung's model
+    assert spawn.calls[0][2].model == env.charter.raw["lanes"]["exquisite"]["model"]
+
+
 def test_relay_r6_teardown_order_revoke_then_relay_then_egress(env: Env) -> None:
     """R6: teardown order is revoke -> relay stop -> egress stop (revoke is the
     load-bearing security act and goes first)."""

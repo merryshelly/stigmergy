@@ -290,6 +290,17 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     relay_key_provider = make_op_key_provider(_RELAY_KEY_REF)
     relay_forwarder = make_urllib_forwarder(base_url=_ANTHROPIC_BASE_URL)
 
+    def secrets_for_capability(capability):
+        # bead .25 audit (F-2): arm the sealed-transcript backstop against the
+        # REAL key, not just the capability token. The daemon default redacts
+        # only the token; .25 (per daemon.py + drivers/claude_code.py docstrings)
+        # owns adding the real key to both the redactor and the must_not_contain
+        # tripwire. relay_key_provider is op-backed + cached fetch-once, so this
+        # adds no extra op calls after warmup. No ACTIVE leak exists (the worker
+        # never holds the key) -- this is the last-line defense-in-depth the bead
+        # was chartered to wire.
+        return frozenset({capability.token, relay_key_provider()})
+
     def relay_setup_fn(provisional_id: str, runtime_dir: Path) -> RelayHandle:
         # Per-dispatch relay. The sync `forwarder` slot is a sentinel that
         # raises — the streaming serve_relay path uses prepare_upstream +
@@ -330,6 +341,7 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         # relay_teardown_fn stays at Daemon's default (RelayHandle.stop).
         egress_setup_fn=egress.setup_dispatch_egress,
         relay_setup_fn=relay_setup_fn,
+        secrets_for_capability=secrets_for_capability,
     )
 
 

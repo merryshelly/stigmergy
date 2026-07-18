@@ -252,6 +252,16 @@ def test_build_daemon_relay_wiring(tmp_path: Path, monkeypatch) -> None:
         # start_relay got the forwarder from make_urllib_forwarder
         assert captured["forwarder"] == "FAKE_FORWARDER"
         assert captured["provisional_id"] == "relay-xyz"
+
+        # bead .25 audit F-2: the transcript backstop is armed against the REAL
+        # key (not just the capability token).
+        from stigmergy.relay import Capability
+
+        cap = Capability(token="cap-tok-xyz", dispatch_id="d1",
+                         max_output_tokens=1, max_calls=1)
+        secret_set = daemon._secrets_for_capability(cap)
+        assert "cap-tok-xyz" in secret_set
+        assert "sk-fake-not-real" in secret_set  # the (monkeypatched) real key
     finally:
         daemon._store.close()
 

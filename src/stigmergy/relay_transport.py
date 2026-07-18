@@ -226,7 +226,20 @@ Forwarder = Callable[[UpstreamRequest], Awaitable[tuple[UpstreamHead, AsyncItera
 # headers, including the injected key, to the redirect target by default).
 # Reuses critic_client's exact no-redirect handler class (same guard, same
 # failure shape: the redirect raises HTTPError -> mapped to UpstreamError).
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+#
+# bead .25 audit (F-1, HIGH; opus+codex convergent): `build_opener()` installs
+# a default ProxyHandler that reads *_proxy env vars at import time. Without an
+# explicit empty ProxyHandler, a daemon that inherits HTTPS_PROXY would route
+# this KEY-BEARING upstream call through that proxy (reroute / metadata leak;
+# key exfil under a MITM proxy with a trusted CA). The inference path is
+# deliberately a DIRECT host call (never through the egress proxy), so proxy
+# handling is disabled here explicitly — more robust than env-scrubbing (survives
+# a var set after import) and self-documenting. Netloc pinning (F1/.55) does NOT
+# cover this (the ProxyHandler intercepts inside opener.open, orthogonal to the
+# netloc check).
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler
+)
 
 
 # --------------------------------------------------------------------------- #

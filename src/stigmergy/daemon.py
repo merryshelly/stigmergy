@@ -453,7 +453,14 @@ class Daemon:
         ticket_id = eligible_ids[0]
         ticket_row = self._store.get_ticket(ticket_id)
         steering = self._steering_of(ticket_id)
-        lane = select_lane(self._charter, ticket_row)
+        # bead .25 audit (codex HIGH): resolve the OPERATIONAL lane with the
+        # ticket's current rung — the SAME resolution prepare_dispatch uses
+        # (dispatch.py select_lane(..., rung=...)). Without rung, a stepped-up
+        # retry would get the egress policy + execution snapshot of the ENTRY
+        # lane, not the rung it actually runs on — an egress-policy mismatch
+        # (masked in v0 only because all rungs share egress groups). Now the
+        # egress policy, the execution metadata, and plan.lane all agree.
+        lane = select_lane(self._charter, ticket_row, rung=ticket_row.get("current_rung"))
         execution = self._build_execution(lane)
 
         # Bridging decision (module docstring point 7): claim with a
