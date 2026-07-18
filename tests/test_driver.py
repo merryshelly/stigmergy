@@ -237,6 +237,52 @@ def test_build_run_argv_no_extra_volume_from_env(tmp_path):
 
 
 # ==========================================================================
+# bead .25: relay_socket threading + cred_env base-URL drop. Cases B4-B6.
+# ==========================================================================
+
+
+def test_model_cfg_relay_socket_field_defaults_none():
+    cfg = _model_cfg()
+    assert cfg.relay_socket is None
+    import dataclasses
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.relay_socket = "/x"  # type: ignore[misc]
+
+
+def test_spawn_with_relay_socket_mounts_it_and_drops_base_url(tmp_path):
+    # bead .25: production relay path. The relay socket is mounted at the .63
+    # in-cage path, and the worker gets ONLY the capability token — the .63
+    # entrypoint owns ANTHROPIC_BASE_URL (loopback relay shim), so cred_env
+    # must NOT carry a host base URL.
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    sock = tmp_path / "relay.sock"
+    runner = CapturingRunOne(stdout=_success_json())
+    cap = _capability()
+    spawn(pack, work, _model_cfg(relay_socket=sock), cap, _budgets(), run_one=runner)
+    argv, _env, _timeout = runner.calls[0]
+    assert f"--volume={sock}:/run/relay.sock:rw" in argv
+    assert f"--env=ANTHROPIC_API_KEY={cap.token}" in argv
+    assert not any(a.startswith("--env=ANTHROPIC_BASE_URL=") for a in argv)
+
+
+def test_spawn_without_relay_socket_is_backward_compatible(tmp_path):
+    # Legacy/no-relay path: no relay volume; ANTHROPIC_BASE_URL still injected
+    # from relay_base_url (existing .13 behavior preserved).
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout=_success_json())
+    cap = _capability()
+    spawn(pack, work, _model_cfg(relay_base_url="http://relay.local:9191"),
+          cap, _budgets(), run_one=runner)
+    argv, _env, _timeout = runner.calls[0]
+    assert not any(":/run/relay.sock:rw" in a for a in argv)
+    assert f"--env=ANTHROPIC_API_KEY={cap.token}" in argv
+    assert "--env=ANTHROPIC_BASE_URL=http://relay.local:9191" in argv
+
+
+# ==========================================================================
 # Task-pack / work-clone contract (bead .13 build spec §0.3/§0.4). Cases 6-7.
 # ==========================================================================
 

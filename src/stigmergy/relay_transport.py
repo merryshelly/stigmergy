@@ -109,6 +109,7 @@ from stigmergy.relay import (
     RelayRequest,
     RelayResponse,
     UpstreamRequest,
+    _find_header,
     extract_usage,
     prepare_upstream,
 )
@@ -1013,6 +1014,11 @@ async def _handle_connection(
     reason = "handler-exception"
     status = 500
     head_written = False
+    # bead .25: the worker-controlled anthropic-beta value is passed through to
+    # upstream (claude-code needs it; see bead25-build-spec §9). Log it so the
+    # worker's beta selection is AUDITED, not invisible — the observability half
+    # of the decision-5b posture (server-side-tool betas would bypass the cage).
+    beta: str | None = None
     try:
         try:
             request = await read_relay_request(
@@ -1027,6 +1033,8 @@ async def _handle_connection(
             reason = "malformed-request"
             await _write_deny_response(writer, status)
             return
+
+        beta = _find_header(request.headers, "anthropic-beta")
 
         prepared = prepare_upstream(relay, request)
         if isinstance(prepared, DenyResponse):
@@ -1277,6 +1285,7 @@ async def _handle_connection(
                 "decision": decision,
                 "reason": reason,
                 "status": status,
+                "anthropic_beta": beta,
             },
         )
         try:

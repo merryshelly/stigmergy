@@ -497,6 +497,7 @@ def prepare_dispatch(
     relay_base_url: str,
     image: str,
     egress_socket: Path | str | None = None,
+    relay_socket: Path | str | None = None,
 ) -> DispatchPlan:
     """The one entry point `.22` calls (bead .21 build spec §1). Composes
     :func:`select_lane` + :func:`generate_worker_name` +
@@ -555,6 +556,7 @@ def prepare_dispatch(
         image=image,
         relay_base_url=relay_base_url,
         egress_socket=egress_socket,
+        relay_socket=relay_socket,
     )
     budgets = claude_code.Budgets(output_tokens=output_tokens, driver_turns=driver_turns)
 

@@ -523,7 +523,7 @@ class _SpyCapabilityStore(CapabilityStore):
         return super().mint(*args, **kwargs)
 
 
-def _prepare_test_dispatch(tmp_path: Path, *, capability_store=None):
+def _prepare_test_dispatch(tmp_path: Path, *, capability_store=None, **prepare_kwargs):
     charter = make_full_charter(tmp_path)
     rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
     store = RigStore.create(tmp_path / "tickets.db")
@@ -562,8 +562,28 @@ def _prepare_test_dispatch(tmp_path: Path, *, capability_store=None):
         prompts_dir=prompts_dir,
         relay_base_url="http://relay.local:9999",
         image=PINNED_IMAGE,
+        **prepare_kwargs,
     )
     return charter, plan, store, cap_store
+
+
+def test_prepare_dispatch_threads_relay_socket(tmp_path: Path) -> None:
+    # bead .25: the daemon's per-dispatch relay socket path flows into the
+    # DispatchPlan's ModelConfig so spawn mounts it into the cage.
+    sock = tmp_path / "relay.sock"
+    _charter, plan, store, _cap = _prepare_test_dispatch(tmp_path, relay_socket=sock)
+    try:
+        assert plan.model_cfg.relay_socket == sock
+    finally:
+        store.close()
+
+
+def test_prepare_dispatch_relay_socket_defaults_none(tmp_path: Path) -> None:
+    _charter, plan, store, _cap = _prepare_test_dispatch(tmp_path)
+    try:
+        assert plan.model_cfg.relay_socket is None
+    finally:
+        store.close()
 
 
 def test_case18_prepare_dispatch_quota_invariant(tmp_path: Path) -> None:

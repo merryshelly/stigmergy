@@ -515,6 +515,38 @@ def make_infra_critic():
     )
 
 
+class FakeHandle:
+    """Duck-typed stand-in for a per-dispatch relay/egress handle (bead .25):
+    a socket_path + a stop() spy — enough for the daemon setup/teardown seams,
+    no real server/thread."""
+
+    def __init__(self, socket_path: Path):
+        self.socket_path = socket_path
+        self.stop_calls = 0
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+class FakeSetup:
+    """A relay/egress setup_fn (bead .25): records call args and returns a
+    FakeHandle with a deterministic socket_path per call. Accepts *args so it
+    fits both the egress signature (provisional_id, policy, runtime_dir) and
+    the relay signature (provisional_id, runtime_dir)."""
+
+    def __init__(self, tag: str = "sock"):
+        self._tag = tag
+        self.calls: list[tuple] = []
+        self.handles: list[FakeHandle] = []
+
+    def __call__(self, provisional_id: str, *rest) -> FakeHandle:
+        self.calls.append((provisional_id, *rest))
+        runtime_dir = rest[-1]  # last positional is runtime_dir for both sigs
+        handle = FakeHandle(Path(runtime_dir) / f"{provisional_id}-{self._tag}.sock")
+        self.handles.append(handle)
+        return handle
+
+
 def make_daemon(
     env: Env,
     *,
@@ -524,6 +556,10 @@ def make_daemon(
     spend_leash: Any = None,
     now_fn: Any = None,
     min_disk_bytes: int = 0,
+    relay_setup_fn: Any = None,
+    relay_teardown_fn: Any = None,
+    egress_setup_fn: Any = None,
+    egress_teardown_fn: Any = None,
 ) -> Daemon:
     if run_checks_fn is None:
         run_checks_fn = ScriptedChecks([pass_result("lint"), pass_result("pytest")])
@@ -534,6 +570,15 @@ def make_daemon(
         spend_leash = SpendLeash(budgets, env.registry)
     if now_fn is None:
         now_fn = FakeClock()
+    extra: dict[str, Any] = {}
+    if relay_setup_fn is not None:
+        extra["relay_setup_fn"] = relay_setup_fn
+    if relay_teardown_fn is not None:
+        extra["relay_teardown_fn"] = relay_teardown_fn
+    if egress_setup_fn is not None:
+        extra["egress_setup_fn"] = egress_setup_fn
+    if egress_teardown_fn is not None:
+        extra["egress_teardown_fn"] = egress_teardown_fn
     return Daemon(
         store=env.store,
         record_plane=env.record_plane,
@@ -553,6 +598,7 @@ def make_daemon(
         now_fn=now_fn,
         min_disk_bytes=min_disk_bytes,
         disk_path=str(env.rig_paths["repo_root"]),
+        **extra,
     )
 
 
@@ -1052,6 +1098,120 @@ def test_case16_capability_revoked_even_when_spawn_raises(env: Env) -> None:
     assert len(env.capability_store.minted) == 1
     cap = env.capability_store.minted[0]
     assert env.capability_store.is_live(cap.token) is False
+
+
+# ==========================================================================
+# bead .25: credential-relay setup/teardown seam. Cases R1-R6 (incl. case 29).
+# ==========================================================================
+
+
+def test_relay_r1_no_relay_setup_fn_leaves_relay_socket_none(env: Env) -> None:
+    """R1 (backward-compat gate): with no relay_setup_fn (default), the
+    dispatch runs with no relay and model_cfg.relay_socket is None."""
+    add_dispatchable_ticket(env, "t-r1")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    daemon = make_daemon(env, spawn_fn=spawn)
+    daemon.poll_once()
+    assert spawn.calls[0][2].relay_socket is None
+
+
+def test_relay_r2_socket_threaded_into_dispatch(env: Env) -> None:
+    """R2: the relay handle's served socket_path (read from the handle) is
+    exactly what prepare_dispatch threads into model_cfg.relay_socket — no
+    drift between served and mounted."""
+    add_dispatchable_ticket(env, "t-r2")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup)
+    daemon.poll_once()
+    assert len(relay_setup.handles) == 1
+    assert spawn.calls[0][2].relay_socket == relay_setup.handles[0].socket_path
+
+
+def test_relay_case29_teardown_revoke_relay_stop_and_egress(env: Env) -> None:
+    """Case 29: a normal dispatch cycle revokes the capability AND stops the
+    relay AND tears down egress."""
+    add_dispatchable_ticket(env, "t-29")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    egress_setup = FakeSetup("egress")
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup,
+                         egress_setup_fn=egress_setup)
+    daemon.poll_once()
+    cap = env.capability_store.minted[0]
+    assert env.capability_store.is_live(cap.token) is False   # revoked
+    assert relay_setup.handles[0].stop_calls == 1             # relay stopped
+    assert egress_setup.handles[0].stop_calls == 1            # egress torn down
+
+
+def test_relay_case29b_teardown_runs_even_when_spawn_raises(env: Env) -> None:
+    """Case 29b: spawn_fn raises -> the exception propagates AFTER the finally,
+    and revoke + relay stop + egress stop all still ran."""
+    add_dispatchable_ticket(env, "t-29b")
+    relay_setup = FakeSetup("relay")
+    egress_setup = FakeSetup("egress")
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), relay_setup_fn=relay_setup,
+                         egress_setup_fn=egress_setup)
+    with pytest.raises(RuntimeError):
+        daemon.poll_once()
+    cap = env.capability_store.minted[0]
+    assert env.capability_store.is_live(cap.token) is False
+    assert relay_setup.handles[0].stop_calls == 1
+    assert egress_setup.handles[0].stop_calls == 1
+
+
+def test_relay_r5_teardown_independence_relay_failure_still_tears_egress(env: Env) -> None:
+    """R5: a relay_teardown_fn that raises must NOT skip egress teardown, and
+    revoke must have run first regardless (each teardown independently
+    guarded)."""
+    add_dispatchable_ticket(env, "t-r5")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    egress_setup = FakeSetup("egress")
+
+    def exploding_relay_teardown(handle):
+        raise RuntimeError("relay stop boom")
+
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup,
+                         relay_teardown_fn=exploding_relay_teardown,
+                         egress_setup_fn=egress_setup)
+    daemon.poll_once()  # must NOT raise — teardown failure is swallowed+logged
+    cap = env.capability_store.minted[0]
+    assert env.capability_store.is_live(cap.token) is False   # revoke ran first
+    assert egress_setup.handles[0].stop_calls == 1            # egress still torn down
+
+
+def test_relay_r6_teardown_order_revoke_then_relay_then_egress(env: Env) -> None:
+    """R6: teardown order is revoke -> relay stop -> egress stop (revoke is the
+    load-bearing security act and goes first)."""
+    add_dispatchable_ticket(env, "t-r6")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    order: list[str] = []
+
+    class OrderStore(SpyCapabilityStore):
+        def revoke(self, dispatch_id):  # type: ignore[override]
+            order.append("revoke")
+            return super().revoke(dispatch_id)
+
+    env.capability_store = OrderStore()
+
+    def relay_setup_fn(pid, runtime_dir):
+        return FakeHandle(Path(runtime_dir) / f"{pid}.sock")
+
+    def relay_teardown(handle):
+        order.append("relay")
+
+    def egress_setup_fn(pid, policy, runtime_dir):
+        return FakeHandle(Path(runtime_dir) / f"{pid}.sock")
+
+    def egress_teardown(handle):
+        order.append("egress")
+
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup_fn,
+                         relay_teardown_fn=relay_teardown, egress_setup_fn=egress_setup_fn,
+                         egress_teardown_fn=egress_teardown)
+    daemon.poll_once()
+    assert order == ["revoke", "relay", "egress"]
 
 
 # ==========================================================================

@@ -24,6 +24,7 @@ per-dispatch lifecycle are exercised deterministically and offline.
 from __future__ import annotations
 
 import asyncio
+import json
 import urllib.error
 from pathlib import Path
 
@@ -913,3 +914,104 @@ class TestConcurrencyQuotaLeash:
         statuses = sorted(line.split(b" ")[1] for line in results)
         assert statuses == [b"200", b"429"]  # the other is quota-denied
         assert store.usage(cap.token)["calls"] == 1  # charged exactly once total
+
+
+# =========================================================================== #
+# bead .25: anthropic-beta pass-through + audit logging (live finding §9)       #
+# =========================================================================== #
+class TestAnthropicBetaPassthrough:
+    def _serve(self, tmp_path, relay, forwarder, raw):
+        socket_path = tmp_path / "relay.sock"
+        log_path = tmp_path / "relay.jsonl"
+        captured: dict[str, bytes] = {}
+
+        async def _run():
+            server = await serve_relay(
+                socket_path, relay, forwarder=forwarder, log_path=log_path, dispatch_id="d1"
+            )
+            try:
+                captured["resp"] = await _roundtrip(socket_path, raw)
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(_run())
+        return captured["resp"], log_path
+
+    def test_anthropic_beta_forwarded_when_allowlisted(self, tmp_path):
+        # bead .25 (SB-approved widening): with anthropic-beta in the allowlist,
+        # the worker's beta value reaches upstream (claude-code needs it).
+        store = CapabilityStore()
+        kp = CountingKeyProvider()
+        cap = store.mint("d1", max_output_tokens=10000, max_calls=5)
+        relay = CredentialRelay(
+            store=store,
+            key_provider=kp,
+            forwarder=lambda req: (_ for _ in ()).throw(AssertionError("sync unused")),
+            capability_header=CAP_HEADER,
+            upstream_header_allowlist=frozenset({"content-type", "accept", "anthropic-beta"}),
+        )
+        fwd = FakeForwarder(
+            headers=[("content-type", "application/json")],
+            chunks=[b'{"usage":{"output_tokens":1}}'],
+        )
+        raw = _build_raw_request(
+            token=cap.token, extra_lines=["anthropic-beta: context-management-2025-06-27"]
+        )
+        self._serve(tmp_path, relay, fwd, raw)
+        up = {k.lower(): v for k, v in fwd.requests[0].request.headers.items()}
+        assert up.get("anthropic-beta") == "context-management-2025-06-27"
+
+    def test_anthropic_beta_dropped_under_tight_default(self, tmp_path):
+        # DEFAULT allowlist stays tight (honors .55): anthropic-beta is dropped.
+        store = CapabilityStore()
+        kp = CountingKeyProvider()
+        cap = store.mint("d1", max_output_tokens=10000, max_calls=5)
+        relay = _relay(store, kp)  # DEFAULT_UPSTREAM_HEADER_ALLOWLIST
+        fwd = FakeForwarder(
+            headers=[("content-type", "application/json")],
+            chunks=[b'{"usage":{"output_tokens":1}}'],
+        )
+        raw = _build_raw_request(
+            token=cap.token, extra_lines=["anthropic-beta: context-management-2025-06-27"]
+        )
+        self._serve(tmp_path, relay, fwd, raw)
+        up = {k.lower(): v for k, v in fwd.requests[0].request.headers.items()}
+        assert "anthropic-beta" not in up
+
+    def test_anthropic_beta_value_logged(self, tmp_path):
+        # The worker-controlled beta value is AUDITED in the relay JSONL
+        # (decision-5b observability), regardless of the allowlist.
+        store = CapabilityStore()
+        kp = CountingKeyProvider()
+        cap = store.mint("d1", max_output_tokens=10000, max_calls=5)
+        relay = _relay(store, kp)
+        fwd = FakeForwarder(
+            headers=[("content-type", "application/json")],
+            chunks=[b'{"usage":{"output_tokens":1}}'],
+        )
+        raw = _build_raw_request(
+            token=cap.token, extra_lines=["anthropic-beta: interleaved-thinking-2025-05-14"]
+        )
+        _resp, log_path = self._serve(tmp_path, relay, fwd, raw)
+        entries = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
+        allow = [e for e in entries if e["decision"] == "allow"]
+        assert allow
+        assert allow[-1]["anthropic_beta"] == "interleaved-thinking-2025-05-14"
+
+    def test_anthropic_beta_absent_logs_null(self, tmp_path):
+        # No anthropic-beta on the request -> logged as null (not missing key).
+        store = CapabilityStore()
+        kp = CountingKeyProvider()
+        cap = store.mint("d1", max_output_tokens=10000, max_calls=5)
+        relay = _relay(store, kp)
+        fwd = FakeForwarder(
+            headers=[("content-type", "application/json")],
+            chunks=[b'{"usage":{"output_tokens":1}}'],
+        )
+        raw = _build_raw_request(token=cap.token)
+        _resp, log_path = self._serve(tmp_path, relay, fwd, raw)
+        entries = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
+        assert entries
+        assert all("anthropic_beta" in e for e in entries)
+        assert entries[-1]["anthropic_beta"] is None

@@ -187,6 +187,71 @@ def test_build_daemon_wiring(tmp_path: Path) -> None:
 
         # notifier topic from charter [notify].ntfy_topic
         assert daemon._notifier.topic == "stigmergy"
+
+        # bead .25: egress + relay wired for real (were .22-era placeholders).
+        assert daemon._egress_setup_fn is cli.egress.setup_dispatch_egress
+        assert daemon._relay_setup_fn is not None
+        assert daemon._relay_teardown_fn is not None
+    finally:
+        daemon._store.close()
+
+
+# --- bead .25: _build_daemon credential-relay wiring ------------------------
+
+
+def test_build_daemon_relay_wiring(tmp_path: Path, monkeypatch) -> None:
+    """bead .25: the relay-setup closure constructs a CredentialRelay that
+    SHARES the daemon's CapabilityStore, pins anthropic-version, widens the
+    header allowlist to include anthropic-beta (SB option A), and start_relay
+    gets the make_urllib_forwarder result. make_op_key_provider is lazy, so
+    no real op/network call happens here."""
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+
+    kp_refs: list[str] = []
+    monkeypatch.setattr(
+        cli, "make_op_key_provider",
+        lambda ref: (kp_refs.append(ref), (lambda: "sk-fake-not-real"))[1],
+    )
+    fwd_urls: list[str] = []
+
+    def fake_make_forwarder(*, base_url, **kw):
+        fwd_urls.append(base_url)
+        return "FAKE_FORWARDER"
+
+    monkeypatch.setattr(cli, "make_urllib_forwarder", fake_make_forwarder)
+
+    captured: dict = {}
+
+    def fake_start_relay(provisional_id, runtime_dir, relay, *, forwarder, log_path):
+        captured["relay"] = relay
+        captured["forwarder"] = forwarder
+        captured["provisional_id"] = provisional_id
+        captured["log_path"] = log_path
+        return object()  # stand-in RelayHandle
+
+    monkeypatch.setattr(cli, "start_relay", fake_start_relay)
+
+    daemon = _build_daemon(resolved)
+    try:
+        # E19/E20: the relay key ref + forwarder base URL are wired.
+        assert cli._RELAY_KEY_REF in kp_refs
+        assert "https://api.anthropic.com" in fwd_urls
+
+        # invoke the per-dispatch relay closure
+        handle = daemon._relay_setup_fn("relay-xyz", tmp_path)
+        assert handle is not None
+        relay = captured["relay"]
+        # shared store (load-bearing — E18)
+        assert relay._store is daemon._capability_store
+        # pinned version + widened allowlist (SB option A)
+        assert relay._upstream_headers_pinned == {"anthropic-version": "2023-06-01"}
+        assert relay._upstream_header_allowlist == frozenset(
+            {"content-type", "accept", "anthropic-beta"}
+        )
+        # start_relay got the forwarder from make_urllib_forwarder
+        assert captured["forwarder"] == "FAKE_FORWARDER"
+        assert captured["provisional_id"] == "relay-xyz"
     finally:
         daemon._store.close()
 

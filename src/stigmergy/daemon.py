@@ -170,6 +170,7 @@ from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.recover import ContainerReaper, RecoveryReport
 from stigmergy.registry import Registry
 from stigmergy.relay import Capability, CapabilityStore, build_redactor
+from stigmergy.relay_transport import RelayHandle
 from stigmergy.rig import RigStore
 from stigmergy.spend import SpendLeash
 from stigmergy.statemachine import (
@@ -233,6 +234,14 @@ def _default_secrets_for_capability(capability: Capability) -> frozenset[str]:
     return frozenset({capability.token})
 
 
+def _default_relay_teardown(handle: RelayHandle) -> None:
+    """Default per-dispatch relay teardown (bead .25): stop the relay server
+    and remove its socket (idempotent). Mirrors `egress.teardown`'s role for
+    the egress proxy — a dispatch whose relay is gone never falls back to
+    unmetered/uninjected access."""
+    handle.stop()
+
+
 @dataclass(frozen=True)
 class PollSummary:
     """Everything one `poll_once()` call did, for tests to assert against
@@ -285,6 +294,8 @@ class Daemon:
         run_checks_fn: Callable[..., list[CheckResult]] = checks.run_checks,
         egress_setup_fn: Callable[..., EgressHandle] | None = None,
         egress_teardown_fn: Callable[[EgressHandle], None] = egress.teardown,
+        relay_setup_fn: Callable[..., RelayHandle] | None = None,
+        relay_teardown_fn: Callable[[RelayHandle], None] = _default_relay_teardown,
         secrets_for_capability: Callable[[Capability], frozenset[str]] | None = None,
         now_fn: Callable[[], float] = time.time,
         git_repo_paths: list[str | Path] | None = None,
@@ -314,6 +325,8 @@ class Daemon:
         self._run_checks_fn = run_checks_fn
         self._egress_setup_fn = egress_setup_fn
         self._egress_teardown_fn = egress_teardown_fn
+        self._relay_setup_fn = relay_setup_fn
+        self._relay_teardown_fn = relay_teardown_fn
         self._secrets_for_capability = (
             secrets_for_capability
             if secrets_for_capability is not None
@@ -372,10 +385,10 @@ class Daemon:
         if self._spend_leash.can_dispatch():
             claimed = self._claim_and_prepare(now)
             if claimed is not None:
-                ticket_id, plan, egress_handle = claimed
+                ticket_id, plan, egress_handle, relay_handle = claimed
                 dispatched_ticket = ticket_id
                 dispatch_status_value, dispatch_infra_trip = self._run_dispatch_cycle(
-                    ticket_id, plan, egress_handle
+                    ticket_id, plan, egress_handle, relay_handle
                 )
 
         weave_ran, weave_result_tickets, weave_infra_trip = self._maybe_weave(now)
@@ -427,7 +440,7 @@ class Daemon:
 
     def _claim_and_prepare(
         self, now: float
-    ) -> tuple[str, DispatchPlan, EgressHandle | None] | None:
+    ) -> tuple[str, DispatchPlan, EgressHandle | None, RelayHandle | None] | None:
         """Find one eligible ticket, claim it, and prepare its dispatch.
         Returns `None` if nothing is eligible, or if a race makes the
         claim itself fail (never a bug — `LeaseError` is an ordinary
@@ -465,6 +478,16 @@ class Daemon:
         egress_handle = self._setup_egress(ticket_id, lane, now)
         egress_socket = egress_handle.socket_path if egress_handle is not None else None
 
+        # bead .25: the credential relay mirrors egress — set up BEFORE
+        # prepare_dispatch with a provisional id, read the served socket path
+        # back from the handle, thread it into the dispatch so spawn mounts
+        # /run/relay.sock. The relay authorizes by capability TOKEN against the
+        # shared CapabilityStore (not by dispatch_id), so it is safe to stand
+        # up before the capability is minted inside prepare_dispatch — the
+        # worker only issues a request once it is running, well after mint.
+        relay_handle = self._setup_relay(ticket_id, now)
+        relay_socket = relay_handle.socket_path if relay_handle is not None else None
+
         fresh_row = self._store.get_ticket(ticket_id)
         plan = prepare_dispatch(
             charter=self._charter,
@@ -478,12 +501,13 @@ class Daemon:
             relay_base_url=self._relay_base_url,
             image=self._image,
             egress_socket=egress_socket,
+            relay_socket=relay_socket,
         )
         # Reconcile the ticket's lease_dispatch_id to the REAL dispatch
         # identity now that prepare_dispatch has generated it — see module
         # docstring point 7.
         self._store.update_ticket(ticket_id, lease_dispatch_id=plan.dispatch_id)
-        return ticket_id, plan, egress_handle
+        return ticket_id, plan, egress_handle, relay_handle
 
     def _build_execution(self, lane: Any) -> dict[str, Any]:
         """Build the `execution` snapshot fields (SPEC §4: mechanism
@@ -513,8 +537,8 @@ class Daemon:
         return result.stdout.strip()
 
     def _setup_egress(self, ticket_id: str, lane: Any, now: float) -> EgressHandle | None:
-        """v0 pre-.25: `None` unless `egress_setup_fn` is injected (see
-        module docstring "Egress" note)."""
+        """`None` unless `egress_setup_fn` is injected (wired for real by
+        `cli._build_daemon` at `.25`)."""
         if self._egress_setup_fn is None:
             return None
         policy = egress.policy_for_lane(self._charter.raw, lane.name)
@@ -522,17 +546,39 @@ class Daemon:
         provisional_id = f"egress-{ticket_id}-{int(now * 1000)}"
         return self._egress_setup_fn(provisional_id, policy, runtime_dir)
 
+    def _setup_relay(self, ticket_id: str, now: float) -> RelayHandle | None:
+        """bead .25: `None` unless `relay_setup_fn` is injected (wired for real
+        by `cli._build_daemon`). Mirrors `_setup_egress`: a provisional id + a
+        per-rig runtime dir; the injected fn constructs a `CredentialRelay`
+        (sharing this daemon's `CapabilityStore`) and `start_relay`s it,
+        returning a `RelayHandle` whose `socket_path` the caller threads into
+        the dispatch. No lane/policy input — the relay authorizes by capability
+        token, not by lane."""
+        if self._relay_setup_fn is None:
+            return None
+        runtime_dir = Path(self._rig_paths["clones_root"]) / "_relay_runtime"
+        provisional_id = f"relay-{ticket_id}-{int(now * 1000)}"
+        return self._relay_setup_fn(provisional_id, runtime_dir)
+
     # -- dispatch cycle ---------------------------------------------------------
 
     def _run_dispatch_cycle(
-        self, ticket_id: str, plan: DispatchPlan, egress_handle: EgressHandle | None
+        self,
+        ticket_id: str,
+        plan: DispatchPlan,
+        egress_handle: EgressHandle | None,
+        relay_handle: RelayHandle | None = None,
     ) -> tuple[str, bool]:
         """Spawn, emit the DISPATCH event, then run the §1.1/§1.2 decision
-        tree. `capability_store.revoke(dispatch_id)` and egress teardown
-        ALWAYS run in a `finally` around this whole block — covers every
-        exit path, including an unexpected exception from `spawn_fn`
-        (case 16: the exception propagates after `finally` runs; revoke
-        still happened)."""
+        tree. `capability_store.revoke(dispatch_id)`, relay teardown, and
+        egress teardown ALWAYS run in a `finally` around this whole block —
+        covers every exit path, including an unexpected exception from
+        `spawn_fn` (case 16: the exception propagates after `finally` runs;
+        revoke still happened). bead .25 (case 29): teardown revokes the
+        capability FIRST (the load-bearing security act — a leaked/replayed
+        token is dead instantly), then stops the relay, then the egress
+        proxy; each teardown is independently guarded so a failure in one
+        never leaks the other's OS resources."""
         infra_trip = False
         dispatch_status_value = "none"
         try:
@@ -619,8 +665,26 @@ class Daemon:
             infra_trip = self._handle_dispatch_outcome(ticket_id, plan, result, ctx, now=t_end)
         finally:
             self._capability_store.revoke(plan.dispatch_id)
+            if relay_handle is not None:
+                try:
+                    self._relay_teardown_fn(relay_handle)
+                except Exception:  # noqa: BLE001 - a relay-stop failure must not skip egress teardown
+                    _logger.warning(
+                        "relay teardown failed for dispatch %s (ticket %s)",
+                        plan.dispatch_id,
+                        ticket_id,
+                        exc_info=True,
+                    )
             if egress_handle is not None:
-                self._egress_teardown_fn(egress_handle)
+                try:
+                    self._egress_teardown_fn(egress_handle)
+                except Exception:  # noqa: BLE001 - an egress-stop failure must not mask the outcome
+                    _logger.warning(
+                        "egress teardown failed for dispatch %s (ticket %s)",
+                        plan.dispatch_id,
+                        ticket_id,
+                        exc_info=True,
+                    )
 
         return dispatch_status_value, infra_trip
 

@@ -31,7 +31,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from stigmergy import approval, checks, spend, triage
+from stigmergy import approval, checks, egress, spend, triage
 from stigmergy.charter import Charter, CharterError
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
@@ -49,7 +49,8 @@ from stigmergy.rangereport import (
 )
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.registry import PricingClass, UnbudgetableError
-from stigmergy.relay import CapabilityStore
+from stigmergy.relay import CapabilityStore, CredentialRelay
+from stigmergy.relay_transport import RelayHandle, make_urllib_forwarder, start_relay
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
 from stigmergy.status import (
@@ -279,6 +280,36 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         filing_max_bytes=dispatch_limits["filed_ticket_bytes"],
     )
 
+    # bead .25: the real credential relay + egress wiring (the last v0 piece).
+    # ONE shared CapabilityStore — the daemon mints/revokes on it AND the relay
+    # authorizes against it; a second instance would make every relay request
+    # deny "unknown" (load-bearing; see bead25-build-spec §8 / test case E18).
+    capability_store = CapabilityStore()
+    # Constructed ONCE (reused across dispatches): the key provider caches
+    # fetch-once (one `op read` per process); the forwarder is stateless.
+    relay_key_provider = make_op_key_provider(_RELAY_KEY_REF)
+    relay_forwarder = make_urllib_forwarder(base_url=_ANTHROPIC_BASE_URL)
+
+    def relay_setup_fn(provisional_id: str, runtime_dir: Path) -> RelayHandle:
+        # Per-dispatch relay. The sync `forwarder` slot is a sentinel that
+        # raises — the streaming serve_relay path uses prepare_upstream +
+        # the injected async forwarder, never CredentialRelay._forwarder.
+        relay = CredentialRelay(
+            store=capability_store,
+            key_provider=relay_key_provider,
+            forwarder=_unused_sync_forwarder,
+            upstream_headers_pinned={"anthropic-version": _ANTHROPIC_VERSION},
+            upstream_header_allowlist=_RELAY_UPSTREAM_HEADER_ALLOWLIST,
+        )
+        log_path = Path(runtime_dir) / f"relay-{provisional_id}.jsonl"
+        return start_relay(
+            provisional_id,
+            runtime_dir,
+            relay,
+            forwarder=relay_forwarder,
+            log_path=log_path,
+        )
+
     return Daemon(
         store=store,
         record_plane=record_plane,
@@ -288,15 +319,17 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         charter=charter,
         registry=registry,
         rig_paths=rig_paths,
-        capability_store=CapabilityStore(),
+        capability_store=capability_store,
         checker_image=checker_image,
         weaver=weaver,
         container_reaper=PodmanContainerReaper(),
         steering_of=_make_steering_of(store, charter, rig_paths["prompts_dir"]),
         # spawn_fn / run_checks_fn: Daemon's own real defaults (claude_code.spawn /
         # checks.run_checks) -- do not pass explicitly, nothing to override.
-        # egress_setup_fn / egress_teardown_fn / relay_base_url: Daemon's own
-        # .22-era placeholder defaults -- do NOT wire real egress/relay here (§0).
+        # bead .25: egress + relay wired for real (were .22-era placeholders).
+        # relay_teardown_fn stays at Daemon's default (RelayHandle.stop).
+        egress_setup_fn=egress.setup_dispatch_egress,
+        relay_setup_fn=relay_setup_fn,
     )
 
 
@@ -691,6 +724,33 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
 # (item id `oknaudituuajtuw3cnv4dra7s4`, field `credential`) -- per bead .31's
 # comment, do NOT source the critic key from any other vault item.
 _CRITIC_KEY_REF = "op://shelly/API Credential - stigmergy rig 00/credential"
+
+# bead .25: the credential relay's real Anthropic key (same op item the .64
+# capture used). The real key lives ONLY in the relay process; the worker gets
+# a capability token. See bead25-build-spec.md.
+_RELAY_KEY_REF = "op://shelly/API Credential - stigmergy rig 00/credential"
+_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+# Current REQUIRED header value per Anthropic docs (verified 2026-07-18). The
+# relay pins this (worker's own version header is stripped); without it the
+# first live relay request 400s.
+_ANTHROPIC_VERSION = "2023-06-01"
+# bead .25 (SB adjudication 2026-07-18, option A): claude-code needs
+# `anthropic-beta` passed through to upstream (its beta-gated body fields, e.g.
+# context_management, depend on it; the beta list varies per request so pinning
+# cannot work). The module DEFAULT stays tight (honors .55) — this widening
+# lives ONLY here at the construction site, documented + auditable. Residual
+# risk (server-side-tool betas bypassing the cage) tracked in bead .75.
+_RELAY_UPSTREAM_HEADER_ALLOWLIST = frozenset({"content-type", "accept", "anthropic-beta"})
+
+
+def _unused_sync_forwarder(request):  # noqa: ANN001, ANN202
+    """CredentialRelay's sync `forwarder` slot (the .12 full-body path). The
+    streaming `serve_relay` used in production never calls it — it uses
+    `prepare_upstream` + the injected async forwarder — so this must never run.
+    Raises loudly if it ever does (a wiring bug), never silently forwards."""
+    raise RuntimeError(
+        "sync CredentialRelay.forwarder must never run on the streaming relay path"
+    )
 
 
 _DEFAULT_NTFY_SERVER = "https://ntfy.sh"

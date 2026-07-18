@@ -369,6 +369,22 @@ def test_worker_credential_env_has_capability_not_real_key():
     assert all(DUMMY_REAL_KEY not in v for v in values)
 
 
+def test_worker_credential_env_base_url_none_omits_base_url():
+    # bead .25: when the relay is wired, the .63 worker entrypoint OWNS
+    # ANTHROPIC_BASE_URL (it points claude at the loopback relay shim). The
+    # daemon must then NOT put a host base URL in cred_env — only the
+    # capability token. `base_url=None` (the new default) yields exactly that.
+    store = CapabilityStore()
+    cap = store.mint("disp-1", max_output_tokens=100, max_calls=5)
+    env = worker_credential_env(cap, base_url=None)
+    assert env == {"ANTHROPIC_API_KEY": cap.token}
+    assert "ANTHROPIC_BASE_URL" not in env
+    # default (omitted) behaves like base_url=None
+    assert worker_credential_env(cap) == {"ANTHROPIC_API_KEY": cap.token}
+    # real key never present either way
+    assert DUMMY_REAL_KEY not in cap.token
+
+
 def test_no_worker_facing_artifact_contains_real_key():
     # Everything the relay module hands toward the worker for a dispatch must be
     # clean of the real key — it lives only in the relay process.

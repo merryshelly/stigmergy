@@ -326,17 +326,27 @@ def build_redactor(secrets: Iterable[str]) -> Callable[[str], str]:
     return _redact
 
 
-def worker_credential_env(capability: Capability, *, base_url: str) -> dict[str, str]:
+def worker_credential_env(capability: Capability, *, base_url: str | None = None) -> dict[str, str]:
     """The claude-code-shaped worker env for one dispatch's capability:
-    ``{"ANTHROPIC_API_KEY": capability.token, "ANTHROPIC_BASE_URL": base_url}``.
+    ``{"ANTHROPIC_API_KEY": capability.token}``, plus ``ANTHROPIC_BASE_URL``
+    ONLY when ``base_url`` is given.
 
     Provably contains NO real provider key — only the capability token
-    (worthless after :meth:`CapabilityStore.revoke`) and the relay's own
-    base URL. This is the AC4 credential-vacancy target (bead .12 build
-    spec §1); exact env var names are the claude-code convention, and
-    final task-pack wiring is a .21 concern.
+    (worthless after :meth:`CapabilityStore.revoke`) and, optionally, a base
+    URL. This is the AC4 credential-vacancy target (bead .12 build spec §1).
+
+    bead .25: in production the relay is wired and the ``.63`` worker
+    entrypoint OWNS ``ANTHROPIC_BASE_URL`` (it points claude at the in-cage
+    loopback relay shim once ``/run/relay.sock`` is mounted). The daemon
+    must therefore pass ``base_url=None`` so no host base URL lands in the
+    worker env — the entrypoint's value would win anyway, but a dead host
+    URL in ``cred_env`` is misleading. ``base_url`` is retained (optional)
+    for the legacy/no-relay path (a direct ``ANTHROPIC_BASE_URL``).
     """
-    return {"ANTHROPIC_API_KEY": capability.token, "ANTHROPIC_BASE_URL": base_url}
+    env = {"ANTHROPIC_API_KEY": capability.token}
+    if base_url is not None:
+        env["ANTHROPIC_BASE_URL"] = base_url
+    return env
 
 
 # Reasons whose deny status is 429 (quota exhaustion) rather than 401

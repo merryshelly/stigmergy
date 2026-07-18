@@ -143,8 +143,13 @@ class ModelConfig:
 
     model: str  # --model value (registry entry name / API model id)
     image: str  # rig.image (digest-pinned; container.py enforces this)
-    relay_base_url: str  # passed straight through to relay.worker_credential_env
+    relay_base_url: str  # legacy/no-relay path only (see spawn); vestigial when relay_socket set
     egress_socket: Path | str | None = None  # passed straight through to build_run_argv
+    # bead .25: the dispatch's credential-relay unix socket. When set, it is
+    # mounted into the cage (/run/relay.sock) and the .63 entrypoint owns
+    # ANTHROPIC_BASE_URL (loopback relay shim) -- so cred_env carries ONLY the
+    # capability token (no host base URL). None = legacy/no-relay path.
+    relay_socket: Path | str | None = None  # passed straight through to build_run_argv
     scratch_size: str = "1g"
     pids_limit: int = 1024
     memory: str = "4g"
@@ -453,7 +458,13 @@ def spawn(
         )
     prompt_text = prompt_path.read_text(encoding="utf-8")
 
-    cred_env = worker_credential_env(capability, base_url=model_cfg.relay_base_url)
+    # bead .25: when the relay is wired (relay_socket set), the .63 worker
+    # entrypoint owns ANTHROPIC_BASE_URL (it points claude at the in-cage
+    # loopback relay shim once /run/relay.sock is mounted) -- so the worker
+    # gets ONLY the capability token. Legacy/no-relay path keeps the direct
+    # ANTHROPIC_BASE_URL from relay_base_url.
+    base_url = None if model_cfg.relay_socket is not None else model_cfg.relay_base_url
+    cred_env = worker_credential_env(capability, base_url=base_url)
 
     profile = ContainerProfile(
         image=model_cfg.image,
@@ -491,6 +502,7 @@ def spawn(
         profile,
         command=command,
         egress_socket=model_cfg.egress_socket,
+        relay_socket=model_cfg.relay_socket,
         env=cred_env,
         dispatch_id=capability.dispatch_id,
     )
