@@ -402,10 +402,12 @@ def test_spawn_api_error_status_408_returns_infra(tmp_path):
     assert result.status is DispatchStatus.INFRA
 
 
-def test_spawn_api_error_status_403_stays_failed_pending_sb_policy(tmp_path):
-    # Observed-live denied-egress shape. 401/403 are DELIBERATELY not auto-INFRA
-    # (bead .64 SB policy flag) -> stays FAILED for now. If SB rules auth
-    # statuses are infra, add {401,403} to _INFRA_HTTP_STATUSES and flip this.
+def test_spawn_api_error_status_403_returns_infra(tmp_path):
+    # Observed-live denied-egress shape. SB ruled 2026-07-18 (bead .64): auth
+    # statuses (401/403) are INFRA -- in the credential-relay model the worker
+    # never holds the real key, so an auth failure is ours to fix at the infra
+    # level, not a capability failure. This is the exact captured denied-egress
+    # result object.
     result = _run_result(
         {"type": "result", "subtype": "success", "is_error": True,
          "api_error_status": 403,
@@ -413,7 +415,16 @@ def test_spawn_api_error_status_403_stays_failed_pending_sb_policy(tmp_path):
          "terminal_reason": "api_error"},
         tmp_path,
     )
-    assert result.status is DispatchStatus.FAILED
+    assert result.status is DispatchStatus.INFRA
+
+
+def test_spawn_api_error_status_401_returns_infra(tmp_path):
+    result = _run_result(
+        {"type": "result", "subtype": "success", "is_error": True,
+         "api_error_status": 401, "result": "unauthorized"},
+        tmp_path,
+    )
+    assert result.status is DispatchStatus.INFRA
 
 
 def test_spawn_api_error_status_400_returns_failed(tmp_path):

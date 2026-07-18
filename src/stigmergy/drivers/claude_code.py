@@ -102,16 +102,18 @@ _INFRA_MARKERS: tuple[str, ...] = (
     "temporarily unavailable",
 )
 
-# HTTP statuses that are unambiguously provider/infra conditions, NOT worker
-# capability failures (SPEC rev2 D9: "rate limits ≠ capability failures").
-# Observed live (bead .64): real claude-code reports an API/transport failure as
+# HTTP statuses that are provider/infra conditions, NOT worker capability
+# failures (SPEC rev2 D9: "rate limits ≠ capability failures"). Observed live
+# (bead .64): real claude-code reports an API/transport failure as
 # subtype="success" + is_error=true + an integer `api_error_status` (NOT
 # subtype="error_during_execution"), so the _INFRA_MARKERS path alone never
-# fired for it. Auth statuses (401/403) are DELIBERATELY excluded pending an SB
-# policy call (bead .64 comment) — in the credential-relay model they are
-# arguably infra, but auto-INFRA there could mask a persistent misconfig, so
-# they currently fall through to FAILED.
-_INFRA_HTTP_STATUSES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504, 529})
+# fired for it. Auth statuses (401/403) ARE included per SB ruling (2026-07-18,
+# bead .64): in the credential-relay model the worker never holds the real key,
+# so an auth failure is ours to fix at the infra level, not a capability failure
+# the worker could retry away.
+_INFRA_HTTP_STATUSES: frozenset[int] = frozenset(
+    {401, 403, 408, 429, 500, 502, 503, 504, 529}
+)
 
 
 class DriverError(Exception):
