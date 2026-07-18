@@ -106,12 +106,36 @@ class ContainerProfile:
     network: str = "none"
 
 
+# podman non-registry transports whose source is mutable/local — a decorative
+# `@sha256:` substring on one of these does NOT pin anything (bead .63 review,
+# codex-sol-xhigh: `dir:/tmp/x@sha256:<64hex>` bypassed the digest guard live).
+_IMAGE_TRANSPORT_PREFIXES = (
+    "dir:",
+    "docker-archive:",
+    "docker-daemon:",
+    "oci:",
+    "oci-archive:",
+    "containers-storage:",
+    "tarball:",
+    "sif:",
+)
+
+
 def _require_pinned(image: str) -> None:
-    # Accept a registry ref pinned by digest (`name@sha256:...`) OR a bare
-    # content digest / local image id (`sha256:<64hex>`, bead .63 built
-    # images). Both are immutable + content-addressed; only mutable tags are
-    # rejected.
-    if _DIGEST_RE.search(image) or _BARE_DIGEST_RE.fullmatch(image):
+    # A bare content digest / local image id (`sha256:<64hex>`, bead .63 built
+    # images) is immutable + content-addressed.
+    if _BARE_DIGEST_RE.fullmatch(image):
+        return
+    # Reject non-registry transports outright: their source is mutable/local and
+    # an `@sha256:` on them is decorative, not a pin.
+    if image.startswith(_IMAGE_TRANSPORT_PREFIXES):
+        raise ContainerError(
+            f"image ref {image!r} uses a non-registry transport — refused "
+            "(supply-chain rule SPEC §3/§4; a digest on a mutable/local source "
+            "is not a pin)"
+        )
+    # Otherwise require a registry ref pinned by digest (`name@sha256:...`).
+    if _DIGEST_RE.search(image):
         return
     raise ContainerError(
         f"image ref {image!r} is not digest-pinned (@sha256:... or a bare "

@@ -268,6 +268,20 @@ def test_profile_rejects_bare_sha256_wrong_length(tmp_path):
         )
 
 
+def test_profile_rejects_transport_prefixed_ref_with_decorative_digest(tmp_path):
+    # Bead .63 review (codex-sol-xhigh): a non-registry transport with a
+    # DECORATIVE @sha256: substring pins nothing (the source is mutable/local)
+    # and must be refused even though it contains @sha256:<64hex>.
+    for ref in (
+        "dir:/tmp/evil@sha256:" + "a" * 64,
+        "docker-archive:/tmp/x.tar@sha256:" + "b" * 64,
+        "containers-storage:localhost/x@sha256:" + "c" * 64,
+        "oci:/tmp/layout@sha256:" + "d" * 64,
+    ):
+        with pytest.raises(ContainerError):
+            build_run_argv(_profile(tmp_path, image=ref), command=["true"])
+
+
 # --------------------------------------------------------------------------
 # Deterministic: worker invocation environment (rootless cgroup enforcement)
 # --------------------------------------------------------------------------
