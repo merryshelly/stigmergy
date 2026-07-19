@@ -178,6 +178,43 @@ def _require_valid_dispatch_id(dispatch_id: str | None) -> None:
         raise ContainerError(f"dispatch_id {dispatch_id!r} is invalid — must not contain ','")
 
 
+def _require_entrypoint_override_safe(
+    entrypoint_override: str | None,
+    network: str,
+    egress_socket: str | Path | None,
+    relay_socket: str | Path | None,
+) -> None:
+    """Raise :class:`ContainerError` if ``entrypoint_override`` is combined
+    with any egress-capable configuration (bead .87). The only sanctioned use
+    of an entrypoint override is a CHECK container — ``network="none"``, no
+    egress/relay socket — which has no governed-egress cage, so displacing the
+    worker image's fail-closed egress-gatekeeper entrypoint (``worker_image/
+    entrypoint.sh``) removes nothing. Overriding the entrypoint on a container
+    that DOES have a netns/egress path would bypass that gatekeeper — refused
+    here so it is mechanically unrepresentable, not merely discouraged. Checked
+    BEFORE any argv token is appended, so a rejected call never leaks a partial
+    argv list."""
+    if entrypoint_override is None:
+        return
+    if network != "none":
+        raise ContainerError(
+            f"entrypoint_override is only permitted on a network=none container "
+            f"(got network={network!r}) — overriding the entrypoint on an "
+            "egress-capable container would bypass the fail-closed egress "
+            "gatekeeper (bead .87)"
+        )
+    if egress_socket is not None:
+        raise ContainerError(
+            "entrypoint_override must not be combined with an egress_socket — a "
+            "gatekeeper-bypassed container with an egress path is forbidden (bead .87)"
+        )
+    if relay_socket is not None:
+        raise ContainerError(
+            "entrypoint_override must not be combined with a relay_socket — a "
+            "gatekeeper-bypassed container with a relay path is forbidden (bead .87)"
+        )
+
+
 def build_run_argv(
     profile: ContainerProfile,
     *,
@@ -186,6 +223,7 @@ def build_run_argv(
     relay_socket: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     dispatch_id: str | None = None,
+    entrypoint_override: str | None = None,
 ) -> list[str]:
     """Render ``profile`` into an exact `podman run` argv (SPEC §4).
 
@@ -245,11 +283,32 @@ def build_run_argv(
     returned argv is byte-identical to the pre-.34 argv (regression guard,
     exactly the discipline ``egress_socket=None``/``env=None`` already
     get).
+
+    ``entrypoint_override`` (bead .87) is the ONLY thing that can displace
+    the image's own ENTRYPOINT. When given, exactly one
+    ``--entrypoint=<value>`` token is emitted immediately before the image
+    ref (after any ``env`` tokens); the caller must pass a ``command`` tail
+    that matches (e.g. ``entrypoint_override="sh"`` with ``command=["-c",
+    "<cmd>"]``). Its ONLY sanctioned use is a CHECK container
+    (:mod:`stigmergy.checks`), which runs ``network="none"`` with no
+    egress/relay socket: bypassing the worker image's fail-closed
+    egress-gatekeeper entrypoint removes nothing, because a no-network
+    container has no governed egress to gate. To make that a mechanical
+    invariant rather than a convention, :func:`_require_entrypoint_override_safe`
+    raises :class:`ContainerError` if ``entrypoint_override`` is combined
+    with ``network != "none"`` or with an ``egress_socket``/``relay_socket``
+    — a gatekeeper-bypassed container that also has an egress path is
+    unrepresentable. Left at its default ``None``, the returned argv is
+    byte-identical to the pre-.87 argv (the worker spawn path passes
+    nothing and is unaffected).
     """
     _require_pinned(profile.image)
     if env is not None:
         _require_valid_env_keys(env)
     _require_valid_dispatch_id(dispatch_id)
+    _require_entrypoint_override_safe(
+        entrypoint_override, profile.network, egress_socket, relay_socket
+    )
 
     work = str(Path(profile.work_clone).resolve())
     task = str(Path(profile.task_pack).resolve())
@@ -279,6 +338,8 @@ def build_run_argv(
     if env is not None:
         for key in sorted(env):
             argv.append(f"--env={key}={env[key]}")
+    if entrypoint_override is not None:
+        argv.append(f"--entrypoint={entrypoint_override}")
     argv.append(profile.image)
     argv.extend(command)
     return argv
@@ -523,16 +584,23 @@ def build_image(
 
 
 def _resolve_image_digest(tag: str, env: dict[str, str]) -> str:
-    """Resolve a built image's content digest via a fallback chain of
-    `podman inspect` formats, never hand-copying any captured value —
-    each subprocess result is used directly, in Python, as bytes.
+    """Resolve a built image's RUNNABLE content id via a fallback chain of
+    `podman inspect` formats, never hand-copying any captured value — each
+    subprocess result is used directly, in Python, as bytes.
 
-    Local-only builds (never pushed/pulled) typically leave `.Digest` and
-    `.RepoDigests` empty, so this falls through to `.Id` (the image config
-    digest), normalizing it to carry the `sha256:` prefix if the podman
-    version reports it bare.
+    `build_image` only ever produces LOCAL provision builds (never pushed),
+    and the returned ref must be one the daemon can `podman run` directly.
+    `.Id` (the image config digest / local image id) is that ref — always
+    present and always runnable for a just-built image — normalized to carry
+    the `sha256:` prefix if podman reports it bare. It is tried FIRST: `.Digest`
+    (and `.RepoDigests`) can be populated with the *manifest* digest, which on
+    some podman versions (e.g. 5.4.2 populates `.Digest` on local builds) is
+    NOT a runnable bare reference (`podman run sha256:<manifest>` → "image not
+    known") — returning it would hand the daemon an image ref that fails every
+    dispatch (bead .93). The manifest forms remain as last-resort fallbacks
+    only for the degenerate case where `.Id` is somehow unavailable.
     """
-    formats = ("{{.Digest}}", "{{index .RepoDigests 0}}", "{{.Id}}")
+    formats = ("{{.Id}}", "{{index .RepoDigests 0}}", "{{.Digest}}")
     for fmt in formats:
         result = subprocess.run(  # noqa: S603
             ["podman", "inspect", "--format", fmt, tag],

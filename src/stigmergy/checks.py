@@ -127,6 +127,18 @@ def _default_run_one(command: str, work_tree: Path | str, *, image: str) -> tupl
     under `sh -c` with `network="none"`, and always discards the temp
     copies afterward — regardless of outcome, so reruns never accumulate
     disk and the source tree is never touched.
+
+    The checker container reuses the worker image, whose ENTRYPOINT is the
+    fail-closed egress gatekeeper (it exits 69 if `/run/egress.sock` is
+    absent). A checker is `network="none"` with no egress mount by design,
+    so the gatekeeper would ALWAYS fail closed and no check could ever run
+    (bead .87). We therefore bypass it: `entrypoint_override="sh"` +
+    `command=["-c", command]` runs the check command directly. `build_run_argv`
+    forbids that override on any egress-capable container, so it can never
+    be used to escape the gatekeeper on a real worker. `HOME=/scratch` is
+    set (the writable tmpfs) so a real check tool (post-.79 pytest/ruff)
+    has a writable home under the `--read-only` rootfs — the same reason
+    the worker entrypoint sets it (bead .85), which the bypass skips.
     """
     source = Path(work_tree)
     if not source.is_dir():
@@ -150,7 +162,12 @@ def _default_run_one(command: str, work_tree: Path | str, *, image: str) -> tupl
             timeout_seconds=_TIMEOUT_SECONDS,
             network="none",
         )
-        argv = build_run_argv(profile, command=["sh", "-c", command])
+        argv = build_run_argv(
+            profile,
+            command=["-c", command],
+            entrypoint_override="sh",
+            env={"HOME": "/scratch"},
+        )
         result = subprocess.run(  # noqa: S603
             argv,
             env=worker_env(),

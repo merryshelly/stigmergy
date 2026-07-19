@@ -25,7 +25,12 @@ from stigmergy.checks import (
     run_check,
     run_checks,
 )
-from stigmergy.container import worker_env
+from stigmergy.container import (
+    ContainerProfile,
+    build_image,
+    build_run_argv,
+    worker_env,
+)
 
 PODMAN = shutil.which("podman")
 requires_podman = pytest.mark.skipif(PODMAN is None, reason="podman not installed")
@@ -296,3 +301,115 @@ def test_live_work_tree_immutability(tmp_path, pinned_live_image):
     assert after_listing == before_listing
     assert "mutated.txt" not in after_listing
     assert after_content == before_content
+
+
+# --------------------------------------------------------------------------
+# Bead .87: checks run against the egress-gated WORKER image, whose ENTRYPOINT
+# is the fail-closed egress gatekeeper (exit 69 with no /run/egress.sock). A
+# checker is network=none with no egress mount, so without the entrypoint
+# bypass NO check could ever run. These live tests use a hermetic image that
+# reproduces that gatekeeper — the plain LIVE_IMAGE (no gatekeeper) is exactly
+# why this class of bug went undetected.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def gatekeeper_image(tmp_path_factory):
+    """Build a hermetic image whose ENTRYPOINT mimics the worker image's
+    fail-closed egress gatekeeper: exit 69 unless /run/egress.sock is a
+    socket, else exec "$@". Digest-pinned base resolved programmatically."""
+    if PODMAN is None:
+        pytest.skip("podman not installed")
+    subprocess.run(
+        ["podman", "pull", LIVE_IMAGE],
+        env=worker_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    base = subprocess.run(
+        ["podman", "inspect", "--format", "{{index .RepoDigests 0}}", LIVE_IMAGE],
+        env=worker_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert "@sha256:" in base
+    cf_dir = tmp_path_factory.mktemp("gatekeeper-image")
+    (cf_dir / "gate.sh").write_text(
+        "#!/bin/sh\n"
+        '[ -S /run/egress.sock ] || { echo "gatekeeper: egress socket absent" >&2; exit 69; }\n'
+        'exec "$@"\n'
+    )
+    (cf_dir / "Containerfile").write_text(
+        f"FROM {base}\n"
+        "COPY gate.sh /gate.sh\n"
+        "RUN chmod +x /gate.sh\n"
+        'ENTRYPOINT ["/gate.sh"]\n'
+    )
+    return build_image(cf_dir, "localhost/stigmergy-checktest:gatekeeper")
+
+
+@requires_podman
+def test_live_egress_gatekeeper_fires_without_bypass(tmp_path, gatekeeper_image):
+    # The bug .87 fixes, kept documented: WITHOUT the entrypoint bypass, a
+    # network=none checker (no egress socket) hits the gatekeeper entrypoint
+    # which fail-closes at exit 69 before the check command ever runs.
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "f").write_text("SMOKE-OK\n")
+    task = tmp_path / "task"
+    task.mkdir()
+    profile = ContainerProfile(
+        image=gatekeeper_image,
+        work_clone=work,
+        task_pack=task,
+        scratch_size="16m",
+        pids_limit=16,
+        memory="128m",
+        cpus="1",
+        timeout_seconds=30,
+        network="none",
+    )
+    argv = build_run_argv(profile, command=["sh", "-c", "grep -q SMOKE /work/f"])
+    result = subprocess.run(
+        argv, env=worker_env(), capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 69
+
+
+@requires_podman
+def test_live_check_bypasses_egress_gatekeeper(tmp_path, gatekeeper_image):
+    # The fix: run_check bypasses the gatekeeper -> the real check command
+    # runs to a real exit code. Matching content -> PASS, runs == (0,).
+    work = tmp_path / "src"
+    work.mkdir()
+    (work / "DOGFOOD-SMOKE.md").write_text("SMOKE-OK content\n")
+    result = run_check(
+        "smoke",
+        "grep -q '^SMOKE-OK' /work/DOGFOOD-SMOKE.md",
+        work,
+        image=gatekeeper_image,
+        flake_reruns=0,
+    )
+    assert result.outcome is CheckOutcome.PASS
+    assert result.runs == (0,)
+
+
+@requires_podman
+def test_live_check_real_fail_not_infra_against_gatekeeper(tmp_path, gatekeeper_image):
+    # Non-matching content -> the grep actually ran and returned 1 (a real
+    # FAIL), NOT the gatekeeper's 69 and NOT ERROR — proving the check command
+    # executed, not the entrypoint.
+    work = tmp_path / "src"
+    work.mkdir()
+    (work / "DOGFOOD-SMOKE.md").write_text("nope\n")
+    result = run_check(
+        "smoke",
+        "grep -q '^SMOKE-OK' /work/DOGFOOD-SMOKE.md",
+        work,
+        image=gatekeeper_image,
+        flake_reruns=0,
+    )
+    assert result.outcome is CheckOutcome.FAIL
+    assert result.runs == (1,)

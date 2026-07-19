@@ -100,7 +100,7 @@ def _argv(tmp_path, command=None, **overrides):
     # existing call site only ever passes ContainerProfile fields, so this
     # split is purely additive and does not change any existing test.
     build_kwargs = {}
-    for key in ("egress_socket", "relay_socket", "env", "dispatch_id"):
+    for key in ("egress_socket", "relay_socket", "env", "dispatch_id", "entrypoint_override"):
         if key in overrides:
             build_kwargs[key] = overrides.pop(key)
     return build_run_argv(
@@ -361,6 +361,19 @@ def test_build_image_pinned_base_builds_and_returns_digest(tmp_path):
     (cf_dir / "Containerfile").write_text(f"FROM {base}\nRUN true\n")
     digest = build_image(cf_dir, "localhost/stigmergy-worker:test")
     assert isinstance(digest, str) and "sha256:" in digest
+    # bead .93: the returned ref must be RUNNABLE, not just sha256-shaped.
+    # `.Digest` (manifest) is sha256-shaped but `podman run` rejects it bare
+    # ("image not known") on podman versions that populate it for local
+    # builds — the daemon would fail every dispatch. Prove `podman run`
+    # accepts what build_image returns.
+    run = subprocess.run(
+        ["podman", "run", "--rm", "--network=none", "--entrypoint=sh", digest, "-c", "true"],
+        env={**worker_env()},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 0, f"build_image returned a non-runnable ref: {run.stderr}"
 
 
 @requires_podman
@@ -562,6 +575,52 @@ def test_relay_socket_combined_with_egress_socket_ordered(tmp_path):
     assert argv.index(egress_token) < argv.index(relay_token) < argv.index(env_token)
     # relay volume immediately follows the egress volume.
     assert argv.index(relay_token) == argv.index(egress_token) + 1
+
+
+# --------------------------------------------------------------------------
+# Bead .87: entrypoint_override — CHECK containers bypass the egress
+# gatekeeper entrypoint; mechanically forbidden on any egress-capable cage.
+# --------------------------------------------------------------------------
+
+
+def test_entrypoint_override_emits_flag_before_image(tmp_path):
+    # entrypoint_override="sh" -> exactly one --entrypoint=sh token,
+    # positioned immediately before the image ref (all flags precede the
+    # image positional in podman).
+    argv = _argv(tmp_path, entrypoint_override="sh")
+    assert argv.count("--entrypoint=sh") == 1
+    image_index = argv.index(PINNED_IMAGE)
+    assert argv.index("--entrypoint=sh") == image_index - 1
+
+
+def test_entrypoint_override_none_is_byte_identical(tmp_path):
+    # Regression guard (same discipline as egress_socket/env/dispatch_id):
+    # the default None leaves the argv byte-identical to the pre-.87 argv,
+    # so the worker spawn path (which passes nothing) is unaffected.
+    baseline = _argv(tmp_path, command=["true"])
+    with_default = _argv(tmp_path, command=["true"], entrypoint_override=None)
+    assert baseline == with_default
+    assert not any(a.startswith("--entrypoint=") for a in baseline)
+
+
+def test_entrypoint_override_rejected_on_networked_container(tmp_path):
+    # The security invariant: an entrypoint override on an egress-capable
+    # (non-none network) container would bypass the fail-closed egress
+    # gatekeeper -> refused, mechanically unrepresentable.
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, network="ns:/run/netns/dispatch-x", entrypoint_override="sh")
+
+
+def test_entrypoint_override_rejected_with_egress_socket(tmp_path):
+    egress = tmp_path / "egress.sock"
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, egress_socket=egress, entrypoint_override="sh")
+
+
+def test_entrypoint_override_rejected_with_relay_socket(tmp_path):
+    relay = tmp_path / "relay.sock"
+    with pytest.raises(ContainerError):
+        _argv(tmp_path, relay_socket=relay, entrypoint_override="sh")
 
 
 # --------------------------------------------------------------------------
