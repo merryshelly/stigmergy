@@ -729,8 +729,17 @@ def test_bundle_created_when_work_ref_exists(tmp_path):
 
     assert result.bundle_ref is not None
     assert Path(result.bundle_ref).is_file()
+    # `git bundle verify` resolves the bundle's prerequisite commits against a
+    # repository, so it must run INSIDE one -- verify against `work`, the clone
+    # the bundle was created from. Passing cwd explicitly (rather than relying
+    # on the ambient process cwd happening to sit in a git repo) keeps this
+    # deterministic when the suite runs in a checker cage whose /work copy may
+    # or may not carry .git.
     verify = subprocess.run(  # noqa: S603
-        ["git", "bundle", "verify", result.bundle_ref], capture_output=True, text=True
+        ["git", "bundle", "verify", result.bundle_ref],
+        cwd=work,
+        capture_output=True,
+        text=True,
     )
     assert verify.returncode == 0, verify.stderr
 
