@@ -420,10 +420,20 @@ def _ticket(rigs_root: Path, ticket_id: str) -> dict:
 
 
 def _make_staging(rigs_root: Path) -> None:
-    """Create a `staging` branch in the rig's repo clone so range-report has a
-    ref to compute against."""
+    """Ensure a `staging` branch exists in the rig's repo clone so range-report
+    has a ref to compute against. Scaffold now creates the charter's
+    dispatch_base branch (bead .90), so this is idempotent — a no-op when
+    staging already exists, still creating it for a rig whose dispatch_base is
+    not `staging`."""
     repo = rigs_root / RIG / "repo"
-    subprocess.run(["git", "-C", str(repo), "branch", "staging", "HEAD"], check=True)
+    exists = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "refs/heads/staging"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if exists.returncode != 0:
+        subprocess.run(["git", "-C", str(repo), "branch", "staging", "HEAD"], check=True)
 
 
 _ATTRIB = ["--agent", "merry", "--operator-session", "sess-42"]

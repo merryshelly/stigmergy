@@ -355,7 +355,21 @@ class Daemon:
     def recover_on_start(self) -> RecoveryReport:
         """Calls `recover.recover(...)` exactly once (bead .22 build spec
         §4). `recover.RecoveryError` (disk headroom) propagates uncaught —
-        fatal, per the session brief."""
+        fatal, per the session brief.
+
+        Also fails loudly (bead .90) if the charter's `dispatch_base` branch
+        is absent from the rig repo: workers dispatch FROM and the weaver
+        lands ONTO it, and without it `_build_execution` resolves `base_oid`
+        to `None` and every dispatch fails obscurely downstream. Scaffold
+        creates it (`rig._ensure_dispatch_base_branch`); this is the
+        belt-and-suspenders for a hand-crafted rig or a deleted branch."""
+        dispatch_base = self._charter.raw["tiers"]["dispatch_base"]
+        if self._git_rev_parse(Path(self._rig_paths["repo_root"]), dispatch_base) is None:
+            raise DaemonError(
+                f"dispatch_base branch {dispatch_base!r} does not exist in the rig repo "
+                f"{self._rig_paths['repo_root']!r} — cannot dispatch or land. Scaffold a fresh "
+                "rig (which creates it) or create the branch before starting the daemon."
+            )
         now = self._now_fn()
         return recover_module.recover(
             self._store,

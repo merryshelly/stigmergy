@@ -27,7 +27,12 @@ import pytest
 from stigmergy.approval import approve
 from stigmergy.charter import load_charter
 from stigmergy.checks import CheckOutcome, CheckResult
-from stigmergy.daemon import _BACKOFF_CAP_SECONDS, _CIRCUIT_BREAKER_THRESHOLD, Daemon
+from stigmergy.daemon import (
+    _BACKOFF_CAP_SECONDS,
+    _CIRCUIT_BREAKER_THRESHOLD,
+    Daemon,
+    DaemonError,
+)
 from stigmergy.drivers.claude_code import DispatchResult, DispatchStatus
 from stigmergy.notify import NotificationStore, NtfyNotifier
 from stigmergy.records import RecordPlane
@@ -1439,3 +1444,26 @@ def test_harvest_failure_is_isolated_from_the_dispatch_outcome(env: Env) -> None
     assert summary.dispatch_status == "done"
     assert env.store.get_ticket("t-1")["state"] == PARKED
     assert env.store.count_untriaged_filings() == 0
+
+
+# ==========================================================================
+# bead .90: recover_on_start fails loudly if the dispatch_base branch is
+# absent from the rig repo (belt-and-suspenders for the scaffold fix)
+# ==========================================================================
+
+
+def test_recover_on_start_raises_when_dispatch_base_branch_absent(
+    env: Env, tmp_path: Path
+) -> None:
+    """A rig repo missing the charter's dispatch_base branch ('staging') must
+    fail LOUDLY at startup (DaemonError), not dispatch obscurely against
+    base_oid=None."""
+    no_staging = tmp_path / "no_staging_repo"
+    run_git(None, ["init", "--quiet", "-b", "main", str(no_staging)])
+    (no_staging / "README.md").write_text("x\n")
+    run_git(no_staging, ["add", "README.md"])
+    run_git(no_staging, ["commit", "--quiet", "-m", "init"])
+    env.rig_paths["repo_root"] = no_staging
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn())
+    with pytest.raises(DaemonError):
+        daemon.recover_on_start()

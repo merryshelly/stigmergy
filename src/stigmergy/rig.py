@@ -668,6 +668,43 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
         store.close()
 
     _clone_repo(repo, rig_root / "repo")
+    _ensure_dispatch_base_branch(rig_root / "repo", charter.raw["tiers"]["dispatch_base"])
+
+
+def _ensure_dispatch_base_branch(dest: Path, dispatch_base: str) -> None:
+    """Create the charter's ``dispatch_base`` branch in the freshly-cloned rig
+    repo if it does not already exist (bead .90).
+
+    Workers dispatch FROM and the weaver lands ONTO
+    ``refs/heads/<dispatch_base>`` (e.g. ``staging``). A fresh ``git clone``
+    only carries the source's default branch, so unless ``dispatch_base``
+    happens to BE that default it is absent — and the daemon would resolve
+    ``base_oid`` to ``None`` (``_build_execution``) and fail every dispatch
+    obscurely. Creating it here — at the clone's current HEAD, no checkout, no
+    commit, so no git committer identity is needed — makes a scaffolded rig
+    functional end-to-end with no manual ceremony (previously a hand step).
+    Idempotent: if the branch already exists (``dispatch_base`` IS the default
+    branch) this is a no-op.
+    """
+    exists = subprocess.run(  # noqa: S603
+        ["git", "-C", str(dest), "rev-parse", "--verify", "--quiet", f"refs/heads/{dispatch_base}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if exists.returncode == 0:
+        return
+    created = subprocess.run(  # noqa: S603
+        ["git", "-C", str(dest), "branch", dispatch_base, "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        raise RigError(
+            f"could not create dispatch_base branch {dispatch_base!r} in the rig repo "
+            f"(exit {created.returncode}): {created.stderr.strip()}"
+        )
 
 
 def _rewrite_registry_path(text: str, new_rel: str) -> str:

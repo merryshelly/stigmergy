@@ -972,3 +972,47 @@ def test_B5_mark_filed_ticket_triaged_tombstone(tmp_path: Path) -> None:
             store.mark_filed_ticket_triaged(filed_id, outcome="rejected")
     finally:
         store.close()
+
+
+# --- bead .90: scaffold creates the dispatch_base branch --------------------
+
+
+def test_create_rig_creates_dispatch_base_branch(tmp_path: Path) -> None:
+    # Workers dispatch FROM and the weaver lands ONTO refs/heads/<dispatch_base>
+    # (fixture charter: "staging"). A fresh clone only has the source default
+    # branch, so scaffold must create it or the daemon dispatches against
+    # base_oid=None. Previously a manual ceremony step.
+    repo = make_local_repo(tmp_path)
+    charter_path = make_charter(tmp_path, repo)
+    rig_root = create_rig(charter_path, base_dir=tmp_path / "rigs")
+    r = subprocess.run(
+        ["git", "-C", str(rig_root / "repo"), "rev-parse", "--verify", "refs/heads/staging"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0, f"staging branch absent after scaffold: {r.stderr}"
+
+
+def test_create_rig_dispatch_base_idempotent_when_it_is_default_branch(tmp_path: Path) -> None:
+    # If dispatch_base already exists (it IS the repo's default branch),
+    # scaffold must succeed (no "branch already exists" error) and the branch
+    # must still be present.
+    repo = make_local_repo(tmp_path)
+    default_branch = subprocess.run(
+        ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    charter_text = mutate('dispatch_base = "staging"', f'dispatch_base = "{default_branch}"')
+    charter_path = make_charter(tmp_path, repo, content=charter_text)
+    rig_root = create_rig(charter_path, base_dir=tmp_path / "rigs")  # must not raise
+    r = subprocess.run(
+        ["git", "-C", str(rig_root / "repo"), "rev-parse", "--verify",
+         f"refs/heads/{default_branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0
