@@ -79,4 +79,11 @@ fi
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
 
+# Worker HOME must be writable (bead .85). The cage runs --read-only, so /root
+# (the image-default HOME for the root user) sits on the read-only rootfs and
+# claude-code's `mkdir $HOME/.claude` fails EROFS -> no Bash tool -> the worker
+# cannot `git commit` -> nothing is ever collected. Point HOME at the writable
+# /scratch tmpfs so the worker has a writable home for tool state.
+export HOME=/scratch
+
 exec "$@"
