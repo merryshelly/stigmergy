@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from stigmergy.charter import Charter, CharterError, classify_diff, load_charter
+from stigmergy.charter import (
+    Charter,
+    CharterError,
+    classify_diff,
+    load_charter,
+    resolve_check_resources,
+)
+from stigmergy.checks import DEFAULT_CHECK_RESOURCES, CheckResources
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VALID_CHARTER_PATH = FIXTURES / "charter_valid.toml"
@@ -366,5 +373,213 @@ def test_unknown_dispatch_limits_key_still_rejected(tmp_path: Path) -> None:
         "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
         "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\nbogus_limit = 1\n",
     )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+# --- .91: charter-configurable checker resource bounds --------------------
+# Bead workspace-e2uh.91. Resolution order (lowest -> highest precedence):
+# DEFAULT_CHECK_RESOURCES (the legacy hardcoded 60s/256m/1cpu/64m/64pids)
+# -> [loop.check_resources] (applies to EVERY check, including synthesized
+# ones like `ticket-tests`) -> [checks.<name>] per-check override (named
+# charter checks only). Sizes (memory, scratch_size) are unit-bearing
+# strings; counts (timeout_seconds, cpus, pids_limit) are numbers.
+
+
+def test_check_entry_accepts_resource_overrides(tmp_path: Path) -> None:
+    content = mutate(
+        '[checks.pytest]\ncmd = "pytest -x -q"\n',
+        '[checks.pytest]\ncmd = "pytest -x -q"\n'
+        'timeout_seconds = 1800\nmemory = "4g"\ncpus = "4"\n'
+        'scratch_size = "2g"\npids_limit = 512\n',
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["checks"]["pytest"]["timeout_seconds"] == 1800
+
+
+def test_loop_check_resources_default_accepted(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + (
+        "\n[loop.check_resources]\n"
+        'timeout_seconds = 900\nmemory = "2g"\ncpus = "2"\n'
+        'scratch_size = "1g"\npids_limit = 256\n'
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["loop"]["check_resources"]["memory"] == "2g"
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "true", '"60"', "1.5"])
+def test_check_timeout_bad_value_rejected(tmp_path: Path, bad: str) -> None:
+    # timeout_seconds is a positive int: reject non-positive, bool, string, float.
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        f'cmd = "pytest -x -q"\ntimeout_seconds = {bad}\n',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+@pytest.mark.parametrize("bad", ['""', '"lots"', '"4gb"', "256", "true"])
+def test_check_memory_bad_value_rejected(tmp_path: Path, bad: str) -> None:
+    # memory is a unit-bearing size string (^\d+[bkmgBKMG]?$): reject empty,
+    # non-numeric, multi-letter unit, bare int, bool.
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        f'cmd = "pytest -x -q"\nmemory = {bad}\n',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "true", '"two"', '""'])
+def test_check_cpus_bad_value_rejected(tmp_path: Path, bad: str) -> None:
+    # cpus is a positive number (int/float/numeric-string): reject non-positive,
+    # bool, non-numeric string, empty.
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        f'cmd = "pytest -x -q"\ncpus = {bad}\n',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "true", "2.5", '"64"'])
+def test_check_pids_limit_bad_value_rejected(tmp_path: Path, bad: str) -> None:
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        f'cmd = "pytest -x -q"\npids_limit = {bad}\n',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_unknown_key_in_loop_check_resources_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\n[loop.check_resources]\ntimeout_seconds = 900\nbogus = 1\n"
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_unknown_resource_key_in_checks_entry_rejected(tmp_path: Path) -> None:
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        'cmd = "pytest -x -q"\nbogus_knob = 1\n',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_resolve_defaults_when_no_resource_config(tmp_path: Path) -> None:
+    charter = load_charter(make_charter(tmp_path, BASE_CHARTER_TOML), env={})
+    # a synthesized check name (not in [checks.*]) with no [loop.check_resources]
+    # resolves to the legacy defaults.
+    assert resolve_check_resources(charter, "ticket-tests") == DEFAULT_CHECK_RESOURCES
+
+
+def test_resolve_loop_default_applies_to_unnamed_check(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[loop.check_resources]\ntimeout_seconds = 900\nmemory = "2g"\n'
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    r = resolve_check_resources(charter, "ticket-tests")  # not a named charter check
+    assert r.timeout_seconds == 900
+    assert r.memory == "2g"
+    assert r.cpus == DEFAULT_CHECK_RESOURCES.cpus  # unset key keeps default
+
+
+def test_resolve_percheck_overrides_loop_default(tmp_path: Path) -> None:
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        'cmd = "pytest -x -q"\ntimeout_seconds = 1800\ncpus = "4"\n',
+    )
+    content += '\n[loop.check_resources]\ntimeout_seconds = 900\nmemory = "2g"\n'
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    r = resolve_check_resources(charter, "pytest")
+    assert r.timeout_seconds == 1800  # per-check wins over loop default
+    assert r.cpus == "4"  # per-check
+    assert r.memory == "2g"  # loop default (no per-check override)
+    assert r.scratch_size == DEFAULT_CHECK_RESOURCES.scratch_size  # neither -> default
+    # a sibling check with no per-check override gets the loop default, not
+    # pytest's override.
+    r_lint = resolve_check_resources(charter, "lint")
+    assert r_lint.timeout_seconds == 900
+
+
+def test_resolve_normalizes_numeric_types(tmp_path: Path) -> None:
+    content = mutate(
+        'cmd = "pytest -x -q"\n',
+        'cmd = "pytest -x -q"\ncpus = 4\n',  # bare int in TOML
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    r = resolve_check_resources(charter, "pytest")
+    assert r.cpus == "4"
+    assert isinstance(r.cpus, str)
+    assert isinstance(r.timeout_seconds, int)
+    assert isinstance(r, CheckResources)
+
+
+# --- .79: [provision] table (per-rig worker image pip deps) ---------------
+# Bead workspace-e2uh.79. Optional top-level [provision] table; its only
+# key is `pip` -- a list of non-empty package-spec strings (may carry
+# version pins), consumed by `rig.provision_rig_image` to build the
+# per-rig worker image. A charter with no [provision] table at all must
+# keep loading exactly as before (base-image fallback, .79 build spec).
+
+
+def test_provision_table_absent_is_fine(tmp_path: Path) -> None:
+    # No [provision] table at all -- must load clean, `provision` absent
+    # from the merged config (never synthesized as an empty dict).
+    charter = load_charter(make_charter(tmp_path, BASE_CHARTER_TOML), env={})
+    assert "provision" not in charter.raw
+
+
+def test_provision_table_with_pip_list_accepted(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\npip = ["ruff", "pytest"]\n'
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["provision"]["pip"] == ["ruff", "pytest"]
+
+
+def test_provision_pip_may_carry_version_pins(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\npip = ["ruff==0.15.22", "pytest>=8,<9"]\n'
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["provision"]["pip"] == ["ruff==0.15.22", "pytest>=8,<9"]
+
+
+def test_provision_empty_pip_list_accepted(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\n[provision]\npip = []\n"
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["provision"]["pip"] == []
+
+
+def test_provision_table_absent_pip_key_accepted(tmp_path: Path) -> None:
+    # [provision] present but with no `pip` key at all -- the table itself
+    # is legal (pip is optional within it).
+    content = BASE_CHARTER_TOML + "\n[provision]\n"
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["provision"] == {}
+
+
+def test_provision_not_a_table_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\nprovision = 1\n"
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_provision_pip_not_a_list_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\npip = "ruff"\n'
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_provision_pip_non_string_element_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\n[provision]\npip = [1, 2]\n"
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_provision_pip_empty_string_element_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\npip = ["ruff", ""]\n'
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_provision_unknown_key_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\npip = ["ruff"]\nbogus_key = 1\n'
     with pytest.raises(CharterError):
         load_charter(make_charter(tmp_path, content), env={})

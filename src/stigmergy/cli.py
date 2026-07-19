@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from stigmergy import approval, checks, egress, spend, triage
-from stigmergy.charter import Charter, CharterError
+from stigmergy.charter import Charter, CharterError, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
 from stigmergy.critic_client import make_critic_client, make_range_critic_client
@@ -264,7 +264,10 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         registry,
     )
 
-    checker_image = charter.raw["rig"]["image"]  # v0: same image for worker + checker
+    # bead .79: use the per-rig built image (base + provision deps) when
+    # present, else the charter base. resolve_rig computed this from rig meta.
+    # v0: one image for worker + checker.
+    checker_image = resolved.worker_image
     critic_cfg = charter.raw["roles"]["critic"]
     # bead .36: the critic client is now real (direct Anthropic Messages call,
     # SPEC §7) -- any client-side/provider failure surfaces as CriticInfraError,
@@ -293,6 +296,9 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         # charter (never an implicit charter reach-in from inside the weaver).
         filing_max_filings=dispatch_limits["filed_tickets"],
         filing_max_bytes=dispatch_limits["filed_ticket_bytes"],
+        # bead .91: staging-gate checks get the same charter-configured resource
+        # bounds as the daemon attempt gate (charter bound in the closure).
+        check_resources_fn=lambda name: resolve_check_resources(charter, name),
     )
 
     # bead .25: the real credential relay + egress wiring (the last v0 piece).
@@ -347,6 +353,7 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         rig_paths=rig_paths,
         capability_store=capability_store,
         checker_image=checker_image,
+        image=resolved.worker_image,
         weaver=weaver,
         container_reaper=PodmanContainerReaper(),
         steering_of=_make_steering_of(store, charter, rig_paths["prompts_dir"]),

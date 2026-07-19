@@ -52,7 +52,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,17 +63,26 @@ from stigmergy.container import ContainerProfile, build_run_argv, worker_env
 # at the end of a check's output, not the head.
 _OUTPUT_CAP_BYTES = 4096
 
-# Checker-container resource defaults (SPEC §5 charter has no per-check
-# resource knobs in v0 — [checks.<name>] carries only `cmd` — so these are
-# fixed, conservative bounds, not charter-configurable).
-_SCRATCH_SIZE = "64m"
-_PIDS_LIMIT = 64
-_MEMORY = "256m"
-_CPUS = "1"
-_TIMEOUT_SECONDS = 60
+
+@dataclass(frozen=True)
+class CheckResources:
+    """Checker-container resource bounds (bead .91: charter-configurable —
+    see :func:`stigmergy.charter.resolve_check_resources`). Field defaults
+    ARE the historical hardcoded bounds, so a caller that never passes
+    ``resources`` explicitly gets exactly the pre-.91 behavior."""
+
+    timeout_seconds: int = 60
+    memory: str = "256m"
+    cpus: str = "1"
+    scratch_size: str = "64m"
+    pids_limit: int = 64
+
+
+DEFAULT_CHECK_RESOURCES = CheckResources()
+
 # Backstop above the podman-level --timeout so a hung `podman run` itself
 # (not just the containerized command) cannot hang this process forever.
-_SUBPROCESS_TIMEOUT_SECONDS = _TIMEOUT_SECONDS + 30
+_SUBPROCESS_TIMEOUT_BACKSTOP_SECONDS = 30
 
 RunOne = Callable[..., tuple[int, str]]
 
@@ -117,7 +126,13 @@ def _truncate(text: str, cap: int = _OUTPUT_CAP_BYTES) -> str:
     return data[-cap:].decode("utf-8", errors="replace")
 
 
-def _default_run_one(command: str, work_tree: Path | str, *, image: str) -> tuple[int, str]:
+def _default_run_one(
+    command: str,
+    work_tree: Path | str,
+    *,
+    image: str,
+    resources: CheckResources = DEFAULT_CHECK_RESOURCES,
+) -> tuple[int, str]:
     """The real single-attempt executor: fresh copy of ``work_tree``, fresh
     no-network checker container, via :func:`build_run_argv`.
 
@@ -155,11 +170,11 @@ def _default_run_one(command: str, work_tree: Path | str, *, image: str) -> tupl
             image=image,
             work_clone=work_copy,
             task_pack=task_pack,
-            scratch_size=_SCRATCH_SIZE,
-            pids_limit=_PIDS_LIMIT,
-            memory=_MEMORY,
-            cpus=_CPUS,
-            timeout_seconds=_TIMEOUT_SECONDS,
+            scratch_size=resources.scratch_size,
+            pids_limit=resources.pids_limit,
+            memory=resources.memory,
+            cpus=resources.cpus,
+            timeout_seconds=resources.timeout_seconds,
             network="none",
         )
         argv = build_run_argv(
@@ -173,7 +188,7 @@ def _default_run_one(command: str, work_tree: Path | str, *, image: str) -> tupl
             env=worker_env(),
             capture_output=True,
             text=True,
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+            timeout=resources.timeout_seconds + _SUBPROCESS_TIMEOUT_BACKSTOP_SECONDS,
             check=False,
         )
         return result.returncode, (result.stdout + result.stderr)
@@ -188,6 +203,7 @@ def run_check(
     *,
     image: str,
     flake_reruns: int,
+    resources: CheckResources = DEFAULT_CHECK_RESOURCES,
     run_one: RunOne | None = None,
 ) -> CheckResult:
     """Run one named check to a final :class:`CheckResult`, applying the
@@ -197,7 +213,11 @@ def run_check(
     attempt keeps failing (exit code != 0) — stops the moment an attempt
     exits 0. ``run_one`` defaults to the real containerized single-attempt
     executor; tests inject a scripted stand-in so the flake protocol itself
-    is exercised deterministically, with no container involved.
+    is exercised deterministically, with no container involved. ``resources``
+    (bead .91, charter-configurable via :func:`stigmergy.charter.
+    resolve_check_resources`) is passed through to every attempt unchanged —
+    it defaults to :data:`DEFAULT_CHECK_RESOURCES` (the legacy hardcoded
+    bounds) so an unset caller behaves exactly as before .91.
 
     Outcome:
       - first attempt exits 0 -> `PASS`
@@ -219,7 +239,7 @@ def run_check(
 
     for attempt in range(flake_reruns + 1):
         try:
-            exit_code, output = executor(command, work_tree, image=image)
+            exit_code, output = executor(command, work_tree, image=image, resources=resources)
         except Exception as exc:  # noqa: BLE001 - any raise here is an ERROR, not a fail
             output_parts.append(f"[attempt {attempt + 1}] run_one raised: {exc!r}")
             return CheckResult(
@@ -258,6 +278,7 @@ def run_checks(
     *,
     image: str,
     flake_reruns: int,
+    resources: Mapping[str, CheckResources] | None = None,
 ) -> list[CheckResult]:
     """Run every named check in ``checks`` (name -> shell command),
     preserving iteration order, and return one :class:`CheckResult` per
@@ -265,9 +286,18 @@ def run_checks(
 
     Each check gets its own call to :func:`run_check` — its own fresh
     work-tree copy and fresh container(s), never shared with any other
-    check or with any other attempt.
+    check or with any other attempt. ``resources`` (bead .91) maps check
+    name -> :class:`CheckResources`; a check absent from the map (or the
+    map itself being ``None``) falls back to :data:`DEFAULT_CHECK_RESOURCES`.
     """
     return [
-        run_check(name, command, work_tree, image=image, flake_reruns=flake_reruns)
+        run_check(
+            name,
+            command,
+            work_tree,
+            image=image,
+            flake_reruns=flake_reruns,
+            resources=(resources or {}).get(name, DEFAULT_CHECK_RESOURCES),
+        )
         for name, command in checks.items()
     ]

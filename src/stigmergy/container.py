@@ -519,13 +519,26 @@ def _check_pinned_bases(containerfile_text: str) -> None:
 
     A `FROM <alias>` referencing an earlier build stage is exempt (it is
     not a fetched base image); every other `FROM` must carry `@sha256:`.
+
+    Bead .79: a FROM whose base is a BARE `sha256:<64hex>` (no `@`, no
+    registry) is ALSO accepted — this is the form a locally-built per-rig
+    base image takes (`charter [rig].image`, and `_resolve_image_digest`'s
+    own `.Id`-first return value), mirroring `_require_pinned`'s own
+    `_BARE_DIGEST_RE` acceptance for `ContainerProfile.image`. A mutable
+    tag (`name:tag`, no digest at all) is still rejected — this carve-out
+    is narrowly the bare content-digest form, not a general loosening.
     """
     known_aliases: set[str] = set()
     for base, alias in _parse_from_bases(containerfile_text):
-        if base not in known_aliases and not _DIGEST_RE.search(base):
+        if (
+            base not in known_aliases
+            and not _DIGEST_RE.search(base)
+            and not _BARE_DIGEST_RE.fullmatch(base)
+        ):
             raise ContainerError(
-                f"Containerfile FROM {base!r} is not digest-pinned (@sha256:...) — "
-                "supply-chain rule (SPEC §3 provision) rejects mutable tags"
+                f"Containerfile FROM {base!r} is not digest-pinned (@sha256:... or a "
+                "bare sha256:<64hex>) — supply-chain rule (SPEC §3 provision) rejects "
+                "mutable tags"
             )
         if alias:
             known_aliases.add(alias)

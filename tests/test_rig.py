@@ -14,12 +14,14 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from stigmergy import __version__
 from stigmergy.charter import Charter, CharterError, load_charter
+from stigmergy.checks import CheckOutcome, run_check
 from stigmergy.cli import main
 from stigmergy.daemon import _REQUIRED_RIG_PATH_KEYS
 from stigmergy.registry import Registry, UnbudgetableError
@@ -1016,3 +1018,200 @@ def test_create_rig_dispatch_base_idempotent_when_it_is_default_branch(tmp_path:
         check=False,
     )
     assert r.returncode == 0
+
+
+# ==========================================================================
+# bead .79 — per-rig worker image provisioning
+# ==========================================================================
+
+_PROVISION_CHARTER_TAIL = '\n[provision]\npip = ["ruff", "pytest"]\n'
+_FAKE_DIGEST = "sha256:" + "a" * 64  # the (faked) BUILT per-rig image digest
+_FAKE_BASE = "sha256:" + "b" * 64  # a pinned base [rig].image for unit tests
+_BASE_WORKER_IMAGE = "localhost/stigmergy-worker:latest"
+PODMAN = shutil.which("podman")
+
+
+def _base_worker_image_id() -> str | None:
+    if PODMAN is None:
+        return None
+    r = subprocess.run(
+        [PODMAN, "inspect", "--format", "{{.Id}}", _BASE_WORKER_IMAGE],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    val = r.stdout.strip()
+    if r.returncode != 0 or not val:
+        return None
+    return val if val.startswith("sha256:") else f"sha256:{val}"
+
+
+requires_base_worker_image = pytest.mark.skipif(
+    _base_worker_image_id() is None,
+    reason="requires podman + the built localhost/stigmergy-worker:latest base image",
+)
+
+
+def _charter_with_base(base_image: str, *, provision: bool) -> str:
+    """BASE_CHARTER_TOML with [rig].image swapped to ``base_image`` and,
+    optionally, a [provision] table appended."""
+    out = []
+    for ln in BASE_CHARTER_TOML.splitlines():
+        out.append(f'image = "{base_image}"' if ln.strip().startswith("image =") else ln)
+    text = "\n".join(out)
+    return text + _PROVISION_CHARTER_TAIL if provision else text
+
+
+def test_provision_wiring_faked_build(tmp_path, monkeypatch):
+    """create_rig with [provision] generates the per-rig Containerfile, calls
+    build_image, stores the digest in rig meta, and resolve_rig surfaces it as
+    worker_image — with the real (slow) podman build faked out."""
+    import stigmergy.rig as rig_mod
+
+    captured: dict = {}
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        d = Path(containerfile_dir)
+        captured["dir"] = d
+        captured["tag"] = tag
+        captured["containerfile"] = (d / "Containerfile").read_text()
+        return _FAKE_DIGEST
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_base(_FAKE_BASE, provision=True)
+    )
+    rig_root = create_rig(charter_path, base_dir=base_dir)
+
+    assert captured["dir"] == rig_root / "images" / "worker"
+    cf = captured["containerfile"]
+    assert cf.startswith(f"FROM {_FAKE_BASE}")  # FROM the charter's pinned base digest
+    assert "python3-pip" in cf  # pip bootstrapped onto the base
+    assert "pip3 install --break-system-packages" in cf
+    assert "ruff" in cf and "pytest" in cf  # the declared check tools
+    # anti-trap: the project package itself is NEVER baked (would shadow /work)
+    assert "install -e" not in cf
+
+    resolved = resolve_rig("shipyard", rigs_root=base_dir)
+    try:
+        assert resolved.worker_image == _FAKE_DIGEST
+    finally:
+        resolved.store.close()
+
+
+def test_no_provision_table_skips_build_and_falls_back_to_base(tmp_path, monkeypatch):
+    """No [provision] table -> no per-rig build, and resolve_rig.worker_image
+    falls back to the charter base [rig].image (the mechanical grep-smoke path
+    stays unchanged)."""
+    import stigmergy.rig as rig_mod
+
+    called = {"n": 0}
+
+    def fake_build_image(*a, **k):
+        called["n"] += 1
+        return _FAKE_DIGEST
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(tmp_path, repo)  # plain BASE, no [provision]
+    create_rig(charter_path, base_dir=base_dir)
+
+    assert called["n"] == 0
+    resolved = resolve_rig("shipyard", rigs_root=base_dir)
+    try:
+        assert resolved.worker_image == resolved.charter.raw["rig"]["image"]
+    finally:
+        resolved.store.close()
+
+
+def test_provision_containerfile_omits_pip_lines_when_no_specs(tmp_path, monkeypatch):
+    """[provision] present but pip empty -> FROM only, no apt/pip layers."""
+    import stigmergy.rig as rig_mod
+
+    captured: dict = {}
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        captured["cf"] = (Path(containerfile_dir) / "Containerfile").read_text()
+        return _FAKE_DIGEST
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    content = _charter_with_base(_FAKE_BASE, provision=False) + "\n[provision]\npip = []\n"
+    charter_path = make_charter(tmp_path, repo, content=content)
+    create_rig(charter_path, base_dir=base_dir)
+
+    cf = captured["cf"]
+    assert cf.strip().startswith(f"FROM {_FAKE_BASE}")
+    assert "pip3 install" not in cf and "python3-pip" not in cf
+
+
+@pytest.fixture(scope="module")
+def provisioned_worker_image(tmp_path_factory):
+    """Scaffold a rig whose base is the REAL built worker image + [provision]
+    pip=[ruff,pytest], triggering a real per-rig image build. Module-scoped —
+    the build is slow, so both live tests share the one image."""
+    base_id = _base_worker_image_id()
+    if base_id is None:
+        pytest.skip("base worker image not available")
+    tmp_path = tmp_path_factory.mktemp("prov79")
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_base(base_id, provision=True)
+    )
+    create_rig(charter_path, base_dir=base_dir)
+    resolved = resolve_rig("shipyard", rigs_root=base_dir)
+    try:
+        worker_image = resolved.worker_image
+    finally:
+        resolved.store.close()
+    assert worker_image.startswith("sha256:")
+    assert worker_image != base_id  # a NEW image was built, not the base echoed back
+    return worker_image
+
+
+@requires_base_worker_image
+def test_provision_image_has_check_tools_in_cage(provisioned_worker_image):
+    """The per-rig image can actually run ruff + pytest inside a --network=none
+    checker container (the .79 capability: real Tier-1 tools present in-cage)."""
+    with tempfile.TemporaryDirectory() as work:
+        (Path(work) / "f").write_text("x\n")
+        res = run_check(
+            "tools",
+            "ruff --version && python3 -m pytest --version",
+            work,
+            image=provisioned_worker_image,
+            flake_reruns=0,
+        )
+    assert res.outcome is CheckOutcome.PASS, res.output
+
+
+@requires_base_worker_image
+def test_anti_trap_checker_reads_work_candidate(provisioned_worker_image):
+    """FIDELITY: the checker reads the /work CANDIDATE, not a stale baked copy.
+    A passing synthetic test passes in-cage; mutating the /work file to break it
+    makes the SAME check FAIL — proving the candidate is what's under test."""
+    cmd = "cd /work && python3 -m pytest -q tests/test_synthetic.py"
+    with tempfile.TemporaryDirectory() as work:
+        tests_dir = Path(work) / "tests"
+        tests_dir.mkdir()
+        synthetic = tests_dir / "test_synthetic.py"
+
+        synthetic.write_text("def test_ok():\n    assert True\n")
+        passing = run_check(
+            "anti-trap", cmd, work, image=provisioned_worker_image, flake_reruns=0
+        )
+        assert passing.outcome is CheckOutcome.PASS, passing.output
+
+        synthetic.write_text("def test_ok():\n    assert False\n")
+        failing = run_check(
+            "anti-trap", cmd, work, image=provisioned_worker_image, flake_reruns=0
+        )
+        assert failing.outcome is CheckOutcome.FAIL, failing.output

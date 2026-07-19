@@ -42,12 +42,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from stigmergy.checks import DEFAULT_CHECK_RESOURCES, CheckResources
 from stigmergy.registry import Registry, UnbudgetableError, load_registry
 
 logger = logging.getLogger(__name__)
@@ -100,11 +102,16 @@ _KNOWN_TOP_LEVEL = {
     "models",
     "egress",
     "notify",
+    "provision",
 }
 
 _KNOWN_RIG_KEYS = {"name", "repo", "image"}
 _KNOWN_TIERS_KEYS = {"dispatch_base"}
-_KNOWN_CHECK_KEYS = {"cmd"}
+# bead .91: charter-configurable checker resource bounds. `_RESOURCE_KEYS`
+# names the CheckResources fields as they appear in TOML (both under
+# `[checks.<name>]`, alongside `cmd`, and under `[loop.check_resources]`).
+_RESOURCE_KEYS = {"timeout_seconds", "memory", "cpus", "scratch_size", "pids_limit"}
+_KNOWN_CHECK_KEYS = {"cmd"} | _RESOURCE_KEYS
 _KNOWN_GATES_KEYS = {"attempt", "staging"}
 _KNOWN_LOOP_KEYS = {
     "concurrency",
@@ -113,6 +120,7 @@ _KNOWN_LOOP_KEYS = {
     "retries",
     "cadences",
     "timers",
+    "check_resources",
 }
 _KNOWN_CONCURRENCY_KEYS = {"workers"}
 _KNOWN_BUDGETS_KEYS = {"dispatches", "usd", "gate_calls"}
@@ -134,6 +142,11 @@ _KNOWN_CRITIC_KEYS = {"model", "temperature"}
 _KNOWN_MODELS_KEYS = {"registry"}
 _KNOWN_EGRESS_GROUP_KEYS = {"hosts"}
 _KNOWN_NOTIFY_KEYS = {"ntfy_topic"}
+# bead .79: the per-rig worker-image provision table. `pip` is the only key
+# -- a list of package specs (may carry version pins) the provision station
+# installs into the per-rig worker image on top of the charter's pinned
+# base (SPEC §3 provision).
+_KNOWN_PROVISION_KEYS = {"pip"}
 
 _ENV_PREFIX = "SG_"
 
@@ -241,6 +254,52 @@ def classify_diff(prev_resolved: dict[str, Any], curr_resolved: dict[str, Any]) 
                 return "expanding"
 
     return "safe"
+
+
+def resolve_check_resources(charter: Charter, name: str) -> CheckResources:
+    """Resolve the effective :class:`~stigmergy.checks.CheckResources` for
+    check ``name`` (bead .91: charter-configurable checker resource
+    bounds).
+
+    Resolution order (lowest -> highest precedence):
+      1. :data:`~stigmergy.checks.DEFAULT_CHECK_RESOURCES` (the legacy
+         hardcoded 60s/256m/1cpu/64m/64pids bounds).
+      2. ``[loop.check_resources]`` — applies to EVERY check, including a
+         synthesized name absent from ``[checks.*]`` (e.g. the daemon's
+         `ticket-tests`).
+      3. ``[checks.<name>]`` resource keys — per-check override, only for
+         a named charter check; the `cmd` key is ignored here.
+
+    Only keys actually PRESENT at each layer are overlaid; an unset key
+    falls through to the next lower-precedence layer. Final values are
+    normalized to the :class:`CheckResources` field types (`cpus`/`memory`/
+    `scratch_size` as `str`, `timeout_seconds`/`pids_limit` as `int`).
+    """
+    merged: dict[str, Any] = {
+        "timeout_seconds": DEFAULT_CHECK_RESOURCES.timeout_seconds,
+        "memory": DEFAULT_CHECK_RESOURCES.memory,
+        "cpus": DEFAULT_CHECK_RESOURCES.cpus,
+        "scratch_size": DEFAULT_CHECK_RESOURCES.scratch_size,
+        "pids_limit": DEFAULT_CHECK_RESOURCES.pids_limit,
+    }
+
+    loop_overlay = charter.raw.get("loop", {}).get("check_resources", {})
+    for key in _RESOURCE_KEYS:
+        if key in loop_overlay:
+            merged[key] = loop_overlay[key]
+
+    check_overlay = charter.raw.get("checks", {}).get(name, {})
+    for key in _RESOURCE_KEYS:
+        if key in check_overlay:
+            merged[key] = check_overlay[key]
+
+    merged["timeout_seconds"] = int(merged["timeout_seconds"])
+    merged["pids_limit"] = int(merged["pids_limit"])
+    merged["cpus"] = str(merged["cpus"])
+    merged["memory"] = str(merged["memory"])
+    merged["scratch_size"] = str(merged["scratch_size"])
+
+    return CheckResources(**merged)
 
 
 # --- merge / env-override machinery ---------------------------------------
@@ -356,6 +415,7 @@ def _validate(merged: dict[str, Any], charter_dir: Path) -> list[str]:
     _validate_optional_keys(merged.get("models"), _KNOWN_MODELS_KEYS, "models")
     _validate_egress_keys(merged.get("egress"))
     _validate_optional_keys(merged.get("notify"), _KNOWN_NOTIFY_KEYS, "notify")
+    _validate_provision(merged.get("provision"))
 
     registry = _load_registry_for_charter(merged, charter_dir)
 
@@ -393,6 +453,76 @@ def _validate_checks(checks_cfg: Any) -> None:
         raise CharterError("[checks] must be a table")
     for name, entry in checks_cfg.items():
         _validate_keys(entry, _KNOWN_CHECK_KEYS, f"checks.{name}")
+        _validate_check_resources(entry, f"checks.{name}")
+
+
+def _validate_provision(provision_cfg: Any) -> None:
+    """Validate the optional `[provision]` table (bead .79). Absent entirely
+    is fine (a rig with no [provision] falls back to the base worker image
+    unchanged). If present, it must be a table, unknown keys are rejected,
+    and `pip` (if present) must be a list of non-empty strings -- package
+    specs, which may carry version pins (e.g. ``"ruff==0.15.22"``)."""
+    if provision_cfg is None:
+        return
+    _validate_keys(provision_cfg, _KNOWN_PROVISION_KEYS, "provision")
+    if "pip" in provision_cfg:
+        pip_cfg = provision_cfg["pip"]
+        if not isinstance(pip_cfg, list):
+            raise CharterError(f"provision.pip must be a list (got {pip_cfg!r})")
+        for spec in pip_cfg:
+            if not isinstance(spec, str) or not spec:
+                raise CharterError(
+                    f"provision.pip entries must be non-empty strings (got {spec!r})"
+                )
+
+
+_MEMORY_SIZE_RE = re.compile(r"^[0-9]+[bkmgBKMG]?$")
+
+
+def _validate_check_resources(cfg: dict[str, Any], ctx: str) -> None:
+    """Validate the VALUE of each resource key that is PRESENT in ``cfg``
+    (bead .91). Does NOT enforce the key set itself — the caller validates
+    the allowed keys (via :func:`_validate_keys`) before or after calling
+    this; this only rejects bad values for whichever resource keys showed
+    up. Non-resource keys (e.g. `cmd`) are ignored."""
+    if "timeout_seconds" in cfg:
+        _validate_positive_int(cfg, "timeout_seconds", f"{ctx}.timeout_seconds")
+    if "pids_limit" in cfg:
+        _validate_positive_int(cfg, "pids_limit", f"{ctx}.pids_limit")
+    if "cpus" in cfg:
+        _validate_positive_number_or_numeric_string(cfg["cpus"], f"{ctx}.cpus")
+    if "memory" in cfg:
+        _validate_size_string(cfg["memory"], f"{ctx}.memory")
+    if "scratch_size" in cfg:
+        _validate_size_string(cfg["scratch_size"], f"{ctx}.scratch_size")
+
+
+def _validate_positive_number_or_numeric_string(value: Any, ctx: str) -> None:
+    if isinstance(value, bool):
+        raise CharterError(f"{ctx} must be a positive number (got {value!r})")
+    if isinstance(value, int | float):
+        if value <= 0:
+            raise CharterError(f"{ctx} must be a positive number (got {value!r})")
+        return
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise CharterError(f"{ctx} must be a positive number (got {value!r})") from exc
+        if parsed <= 0:
+            raise CharterError(f"{ctx} must be a positive number (got {value!r})")
+        return
+    raise CharterError(f"{ctx} must be a positive number (got {value!r})")
+
+
+def _validate_size_string(value: Any, ctx: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, str) or not value:
+        raise CharterError(f"{ctx} must be a non-empty size string (got {value!r})")
+    if not _MEMORY_SIZE_RE.match(value):
+        raise CharterError(
+            f"{ctx} must match ^[0-9]+[bkmgBKMG]?$ (a positive integer optionally "
+            f"followed by one unit letter) (got {value!r})"
+        )
 
 
 def _validate_lanes_keys(lanes_cfg: Any) -> None:
@@ -451,6 +581,10 @@ def _validate_loop(loop_cfg: Any) -> None:
 
     timers = loop_cfg.get("timers", {})
     _validate_timers(timers)
+
+    check_resources = loop_cfg.get("check_resources", {})
+    _validate_keys(check_resources, _RESOURCE_KEYS, "loop.check_resources")
+    _validate_check_resources(check_resources, "loop.check_resources")
 
 
 def _validate_workers(concurrency_cfg: dict[str, Any]) -> None:

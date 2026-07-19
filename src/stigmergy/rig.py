@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -34,6 +35,7 @@ from typing import Any
 
 from stigmergy import __version__
 from stigmergy.charter import Charter, CharterError, load_charter
+from stigmergy.container import build_image
 from stigmergy.registry import Registry, load_registry
 
 # --- schema (SPEC.md §3 rig definition, §6 ticket work-order contract) -------
@@ -670,6 +672,15 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
     _clone_repo(repo, rig_root / "repo")
     _ensure_dispatch_base_branch(rig_root / "repo", charter.raw["tiers"]["dispatch_base"])
 
+    # bead .79: build the per-rig worker image (base + [provision] deps) so a
+    # real code ticket's ruff/pytest Tier-1 checks run in-cage. Only when the
+    # charter declares [provision] — rigs without it use the base image
+    # unchanged (the mechanical grep-smoke path). The built runnable digest
+    # lands in rig meta ("worker_image"); resolve_rig surfaces it to the
+    # daemon/checker.
+    if "provision" in charter.raw:
+        provision_rig_image(rig_root, charter)
+
 
 def _ensure_dispatch_base_branch(dest: Path, dispatch_base: str) -> None:
     """Create the charter's ``dispatch_base`` branch in the freshly-cloned rig
@@ -744,6 +755,59 @@ def _clone_repo(repo: str, dest: Path) -> None:
 # --- resolve: read-side inverse of create_rig -------------------------------
 
 
+def provision_rig_image(rig_root: Path, charter: Charter, *, store: RigStore | None = None) -> str:
+    """Build the per-rig worker image (bead .79) and record it in rig meta.
+
+    Extends the charter's pinned base worker image (`[rig].image`) with `pip`
+    plus the `[provision].pip` package specs (the check tools ruff/pytest and
+    any third-party project deps), so a real code ticket's Tier-1 checks run
+    in-cage instead of dying ``command not found``. Deps are baked at BUILD
+    time (provision has the `:registries` egress); the RUNTIME worker lane
+    stays inference-only.
+
+    Only tools/deps are baked — NEVER the project package itself. A
+    ``pip install -e .`` would make ``import <project>`` resolve to the stale
+    build-time copy, so the checker would validate the wrong code; the checker
+    must read the ``/work`` candidate at runtime (see ``tmp/bead79-design.md``).
+
+    Writes ``images/worker/Containerfile`` (overwriting the scaffold stub),
+    builds via :func:`stigmergy.container.build_image` (which rejects any
+    non-pinned FROM — the bare ``sha256:`` base is accepted, bead .79), stores
+    the resulting runnable digest under rig meta key ``worker_image``, and
+    returns it. Opens its own store if one is not supplied.
+    """
+    base_image = charter.raw["rig"]["image"]
+    pip_specs = charter.raw.get("provision", {}).get("pip", [])
+
+    images_dir = rig_root / "images" / "worker"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"FROM {base_image}"]
+    if pip_specs:
+        lines.append(
+            "RUN apt-get update "
+            "&& apt-get install -y --no-install-recommends python3-pip "
+            "&& rm -rf /var/lib/apt/lists/*"
+        )
+        lines.append(
+            "RUN pip3 install --break-system-packages --no-cache-dir "
+            + " ".join(shlex.quote(spec) for spec in pip_specs)
+        )
+    (images_dir / "Containerfile").write_text("\n".join(lines) + "\n")
+
+    tag = f"localhost/stigmergy-rig-{charter.raw['rig']['name']}:latest"
+    digest = build_image(images_dir, tag)
+
+    owns_store = store is None
+    if owns_store:
+        store = RigStore(rig_root / "tickets.db")
+    try:
+        store.set_meta("worker_image", digest)
+    finally:
+        if owns_store:
+            store.close()
+    return digest
+
+
 @dataclass(frozen=True)
 class ResolvedRig:
     """Everything needed to construct a real `Daemon` for an already-scaffolded rig.
@@ -760,6 +824,10 @@ class ResolvedRig:
     registry: Registry
     store: RigStore
     rig_paths: dict[str, Path]  # exactly daemon._REQUIRED_RIG_PATH_KEYS' 5 keys
+    # bead .79: the effective worker/checker image — the per-rig built image
+    # (rig meta "worker_image") if provision ran, else the charter's base
+    # `[rig].image`. The daemon uses THIS for both worker dispatch + checker.
+    worker_image: str
 
 
 def resolve_rig(name: str, *, rigs_root: str | os.PathLike[str] | None = None) -> ResolvedRig:
@@ -852,6 +920,11 @@ def resolve_rig(name: str, *, rigs_root: str | os.PathLike[str] | None = None) -
 
     store = RigStore(rig_root / "tickets.db")
 
+    # bead .79: prefer the per-rig built image (provision stored it in meta);
+    # fall back to the charter's base image for rigs scaffolded without
+    # [provision] (e.g. the mechanical grep smoke).
+    worker_image = store.get_meta("worker_image") or charter.raw["rig"]["image"]
+
     repo_root = rig_root / "repo"
     rig_paths: dict[str, Path] = {
         "context_root": rig_root / "context",
@@ -867,4 +940,5 @@ def resolve_rig(name: str, *, rigs_root: str | os.PathLike[str] | None = None) -
         registry=registry,
         store=store,
         rig_paths=rig_paths,
+        worker_image=worker_image,
     )

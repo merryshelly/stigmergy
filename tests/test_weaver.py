@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 
-from stigmergy.checks import CheckOutcome, CheckResult
+from stigmergy.checks import CheckOutcome, CheckResources, CheckResult
 from stigmergy.records import RecordPlane
 from stigmergy.rig import RigStore
 from stigmergy.statemachine import GATED, LANDED, PARKED, REJECTED, FailureClass
@@ -144,9 +144,19 @@ class FakeRunChecks:
         self._results = results
         self._by_tree = by_tree
         self.calls: list[Any] = []
+        self.resources_seen: Any = None
 
-    def __call__(self, checks: dict[str, str], work_tree: Path, *, image: str, flake_reruns: int):
+    def __call__(
+        self,
+        checks: dict[str, str],
+        work_tree: Path,
+        *,
+        image: str,
+        flake_reruns: int,
+        resources: Any = None,
+    ):
         self.calls.append(work_tree)
+        self.resources_seen = resources
         if self._by_tree is not None:
             return self._by_tree(work_tree)
         return list(self._results)
@@ -287,6 +297,7 @@ def make_weaver(
     journal_name: str = "weave-journal.jsonl",
     filing_max_filings: int = 5,
     filing_max_bytes: int = 16384,
+    check_resources_fn: Any = None,
 ) -> Weaver:
     return Weaver(
         store=store,
@@ -301,6 +312,7 @@ def make_weaver(
         ctx_of=stub_ctx_of,
         filing_max_filings=filing_max_filings,
         filing_max_bytes=filing_max_bytes,
+        check_resources_fn=check_resources_fn,
     )
 
 
@@ -373,6 +385,32 @@ def test_met_verdict_lands_on_staging(tmp_path, store, plane):
     dispositions = disposition_events(plane, "t1")
     assert len(dispositions) == 1
     assert dispositions[0]["disposition"] == "landed"
+
+
+def test_check_resources_fn_threads_per_check_bounds(tmp_path, store, plane):
+    """bead .91: with a resolver wired, the weaver's staging-gate full-suite
+    re-run passes a per-check CheckResources map to run_checks — so charter-
+    configured bounds apply at the staging gate, not just the daemon attempt
+    gate. A dropped `resources=` on the weaver's run_checks call surfaces here.
+    """
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t1", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t1", work_product=bundle)
+    run_checks = FakeRunChecks([green_result()])
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=run_checks,
+        critic=make_critic(outcome="met"),
+        check_resources_fn=lambda name: CheckResources(timeout_seconds=1234),
+    )
+    weaver.weave(now=1000.0)
+
+    assert run_checks.resources_seen is not None
+    assert all(isinstance(v, CheckResources) for v in run_checks.resources_seen.values())
+    assert all(v.timeout_seconds == 1234 for v in run_checks.resources_seen.values())
 
 
 def test_unmet_verdict_never_lands(tmp_path, store, plane):

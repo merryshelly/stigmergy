@@ -32,6 +32,7 @@ from stigmergy.container import (
     ContainerError,
     ContainerProfile,
     PodmanContainerReaper,
+    _check_pinned_bases,
     build_image,
     build_run_argv,
     worker_env,
@@ -327,6 +328,53 @@ def test_build_image_rejects_unpinned_base(tmp_path):
     (cf_dir / "Containerfile").write_text("FROM python:3.12-alpine\nRUN true\n")
     with pytest.raises(ContainerError):
         build_image(cf_dir, "localhost/stigmergy-worker:test")
+
+
+# --------------------------------------------------------------------------
+# Bead .79: _check_pinned_bases accepts a bare `sha256:<64hex>` FROM (a
+# locally-built per-rig base image, the form charter [rig].image uses) —
+# consistent with _require_pinned's own _BARE_DIGEST_RE acceptance. A FROM
+# carrying @sha256:<64hex> stays accepted; a build-stage alias stays exempt.
+# It must still REJECT a mutable tag (prove-can-fail).
+# --------------------------------------------------------------------------
+
+
+def test_check_pinned_bases_accepts_bare_sha256_from():
+    # A bare `sha256:<64hex>` FROM (no `@`, no registry) — the exact form
+    # `provision_rig_image`'s generated Containerfile emits for a per-rig
+    # base built by an earlier provision step.
+    text = f"FROM sha256:{'a' * 64}\nRUN true\n"
+    _check_pinned_bases(text)  # must not raise
+
+
+def test_check_pinned_bases_accepts_at_sha256_from():
+    # The registry-digest form (`name@sha256:<64hex>`) must remain accepted.
+    text = f"FROM docker.io/library/node@sha256:{'a' * 64}\nRUN true\n"
+    _check_pinned_bases(text)  # must not raise
+
+
+def test_check_pinned_bases_exempts_build_stage_alias():
+    # A later FROM referencing an earlier stage's alias is exempt (not a
+    # fetched base image) — must still not raise.
+    text = f"FROM sha256:{'a' * 64} AS build\nRUN true\nFROM build\nRUN true\n"
+    _check_pinned_bases(text)  # must not raise
+
+
+def test_check_pinned_bases_still_rejects_mutable_tag():
+    # Prove-can-fail: a mutable tag (no digest at all) must STILL be
+    # rejected — the bare-digest carve-out must not have been widened to
+    # accept arbitrary refs.
+    text = "FROM docker.io/library/node:22-bookworm-slim\nRUN true\n"
+    with pytest.raises(ContainerError):
+        _check_pinned_bases(text)
+
+
+def test_check_pinned_bases_still_rejects_short_mutable_tag():
+    # A second, differently-shaped mutable tag — belt and suspenders against
+    # a fix that only special-cases the exact string used above.
+    text = "FROM node:22\nRUN true\n"
+    with pytest.raises(ContainerError):
+        _check_pinned_bases(text)
 
 
 def test_build_image_rejects_multistage_unpinned_base(tmp_path):

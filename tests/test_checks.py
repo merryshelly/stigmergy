@@ -20,7 +20,9 @@ import subprocess
 import pytest
 
 from stigmergy.checks import (
+    DEFAULT_CHECK_RESOURCES,
     CheckOutcome,
+    CheckResources,
     CheckResult,
     run_check,
     run_checks,
@@ -73,9 +75,11 @@ class ScriptedRunOne:
         self.codes = list(codes)
         self.output = output
         self.calls: list[tuple[str, object, str]] = []
+        self.resources_seen: list[object] = []
 
-    def __call__(self, command, work_tree, *, image):
+    def __call__(self, command, work_tree, *, image, resources=None):
         self.calls.append((command, work_tree, image))
+        self.resources_seen.append(resources)
         idx = len(self.calls) - 1
         code = self.codes[idx] if idx < len(self.codes) else self.codes[-1]
         return code, self.output
@@ -163,8 +167,8 @@ def test_run_checks_returns_one_result_per_check_preserving_names(tmp_path, monk
     }
     runners = {cmd: ScriptedRunOne(codes) for cmd, codes in codes_by_command.items()}
 
-    def fake_default_run_one(command, work_tree, *, image):
-        return runners[command](command, work_tree, image=image)
+    def fake_default_run_one(command, work_tree, *, image, resources=None):
+        return runners[command](command, work_tree, image=image, resources=resources)
 
     monkeypatch.setattr(checks_module, "_default_run_one", fake_default_run_one)
 
@@ -413,3 +417,146 @@ def test_live_check_real_fail_not_infra_against_gatekeeper(tmp_path, gatekeeper_
     )
     assert result.outcome is CheckOutcome.FAIL
     assert result.runs == (1,)
+
+
+# --------------------------------------------------------------------------
+# .91: charter-configurable checker resource bounds
+# --------------------------------------------------------------------------
+# `resources: CheckResources` threads through run_checks -> run_check ->
+# _default_run_one -> ContainerProfile -> build_run_argv/podman. When unset
+# it is DEFAULT_CHECK_RESOURCES (the legacy 60s/256m/1cpu/64m/64pids), so a
+# resource-free caller behaves exactly as pre-.91.
+
+
+def test_default_check_resources_pin_legacy_values():
+    # Backward-compat pin: the historical hardcoded bounds are the defaults.
+    assert DEFAULT_CHECK_RESOURCES.timeout_seconds == 60
+    assert DEFAULT_CHECK_RESOURCES.memory == "256m"
+    assert DEFAULT_CHECK_RESOURCES.cpus == "1"
+    assert DEFAULT_CHECK_RESOURCES.scratch_size == "64m"
+    assert DEFAULT_CHECK_RESOURCES.pids_limit == 64
+
+
+def test_run_check_passes_resources_to_executor(tmp_path):
+    runner = ScriptedRunOne([0])
+    res = CheckResources(
+        timeout_seconds=1800, memory="4g", cpus="4", scratch_size="2g", pids_limit=512
+    )
+    run_check(
+        "pytest",
+        "pytest -x -q",
+        tmp_path,
+        image="unused",
+        flake_reruns=0,
+        resources=res,
+        run_one=runner,
+    )
+    assert runner.resources_seen == [res]
+
+
+def test_run_check_defaults_resources_when_unset(tmp_path):
+    runner = ScriptedRunOne([0])
+    run_check("lint", "ruff check .", tmp_path, image="unused", flake_reruns=0, run_one=runner)
+    assert runner.resources_seen == [DEFAULT_CHECK_RESOURCES]
+
+
+def test_run_checks_maps_per_check_resources(tmp_path, monkeypatch):
+    import stigmergy.checks as checks_module
+
+    seen = {}
+
+    def fake_default_run_one(command, work_tree, *, image, resources=None):
+        seen[command] = resources
+        return 0, ""
+
+    monkeypatch.setattr(checks_module, "_default_run_one", fake_default_run_one)
+    big = CheckResources(
+        timeout_seconds=1800, memory="4g", cpus="4", scratch_size="2g", pids_limit=512
+    )
+    run_checks(
+        {"pytest": "pytest-cmd", "lint": "lint-cmd"},
+        tmp_path,
+        image="unused",
+        flake_reruns=0,
+        resources={"pytest": big},
+    )
+    assert seen["pytest-cmd"] == big
+    # a check absent from the resources map falls back to the default.
+    assert seen["lint-cmd"] == DEFAULT_CHECK_RESOURCES
+
+
+def test_run_checks_defaults_all_when_no_resources_map(tmp_path, monkeypatch):
+    import stigmergy.checks as checks_module
+
+    seen = {}
+
+    def fake_default_run_one(command, work_tree, *, image, resources=None):
+        seen[command] = resources
+        return 0, ""
+
+    monkeypatch.setattr(checks_module, "_default_run_one", fake_default_run_one)
+    run_checks({"a": "cmd-a", "b": "cmd-b"}, tmp_path, image="unused", flake_reruns=0)
+    assert seen["cmd-a"] == DEFAULT_CHECK_RESOURCES
+    assert seen["cmd-b"] == DEFAULT_CHECK_RESOURCES
+
+
+def test_default_run_one_builds_profile_from_resources(tmp_path, monkeypatch):
+    # The resolved bounds must reach the ContainerProfile (hence podman), and
+    # the subprocess backstop must derive from the configured timeout — while
+    # the network="none" checker invariant is preserved.
+    import stigmergy.checks as checks_module
+
+    captured = {}
+
+    def fake_build_run_argv(profile, *, command, entrypoint_override=None, env=None):
+        captured["profile"] = profile
+        return ["true"]
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["subprocess_timeout"] = kwargs.get("timeout")
+        return _Result()
+
+    monkeypatch.setattr(checks_module, "build_run_argv", fake_build_run_argv)
+    monkeypatch.setattr(checks_module.subprocess, "run", fake_run)
+
+    work = tmp_path / "src"
+    work.mkdir()
+    (work / "f").write_text("x")
+    res = CheckResources(
+        timeout_seconds=1800, memory="4g", cpus="4", scratch_size="2g", pids_limit=512
+    )
+    checks_module._default_run_one("grep x f", work, image="img", resources=res)
+
+    p = captured["profile"]
+    assert p.timeout_seconds == 1800
+    assert p.memory == "4g"
+    assert p.cpus == "4"
+    assert p.scratch_size == "2g"
+    assert p.pids_limit == 512
+    assert p.network == "none"  # safety invariant preserved regardless of bounds
+    assert captured["subprocess_timeout"] == 1800 + 30
+
+
+@requires_podman
+def test_live_check_honors_configured_timeout(tmp_path, pinned_live_image):
+    # Fidelity: the configured timeout actually reaches podman --timeout. A 2s
+    # bound must kill a 30s sleep long before it completes.
+    work = tmp_path / "src"
+    work.mkdir()
+    (work / "f").write_text("x")
+    res = CheckResources(timeout_seconds=2)
+    result = run_check(
+        "slow",
+        "sleep 30",
+        work,
+        image=pinned_live_image,
+        flake_reruns=0,
+        resources=res,
+    )
+    assert result.outcome in (CheckOutcome.FAIL, CheckOutcome.ERROR)
+    assert result.wall_time_seconds < 25

@@ -230,6 +230,7 @@ class Weaver:
         filing_max_filings: int,
         filing_max_bytes: int,
         ctx_of: Any = None,
+        check_resources_fn: Any = None,
     ) -> None:
         self.store = store
         self.record_plane = record_plane
@@ -244,6 +245,11 @@ class Weaver:
         self.filing_max_filings = filing_max_filings
         self.filing_max_bytes = filing_max_bytes
         self.ctx_of = ctx_of
+        # bead .91: bound `charter.resolve_check_resources(charter, name)` so the
+        # staging-gate full-suite re-run gets the same charter-configured
+        # resource bounds as the daemon attempt gate. None -> all checks use
+        # DEFAULT_CHECK_RESOURCES (keeps injected-double tests unchanged).
+        self.check_resources_fn = check_resources_fn
 
     # -- WeaveJournalResolver protocol (recover.py) ------------------------
 
@@ -393,11 +399,17 @@ class Weaver:
             flagged = bool(touched) or stripped
 
             checks = self._all_checks(ticket_row)
+            resources_map = (
+                {name: self.check_resources_fn(name) for name in checks}
+                if self.check_resources_fn is not None
+                else None
+            )
             check_results = self.run_checks_fn(
                 checks,
                 candidate_dir,
                 image=self.checker_image,
                 flake_reruns=self.flake_reruns,
+                resources=resources_map,
             )
             if any(r.outcome != CheckOutcome.PASS for r in check_results):
                 return self._die(

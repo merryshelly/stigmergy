@@ -160,7 +160,7 @@ from stigmergy import checks, egress
 from stigmergy import intake as intake_module
 from stigmergy import recover as recover_module
 from stigmergy import triggers as triggers_module
-from stigmergy.charter import Charter
+from stigmergy.charter import Charter, resolve_check_resources
 from stigmergy.checks import CheckOutcome, CheckResult
 from stigmergy.dispatch import DispatchPlan, prepare_dispatch, select_lane
 from stigmergy.drivers import claude_code
@@ -304,6 +304,7 @@ class Daemon:
         disk_path: str | Path | None = None,
         owner: str = "daemon",
         relay_base_url: str = "http://127.0.0.1:0/stigmergy-relay-placeholder",
+        image: str | None = None,
     ) -> None:
         missing = [k for k in _REQUIRED_RIG_PATH_KEYS if k not in rig_paths]
         if missing:
@@ -342,7 +343,10 @@ class Daemon:
         self._owner = owner
         self._relay_base_url = relay_base_url
 
-        self._image = charter.raw["rig"]["image"]
+        # bead .79: the effective worker image — the per-rig built image
+        # (base + provision deps) when the caller resolved one, else the
+        # charter's base `[rig].image` (backward-compatible default).
+        self._image = image if image is not None else charter.raw["rig"]["image"]
         self._rig_name = charter.raw.get("rig", {}).get("name")
         self._lease_ttl_seconds = charter.raw["loop"]["timers"]["lease_ttl_seconds"]
         self._poll_seconds = charter.raw["loop"]["timers"]["poll_seconds"]
@@ -797,11 +801,18 @@ class Daemon:
             check_dict["ticket-tests"] = f"pytest -x -q {shlex.join(tier1_checks)}"
 
         flake_reruns = charter.raw["loop"]["retries"]["flake_reruns"]
+        # bead .91: per-check charter-configurable resource bounds. The
+        # synthesized "ticket-tests" name has no [checks.<name>] entry, so
+        # it resolves to DEFAULT_CHECK_RESOURCES + [loop.check_resources]
+        # overlay only — intentional, since a real pytest run needs more
+        # than the checker's conservative 60s/256m/1cpu defaults.
+        resources_map = {name: resolve_check_resources(charter, name) for name in check_dict}
         check_results = self._run_checks_fn(
             check_dict,
             work_tree=plan.work_clone,
             image=self._checker_image,
             flake_reruns=flake_reruns,
+            resources=resources_map,
         )
 
         for cr in check_results:

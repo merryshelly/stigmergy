@@ -26,7 +26,7 @@ import pytest
 
 from stigmergy.approval import approve
 from stigmergy.charter import load_charter
-from stigmergy.checks import CheckOutcome, CheckResult
+from stigmergy.checks import CheckOutcome, CheckResources, CheckResult
 from stigmergy.daemon import (
     _BACKOFF_CAP_SECONDS,
     _CIRCUIT_BREAKER_THRESHOLD,
@@ -270,9 +270,11 @@ class ScriptedChecks:
     def __init__(self, results: list[CheckResult]):
         self._results = results
         self.calls: list[Any] = []
+        self.resources_seen: Any = None
 
-    def __call__(self, checks_dict, work_tree, *, image, flake_reruns):
+    def __call__(self, checks_dict, work_tree, *, image, flake_reruns, resources=None):
         self.calls.append((dict(checks_dict), work_tree))
+        self.resources_seen = resources
         return list(self._results)
 
 
@@ -663,6 +665,15 @@ def test_case1_happy_path_approved_ticket_ends_parked_with_full_event_trail(env:
     assert len(env.capability_store.minted) == 1
     cap = env.capability_store.minted[0]
     assert env.capability_store.is_live(cap.token) is False
+
+    # bead .91: the daemon passes a per-check resource map to run_checks — one
+    # CheckResources per check it actually ran. A dropped `resources=` on the
+    # daemon's run_checks call (contract-consumer regression) surfaces here.
+    assert run_checks_fn.resources_seen is not None
+    assert set(run_checks_fn.resources_seen) == set(run_checks_fn.calls[0][0])
+    assert all(
+        isinstance(v, CheckResources) for v in run_checks_fn.resources_seen.values()
+    )
 
 
 # ==========================================================================
