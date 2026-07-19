@@ -22,6 +22,7 @@ import stigmergy.cli as cli
 from stigmergy.cli import (
     _DEFAULT_PROTECTED_PATHS,
     _build_daemon,
+    _critic_decoding_params,
     _make_steering_of,
     main,
 )
@@ -292,6 +293,25 @@ def test_make_steering_of_matches_derive_steering(tmp_path: Path) -> None:
         assert via_closure == direct
     finally:
         resolved.store.close()
+
+
+# --- bead .81: critic decoding params omit temperature for deprecating models ---
+
+
+def test_critic_decoding_params_forwards_temperature_when_declared() -> None:
+    assert _critic_decoding_params({"model": "opus", "temperature": 0.0}) == {
+        "temperature": 0.0
+    }
+
+
+def test_critic_decoding_params_omits_temperature_when_absent() -> None:
+    assert _critic_decoding_params({"model": "opus"}) == {}
+
+
+def test_critic_decoding_params_forwards_nonzero_temperature() -> None:
+    assert _critic_decoding_params({"model": "opus", "temperature": 0.7}) == {
+        "temperature": 0.7
+    }
 
 
 # --- case 18: any raising critic client surfaces as CriticInfraError ---------
