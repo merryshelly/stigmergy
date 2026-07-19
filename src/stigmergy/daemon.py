@@ -755,7 +755,7 @@ class Daemon:
             return False
 
         # DONE -> Tier-1 checks (§1.2) decide the outcome.
-        self._run_tier1_checks(ticket_id, plan, ctx, now=now)
+        self._run_tier1_checks(ticket_id, plan, ctx, bundle_ref=result.bundle_ref, now=now)
         return False
 
     def _dispatch_failure(
@@ -767,7 +767,13 @@ class Daemon:
     # -- Tier-1 checks (§1.2) ---------------------------------------------------
 
     def _run_tier1_checks(
-        self, ticket_id: str, plan: DispatchPlan, ctx: dict[str, Any], *, now: float
+        self,
+        ticket_id: str,
+        plan: DispatchPlan,
+        ctx: dict[str, Any],
+        *,
+        bundle_ref: str | None,
+        now: float,
     ) -> None:
         """Run Tier-1 checks directly against the dispatch's own
         `work_clone` (bead .22 build spec §1.2) and decide TIER1_GREEN vs
@@ -816,6 +822,12 @@ class Daemon:
         all_green = all(cr.outcome in _GREEN_CHECK_OUTCOMES for cr in check_results)
 
         if all_green:
+            # bead .94: persist the worker's git bundle (created by the driver,
+            # DispatchResult.bundle_ref) as the ticket's work_product BEFORE
+            # parking — the weaver applies it at the staging gate. Without this
+            # the ticket parks with work_product=None and the weave fails
+            # integration-conflict (weaver._apply_bundle has nothing to apply).
+            self._store.update_ticket(ticket_id, work_product=bundle_ref)
             transition(self._store, ticket_id, TIER1_GREEN, expected_from=IN_FLIGHT)
             transition(self._store, ticket_id, PARKED, expected_from=TIER1_GREEN)
             record_disposition(

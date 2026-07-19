@@ -635,7 +635,7 @@ def test_case1_happy_path_approved_ticket_ends_parked_with_full_event_trail(env:
     DISPOSITION event; capability_store shows the capability was minted
     then revoked exactly once."""
     add_dispatchable_ticket(env, "t-1")
-    spawn_fn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    spawn_fn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/t-1-work.bundle")])
     run_checks_fn = ScriptedChecks([pass_result("lint"), pass_result("pytest")])
     daemon = make_daemon(env, spawn_fn=spawn_fn, run_checks_fn=run_checks_fn)
 
@@ -644,6 +644,9 @@ def test_case1_happy_path_approved_ticket_ends_parked_with_full_event_trail(env:
     assert summary.dispatched_ticket == "t-1"
     assert summary.dispatch_status == "done"
     assert env.store.get_ticket("t-1")["state"] == PARKED
+    # bead .94: the driver's bundle must be persisted as work_product so the
+    # weaver has something to apply (else the weave fails integration-conflict).
+    assert env.store.get_ticket("t-1")["work_product"] == "/tmp/t-1-work.bundle"
 
     events = env.record_plane.read_events()
     types_in_order = [e["event_type"] for e in events]
