@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from stigmergy.container import dispatch_socket_path
 from stigmergy.egress_proxy import (
     DEFAULT_ALLOWED_PORTS,
     EgressPolicy,
@@ -196,8 +197,10 @@ def setup_dispatch_egress(
 ) -> EgressHandle:
     """Start the egress proxy for one dispatch and return its handle.
 
-    Creates ``<runtime_dir>/egress-<dispatch_id>.sock`` (the mount target
-    for ``container.build_run_argv(..., egress_socket=...)``) and
+    Creates ``<runtime_dir>/egress-<hash>.sock`` (the mount target for
+    ``container.build_run_argv(..., egress_socket=...)``; the filename is a
+    fixed-length hash of ``dispatch_id`` to stay under the AF_UNIX path
+    limit — see :func:`stigmergy.container.dispatch_socket_path`) and
     ``<runtime_dir>/egress-<dispatch_id>.jsonl`` (the per-attempt log),
     starts :func:`stigmergy.egress_proxy.serve` on a dedicated background
     event loop thread, and blocks until it is actually listening (or raises
@@ -206,7 +209,10 @@ def setup_dispatch_egress(
     """
     runtime_dir = Path(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = runtime_dir / f"egress-{dispatch_id}.sock"
+    # Fixed-length socket filename: the full dispatch_id can overflow the
+    # AF_UNIX path limit (see container.dispatch_socket_path). The .jsonl log
+    # keeps the readable id (no length limit) for operator correlation.
+    socket_path = dispatch_socket_path(runtime_dir, "egress", dispatch_id)
     log_path = runtime_dir / f"egress-{dispatch_id}.jsonl"
 
     ready = threading.Event()

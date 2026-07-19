@@ -100,6 +100,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from stigmergy.container import dispatch_socket_path
 from stigmergy.critic_client import _NoRedirectHandler
 from stigmergy.relay import (
     CapabilityDenied,
@@ -1478,8 +1479,9 @@ def start_relay(
     ``socket_path_or_runtime_dir``: if it ends in ``.sock`` it is used as
     the exact socket path (its parent directory is created/chmod'd); any
     other path is treated as a per-dispatch runtime directory, created
-    ``0o700`` (bead31 amendment §B), under which
-    ``relay-<dispatch_id>.sock`` is created.
+    ``0o700`` (bead31 amendment §B), under which ``relay-<hash>.sock`` is
+    created (a fixed-length hash of ``dispatch_id`` to stay under the AF_UNIX
+    path limit — see :func:`stigmergy.container.dispatch_socket_path`).
 
     ``max_in_flight``/``stream_deadline`` (bead .56, F5) are passed straight
     through to :func:`serve_relay` — exposed here so ``.25``/``.32``
@@ -1499,7 +1501,10 @@ def start_relay(
         runtime_dir = given.parent
     else:
         runtime_dir = given
-        socket_path = runtime_dir / f"relay-{dispatch_id}.sock"
+        # Fixed-length socket filename to stay under the AF_UNIX path limit
+        # (see container.dispatch_socket_path); the full dispatch_id can
+        # overflow it for realistic rig/ticket names.
+        socket_path = dispatch_socket_path(runtime_dir, "relay", dispatch_id)
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
     # F8 (bead .56, LOW, doc-only): this chmod is the LOAD-BEARING half of

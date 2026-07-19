@@ -28,6 +28,7 @@ import uuid
 import pytest
 
 from stigmergy.container import (
+    _AF_UNIX_MAX_PATH,
     DISPATCH_ID_LABEL_KEY,
     ContainerError,
     ContainerProfile,
@@ -35,6 +36,7 @@ from stigmergy.container import (
     _check_pinned_bases,
     build_image,
     build_run_argv,
+    dispatch_socket_path,
     worker_env,
 )
 
@@ -921,3 +923,56 @@ def test_live_reap_second_call_on_already_removed_id_is_noop(tmp_path, pinned_li
         assert dispatch_id not in reaper.list_running()
     finally:
         reaper.reap(dispatch_id)
+
+
+# ==========================================================================
+# dispatch_socket_path — AF_UNIX path-length safety (regression: the first
+# code dogfood crashed with `OSError: AF_UNIX path too long` because the
+# egress socket path embedded the full dispatch_id under a rig-local runtime
+# dir and overflowed 108 bytes at 110). These are the fixed pass bar.
+# ==========================================================================
+
+# The exact site the live dogfood overflowed on: a serial run's egress
+# runtime dir under a realistically-named rig.
+_REAL_RUNTIME_DIR = "/home/oa-merry/rigs/concurrency01/clones/_egress_runtime"
+_REAL_DISPATCH_ID = "egress-concurrency-92-part1-1784476863032"
+
+
+def test_dispatch_socket_path_stays_under_af_unix_limit_for_real_dogfood_case():
+    # Prove-can-fail regression: this is the exact (runtime_dir, dispatch_id)
+    # that produced a 110-byte path and crashed the daemon. Embedding the full
+    # id again (the pre-fix behavior) reproduces the overflow and fails here.
+    path = dispatch_socket_path(_REAL_RUNTIME_DIR, "egress", _REAL_DISPATCH_ID)
+    assert len(str(path).encode("utf-8")) < _AF_UNIX_MAX_PATH
+    assert str(path).startswith(_REAL_RUNTIME_DIR + "/egress-")
+    assert str(path).endswith(".sock")
+
+
+def test_dispatch_socket_path_filename_is_fixed_length_regardless_of_id():
+    short = dispatch_socket_path("/run", "egress", "x")
+    long = dispatch_socket_path("/run", "egress", "egress-" + "z" * 500 + "-1784476863032")
+    # The dispatch_id grows by ~500 chars; the socket FILENAME does not.
+    assert len(short.name) == len(long.name)
+    assert short.name != long.name  # still distinct per dispatch
+
+
+def test_dispatch_socket_path_is_deterministic_per_dispatch_id():
+    a = dispatch_socket_path("/run/a", "relay", "relay-t-1")
+    b = dispatch_socket_path("/run/b", "relay", "relay-t-1")
+    # Same id -> same filename (an operator can recompute the mapping from the
+    # readable .jsonl sibling); different dir is the only difference.
+    assert a.name == b.name
+    assert a.parent != b.parent
+
+
+def test_dispatch_socket_path_honors_prefix():
+    assert dispatch_socket_path("/run", "egress", "d").name.startswith("egress-")
+    assert dispatch_socket_path("/run", "relay", "d").name.startswith("relay-")
+
+
+def test_dispatch_socket_path_fails_closed_when_runtime_dir_pathologically_long():
+    # A runtime dir so long that even a fixed-length filename overflows: fail
+    # closed with a legible ContainerError, not the kernel's opaque OSError.
+    huge_dir = "/" + "a" * 120
+    with pytest.raises(ContainerError, match="AF_UNIX"):
+        dispatch_socket_path(huge_dir, "egress", "d")

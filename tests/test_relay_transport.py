@@ -898,6 +898,29 @@ class TestRelayLifecycle:
         finally:
             handle.stop()
 
+    def test_start_relay_uses_bounded_socket_filename(self, tmp_path):
+        # Regression (first code dogfood): given a runtime_dir (not an explicit
+        # .sock), the relay socket filename must be a FIXED-LENGTH hash of the
+        # dispatch_id, not the id itself. Embedding a realistic id (rig+ticket+
+        # ms) overflowed the AF_UNIX ~108-byte limit — the same root cause that
+        # crashed the egress proxy on the first real dogfood dispatch.
+        store = CapabilityStore()
+        kp = CountingKeyProvider()
+        relay = _relay(store, kp)
+        fwd = FakeForwarder()
+        runtime_dir = tmp_path / "rt"
+        long_id = "relay-concurrency-92-part1-1784476863032"
+        handle = start_relay(
+            long_id, runtime_dir, relay, forwarder=fwd, log_path=runtime_dir / "relay.jsonl"
+        )
+        try:
+            assert handle.socket_path.exists()
+            assert long_id not in handle.socket_path.name  # hashed, not embedded
+            assert handle.socket_path.name.startswith("relay-")
+            assert handle.socket_path.name.endswith(".sock")
+        finally:
+            handle.stop()
+
 
 # =========================================================================== #
 # Concurrency quota-leash — max_calls must hold against a compromised worker    #

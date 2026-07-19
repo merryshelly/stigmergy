@@ -49,6 +49,7 @@ A `:tag` reference is rejected — tags are mutable, digests are not.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -77,6 +78,45 @@ class ContainerError(Exception):
     """Raised on any worker-containment or supply-chain violation: an
     unpinned image reference, an unpinned Containerfile `FROM`, or a
     `podman` invocation that fails."""
+
+
+# The Linux kernel caps an AF_UNIX address (`sun_path`) at 108 bytes,
+# including the NUL terminator (so 107 usable). A per-dispatch egress/relay
+# proxy socket lives under a rig-local runtime dir whose absolute path already
+# consumes much of that budget; binding one whose path exceeds the cap fails
+# with a cryptic `OSError: AF_UNIX path too long`.
+_AF_UNIX_MAX_PATH = 108
+
+
+def dispatch_socket_path(runtime_dir: str | Path, prefix: str, dispatch_id: str) -> Path:
+    """Build a per-dispatch AF_UNIX socket path with a FIXED-LENGTH filename.
+
+    Embedding the full ``dispatch_id`` in the socket filename (e.g.
+    ``egress-egress-<rig>-<ticket>-<ms>.sock``) can push the absolute path
+    past the kernel's ~108-byte ``AF_UNIX`` limit for realistic rig/ticket
+    names — a real bug the first code dogfood surfaced (a serial run under
+    ``~/rigs/concurrency01/clones/_egress_runtime/`` overflowed at 110 bytes).
+    Derive the filename from a truncated SHA-256 of the ``dispatch_id``
+    instead: fixed length regardless of how long the id is, collision-safe for
+    a rig's ephemeral per-dispatch sockets (the id carries a ms timestamp, so
+    even same-ticket retries differ), and deterministic — so the full readable
+    id can still name the sibling ``.jsonl`` log (which has no length limit)
+    and an operator can recompute the mapping.
+
+    Fails closed with a legible :class:`ContainerError` if the resulting path
+    still would not fit (e.g. a pathologically long ``runtime_dir``), rather
+    than deferring to the kernel's opaque ``AF_UNIX path too long``.
+    """
+    digest = hashlib.sha256(dispatch_id.encode("utf-8")).hexdigest()[:16]
+    socket_path = Path(runtime_dir) / f"{prefix}-{digest}.sock"
+    encoded_len = len(str(socket_path).encode("utf-8"))
+    if encoded_len >= _AF_UNIX_MAX_PATH:
+        raise ContainerError(
+            f"AF_UNIX socket path is {encoded_len} bytes, at/over the "
+            f"{_AF_UNIX_MAX_PATH}-byte limit: {socket_path!r} — shorten the rig "
+            f"name or the rig's runtime directory"
+        )
+    return socket_path
 
 
 @dataclass(frozen=True)

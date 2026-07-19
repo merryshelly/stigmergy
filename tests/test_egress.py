@@ -723,6 +723,32 @@ def test_setup_dispatch_egress_starts_serving_and_teardown_stops_it(tmp_path):
     asyncio.run(_probe_after_stop())
 
 
+def test_setup_dispatch_egress_uses_bounded_socket_filename(tmp_path):
+    # Regression (first code dogfood): the egress socket filename must be a
+    # FIXED-LENGTH hash of the dispatch_id, not the id itself. Embedding a
+    # realistic id (rig+ticket+ms) under a rig-local runtime dir overflowed
+    # the AF_UNIX ~108-byte limit and crashed the daemon with
+    # `OSError: AF_UNIX path too long` before any worker ran. Proves setup
+    # goes through container.dispatch_socket_path. No network needed — the
+    # proxy only binds the unix socket here.
+    long_id = "egress-concurrency-92-part1-1784476863032"
+    policy = EgressPolicy(allowed_hosts=frozenset({"api.anthropic.com"}))
+    handle = setup_dispatch_egress(long_id, policy, tmp_path)
+    try:
+        assert isinstance(handle, EgressHandle)
+        assert handle.socket_path.exists()
+        # The long id is NOT embedded in the socket filename (it is hashed).
+        assert long_id not in handle.socket_path.name
+        assert handle.socket_path.name.startswith("egress-")
+        assert handle.socket_path.name.endswith(".sock")
+        # The sibling .jsonl log KEEPS the readable id (no length limit) so an
+        # operator can still correlate socket <-> dispatch.
+        assert handle.log_path.name == f"egress-{long_id}.jsonl"
+    finally:
+        handle.teardown()
+    assert not handle.socket_path.exists()
+
+
 # --------------------------------------------------------------------------
 # bead .32 -- LIVE end-to-end egress proof, Option A (SB-approved 2026-07-16):
 # a REAL hardened --network=none worker container whose ONLY exit is the
