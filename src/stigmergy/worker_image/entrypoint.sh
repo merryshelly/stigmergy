@@ -86,4 +86,22 @@ export no_proxy="127.0.0.1,localhost"
 # /scratch tmpfs so the worker has a writable home for tool state.
 export HOME=/scratch
 
+# Worker git committer identity (bead .86). A fresh cage carries no git
+# identity, and `git commit` refuses without user.name/user.email — so a worker
+# (which MUST commit to refs/heads/work; only committed work is bundled) could
+# never land anything. Hardcode a synthetic identity (mirrors the weaver's
+# `stigmergy.invalid` convention); real per-dispatch provenance lives in the
+# event log / CV rows, never in the git author. Like everything else in this
+# entrypoint it takes NO runtime config, so the worker ("$@") cannot influence
+# it. `safe.directory=*` disarms git's dubious-ownership guard on the
+# bind-mounted /work worktree under rootless-podman UID remapping (belt: it may
+# not fire, but if it does it aborts every git command before the commit).
+export GIT_AUTHOR_NAME=stigmergy-worker
+export GIT_AUTHOR_EMAIL=worker@stigmergy.invalid
+export GIT_COMMITTER_NAME=stigmergy-worker
+export GIT_COMMITTER_EMAIL=worker@stigmergy.invalid
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0=*
+
 exec "$@"

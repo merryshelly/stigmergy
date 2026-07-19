@@ -5,12 +5,15 @@ FROM docker.io/library/node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca44
 
 # python3 = the egress/relay shim runtime (stdlib only). ca-certificates =
 # the system trust store any TLS client in the cage needs to verify upstream
-# (without it, every HTTPS handshake fails CERTIFICATE_VERIFY_FAILED).
+# (without it, every HTTPS handshake fails CERTIFICATE_VERIFY_FAILED). git =
+# every worker MUST commit its output to refs/heads/work (only committed work
+# is collected into the bundle), so git is a BASE-image requirement, not a
+# per-rig dep — distinct from .79's project deps (bead .86).
 # Build-time apt has the provision station's :registries egress; the RUNTIME
 # worker lane is inference-only (SB .26 decision B — no registry egress out
 # of the cage).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && apt-get install -y --no-install-recommends python3 ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 # The claude-code driver (the worker command exec'd by the entrypoint).
