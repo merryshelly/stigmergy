@@ -36,7 +36,7 @@ from stigmergy.registry import load_registry
 from stigmergy.relay import Capability, CapabilityStore
 from stigmergy.rig import RigStore
 from stigmergy.spend import Budgets, SpendLeash
-from stigmergy.statemachine import DONE, ESCALATED, PARKED, POOL
+from stigmergy.statemachine import ESCALATED, LANDED, PARKED, POOL
 from stigmergy.weaver import Weaver
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1016,14 +1016,15 @@ def test_case12_weave_rejected_routes_through_retry_ladder(env: Env) -> None:
 
 
 # ==========================================================================
-# case 13: weave landed -> DONE
+# case 13: weave landed -> ticket rests at LANDED (bead .89)
 # ==========================================================================
 
 
-def test_case13_weave_landed_completes_to_done(env: Env) -> None:
-    """13. Weave landed -> DONE: weave() returns outcome="landed" ->
-    ticket GATED->LANDED->DONE, DISPOSITION(disposition="landed")
-    emitted."""
+def test_case13_weave_landed_rests_at_landed(env: Env) -> None:
+    """13. Weave landed: weave() returns outcome="landed" -> ticket
+    GATED->LANDED and RESTS there (bead .89: v0 does not advance to DONE;
+    DAG intake + spend key on state=="landed"), DISPOSITION(disposition=
+    "landed") emitted."""
     bundle = make_bundle(env.tmp_path, env.staging_repo, name="t13", files={"f.txt": "x\n"})
     add_parked_ticket_for_weave(env, "t13", work_product=bundle)
 
@@ -1036,7 +1037,7 @@ def test_case13_weave_landed_completes_to_done(env: Env) -> None:
 
     assert summary.weave_ran is True
     assert summary.weave_results == ("t13",)
-    assert env.store.get_ticket("t13")["state"] == DONE
+    assert env.store.get_ticket("t13")["state"] == LANDED
 
     dispositions = disposition_events(env, "t13")
     assert any(d["disposition"] == "landed" for d in dispositions)
@@ -1359,7 +1360,7 @@ def test_case20_spend_exhaustion_blocks_claims_but_allows_final_weave(env: Env) 
     assert first.dispatched_ticket is None  # can_dispatch() False -> never claimed
     assert first.weave_ran is True
     assert first.weave_results == ("t20",)
-    assert env.store.get_ticket("t20")["state"] == DONE
+    assert env.store.get_ticket("t20")["state"] == LANDED
     assert env.store.get_ticket("t-not-dispatched")["state"] == POOL
 
     second = daemon.poll_once()

@@ -119,7 +119,7 @@ _EXPECTED_LEGAL_TRANSITIONS: dict[str, set[str]] = {
     GATED: {LANDED, REJECTED, PARKED},
     FAILED: {POOL, ESCALATED},
     REJECTED: {POOL, ESCALATED},
-    LANDED: {DONE},
+    LANDED: set(),
     ESCALATED: set(),
     DONE: set(),
 }

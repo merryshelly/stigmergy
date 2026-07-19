@@ -63,10 +63,14 @@ STATES: frozenset[str] = frozenset(
     }
 )
 
-# `landed` is the authoritative terminal-success state (spend report counts
-# `state == "landed"`, SPEC §9); `escalated` is the human-floor loop exit;
-# `done` exists for post-land archival vocabulary completeness (v0 rests at
-# `landed`). All three have no outgoing edges.
+# `landed` is the authoritative terminal-success state and where v0 RESTS
+# (bead .89): the spend report counts `state == "landed"` (SPEC §9) AND DAG
+# intake eligibility (`intake._deps_landed`) unblocks a dependent only when
+# every predecessor is `state == "landed"` — so a landed ticket must not move
+# past it. `escalated` is the human-floor loop exit. `done` is a reserved
+# post-land archival state, defined for vocabulary completeness but
+# UNREACHABLE in v0 (nothing transitions into it — the LANDED edge set is
+# empty; see below). All three are terminal (no outgoing edges).
 TERMINAL_STATES: frozenset[str] = frozenset({LANDED, ESCALATED, DONE})
 
 # The four lease columns (RigStore schema, ticket .15) — cleared together
@@ -120,9 +124,11 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     # rejected->pool: retry (revision/reconcile). rejected->escalated:
     # integration_failures cap or rung/ladder exhaustion.
     REJECTED: frozenset({POOL, ESCALATED}),
-    # landed->done: terminal success may absorb to done (archival). Both are
-    # terminal; v0 rests the core loop at `landed`.
-    LANDED: frozenset({DONE}),
+    # bead .89: v0 rests at LANDED (terminal-success). The former LANDED->DONE
+    # edge was taken by the daemon and advanced a landed ticket to DONE,
+    # silently breaking DAG intake + the spend report (both key on
+    # state=="landed"). DONE stays a reserved-but-unreachable archival state.
+    LANDED: frozenset(),
     # Loop exit — terminal in v0 (human floor). No outgoing edges.
     ESCALATED: frozenset(),
     # Terminal. No outgoing edges.

@@ -54,9 +54,12 @@ here, not silently papered over; see the sub report for the full list):**
    already AT `REJECTED`; `GATED -> LANDED` on a ticket already at
    `LANDED`). This module therefore does ONLY the work weaver.py has not
    already done:
-   - `"landed"`: `transition(store, ticket, DONE, expected_from=LANDED)`
-     only. No new DISPOSITION event (weaver's own `"landed"` disposition
-     already satisfies the "one DISPOSITION per weave-ticket outcome"
+   - `"landed"`: NOTHING state-machine-wise (bead .89 — v0 rests at
+     LANDED; the old LANDED->DONE advance broke DAG intake + the spend
+     report, which key on state=="landed"). The ticket already sits at
+     LANDED via weaver's own GATED->LANDED transition, and weaver's
+     `"landed"` disposition already satisfies the "one DISPOSITION per
+     weave-ticket outcome"
      contract).
    - `"infra"`: nothing state-machine-wise (ticket is already `PARKED`,
      weaver's own disposition already emitted) — just the infra-trip
@@ -175,11 +178,9 @@ from stigmergy.rig import RigStore
 from stigmergy.spend import SpendLeash
 from stigmergy.statemachine import (
     CLAIMED,
-    DONE,
     ESCALATED,
     FAILED,
     IN_FLIGHT,
-    LANDED,
     PARKED,
     POOL,
     TIER1_GREEN,
@@ -906,7 +907,11 @@ class Daemon:
         for result in results:
             ticket_id = result.ticket
             if result.outcome == "landed":
-                transition(self._store, ticket_id, DONE, expected_from=LANDED)
+                # bead .89: the ticket already RESTS at LANDED (weaver's own
+                # GATED->LANDED transition). v0 does NOT advance it to DONE —
+                # DAG intake (intake._deps_landed) and the spend report both
+                # key on state=="landed", so a landed ticket must stay there.
+                # A clean landing only breaks any consecutive-infra streak.
                 self._reset_infra_trip_counter()
             elif result.outcome == "infra":
                 # Ticket is ALREADY at PARKED (weaver's own contract).
