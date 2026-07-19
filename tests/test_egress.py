@@ -691,6 +691,7 @@ def test_policy_for_lane_ip_colon_port_hosts_entry_is_inert_not_a_bypass():
 # --------------------------------------------------------------------------
 
 
+@requires_network
 def test_setup_dispatch_egress_starts_serving_and_teardown_stops_it(tmp_path):
     async def _fake_resolver(host, port):
         return ["104.20.23.154"]
