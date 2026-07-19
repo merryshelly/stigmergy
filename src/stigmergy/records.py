@@ -269,8 +269,14 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         # prompt_artifact_hash; decoding_params is the second gate-only
         # requirement (pinned + logged decoding params, SPEC §4/§8).
         decoding_params = payload.get("decoding_params")
-        if not isinstance(decoding_params, dict) or not decoding_params:
-            raise RecordError("gate event missing required 'decoding_params'")
+        if not isinstance(decoding_params, dict):
+            raise RecordError(
+                "gate event missing required 'decoding_params' (must be a dict). An "
+                "EMPTY dict is VALID (bead .81/.95): the deprecating-generation models "
+                "(opus-4-8/sonnet-5) reject all sampling params, so {} is the correct "
+                "logged provenance — 'no sampling params sent; model defaults + forced "
+                "tool_choice'. Only a missing field or non-dict is rejected."
+            )
 
 
 def _validate_triage_payload(payload: dict[str, Any]) -> None:

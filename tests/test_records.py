@@ -252,6 +252,19 @@ def test_gate_event_with_decoding_params_ok_and_prompt_hash_readable(
     assert read_back[0]["decoding_params"] == {"temperature": 0.0}
 
 
+def test_gate_event_with_empty_decoding_params_is_valid(plane: RecordPlane) -> None:
+    # bead .81/.95: opus-4-8/sonnet-5 reject sampling params, so the critic
+    # sends NONE and decoding_params is an EMPTY dict — a valid, meaningful
+    # value (logged provenance: "no sampling params sent"), NOT a missing
+    # field. Must be accepted; only an absent field / non-dict is rejected.
+    fields = common_fields(prompt_artifact_hash="critic01-hashdef")
+    fields["decoding_params"] = {}
+    ev = make_event(EventType.GATE, **fields)
+    assert ev.payload["decoding_params"] == {}
+    plane.append(ev)
+    assert plane.read_events()[0]["decoding_params"] == {}
+
+
 # --- case 8: mechanism-only event is valid without LLM extras --------------
 
 
