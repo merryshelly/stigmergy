@@ -242,14 +242,18 @@ def test_judge_repairs_malformed_verdict_on_one_retry():
     assert verdict.reason == "now complete"
     # Exactly one repair-retry: the client was called twice, no more.
     assert len(client.calls) == 2
-    # The repair prompt is DISTINCT from the first, preserves it verbatim, and
-    # names the defect + demands the missing fields.
+    # The repair prompt is DISTINCT from the first and preserves it verbatim,
+    # then appends a fixed corrective appendix (NO echo of the prior defect —
+    # see the .108 hardening). Assert on the APPENDIX SUFFIX specifically:
+    # 'reason'/'severity' already appear in first_prompt, so a whole-prompt
+    # check would prove nothing about what the correction demands.
     first_prompt = client.calls[0]["prompt"]
     repair_prompt = client.calls[1]["prompt"]
     assert repair_prompt != first_prompt
     assert repair_prompt.startswith(first_prompt)  # original preserved, correction appended
-    assert "REPAIR REQUEST" in repair_prompt
-    assert "reason" in repair_prompt and "severity" in repair_prompt
+    appendix = repair_prompt[len(first_prompt):]
+    assert "REPAIR REQUEST" in appendix
+    assert "reason" in appendix and "severity" in appendix
 
 
 def test_judge_repair_retry_is_bounded_to_one_then_infra():
@@ -298,6 +302,18 @@ def test_repair_prompt_does_not_echo_attacker_influenceable_response():
     assert len(client.calls) == 2
     repair_prompt = client.calls[1]["prompt"]
     assert injection not in repair_prompt
+
+
+def test_judge_repaired_filed_tickets_come_from_the_repair_response():
+    # Both the verdict AND the filed_tickets must come from the REPAIR response,
+    # never the stale malformed first response (guards the response reassignment
+    # in judge against a future refactor that extracts filings from the wrong one).
+    first = {"outcome": "unmet", "tier": 2, "filed_tickets": [{"stale": "first"}]}
+    repair = {**_ok_response(), "filed_tickets": [{"fresh": "repair"}]}
+    client = SequenceClient([first, repair])
+    critic = _critic(client)
+    _verdict, _gate, filed = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert filed == [{"fresh": "repair"}]
 
 
 # --------------------------------------------------------------------------

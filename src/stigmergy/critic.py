@@ -307,8 +307,10 @@ class Critic:
         # about the critic's own verdict protocol) can still destabilize the
         # model into an incomplete verdict. On a malformed-verdict PARSE
         # failure (NOT a transport failure — that already raised in
-        # `_call_client`), re-prompt ONCE with a corrective instruction naming
-        # the exact defect, then parse again; a second failure is genuine infra.
+        # `_call_client`), re-prompt ONCE with a FIXED corrective instruction
+        # (self-contained — it echoes NO part of the malformed response / parse
+        # error; see `_build_repair_prompt` for why), then parse again; a second
+        # failure is genuine infra.
         try:
             verdict = _parse_verdict(response)
         except CriticInfraError:
