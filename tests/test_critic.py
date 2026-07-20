@@ -402,3 +402,60 @@ def test_malformed_verdict_with_valid_filed_tickets_still_infra():
     }
     with pytest.raises(CriticInfraError):
         _critic(StubClient(response=resp)).judge(BENIGN_ARTIFACT, RUBRIC)
+
+
+# --------------------------------------------------------------------------
+# Trusted check evidence (newly added capability)
+# --------------------------------------------------------------------------
+
+
+def test_judge_accepts_check_evidence_parameter():
+    # judge() accepts an optional check_evidence keyword parameter.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    verdict, _, _ = critic.judge(BENIGN_ARTIFACT, RUBRIC, check_evidence="PASS: ruff\nPASS: tests")
+    assert isinstance(verdict, Verdict)
+    # If check_evidence is passed, it must appear in the prompt.
+    assert len(client.calls) == 1
+    prompt = client.calls[0]["prompt"]
+    assert "PASS: ruff" in prompt
+
+
+def test_check_evidence_rendered_outside_artifact_fence():
+    # Trusted check evidence is rendered in a clearly delimited section
+    # OUTSIDE and BEFORE the artifact fence — never inside the artifact region.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    evidence_text = "PASS: check-a\nPASS: check-b"
+    critic.judge(BENIGN_ARTIFACT, RUBRIC, check_evidence=evidence_text)
+
+    prompt = client.calls[0]["prompt"]
+    # The evidence markers must be present.
+    assert "===TRUSTED-EVIDENCE-BEGIN===" in prompt
+    assert "===TRUSTED-EVIDENCE-END===" in prompt
+    assert evidence_text in prompt
+
+    # Find the markers and the artifact fence in the prompt.
+    evidence_begin = prompt.find("===TRUSTED-EVIDENCE-BEGIN===")
+    evidence_end = prompt.find("===TRUSTED-EVIDENCE-END===")
+    artifact_begin = prompt.find("===ARTIFACT-BEGIN")
+    artifact_end = prompt.find("===ARTIFACT-END")
+
+    # The evidence section must come BEFORE the artifact fence.
+    assert evidence_begin != -1
+    assert evidence_end != -1
+    assert artifact_begin != -1
+    assert artifact_end != -1
+    assert evidence_begin < evidence_end < artifact_begin < artifact_end
+
+
+def test_judge_omits_check_evidence_section_when_not_provided():
+    # When check_evidence is not provided, the trusted-evidence section
+    # must not appear in the prompt.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    critic.judge(BENIGN_ARTIFACT, RUBRIC)  # No check_evidence parameter
+
+    prompt = client.calls[0]["prompt"]
+    assert "===TRUSTED-EVIDENCE-BEGIN===" not in prompt
+    assert "===TRUSTED-EVIDENCE-END===" not in prompt

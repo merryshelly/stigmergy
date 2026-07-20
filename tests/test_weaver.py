@@ -197,9 +197,9 @@ class SpyCritic:
         self._inner = inner
         self.judge_called = False
 
-    def judge(self, artifact: str, rubric_items: list[str]):
+    def judge(self, artifact: str, rubric_items: list[str], *, check_evidence: str | None = None):
         self.judge_called = True
-        return self._inner.judge(artifact, rubric_items)
+        return self._inner.judge(artifact, rubric_items, check_evidence=check_evidence)
 
 
 def make_critic(
@@ -1523,3 +1523,43 @@ def test_non_gate_infra_integration_event_has_no_error_field(tmp_path, store, pl
     assert len(events) >= 1
     for event in events:
         assert event.get("error") is None
+
+
+# --------------------------------------------------------------------------
+# Trusted check evidence passed to critic
+# --------------------------------------------------------------------------
+
+
+def test_weaver_passes_check_results_as_evidence_to_critic(tmp_path, store, plane):
+    """The weaver passes its computed check_results to the critic as trusted
+    evidence, allowing the critic to rely on mechanical test results without
+    requiring the artifact to re-prove them."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-ev", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t-ev", work_product=bundle)
+
+    # Create a spy critic that records what evidence it receives.
+    class EvidenceSpy:
+        def __init__(self, inner):
+            self._inner = inner
+            self.received_evidence = None
+
+        def judge(self, artifact, rubric_items, *, check_evidence=None):
+            self.received_evidence = check_evidence
+            return self._inner.judge(artifact, rubric_items, check_evidence=check_evidence)
+
+    inner_critic = make_critic(outcome="met")
+    spy = EvidenceSpy(inner_critic)
+
+    run_checks = FakeRunChecks([green_result()])
+    weaver = make_weaver(
+        tmp_path, store, plane, staging_repo, run_checks_fn=run_checks, critic=spy
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    # Verify that check evidence was passed to the critic.
+    assert spy.received_evidence is not None
+    # The evidence should contain information about the check results.
+    assert "Tier-1 Check Results" in spy.received_evidence
+    assert "PASS" in spy.received_evidence

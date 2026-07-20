@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Any
 
 from stigmergy.checks import CheckOutcome, CheckResult
-from stigmergy.critic import CriticInfraError
+from stigmergy.critic import CriticInfraError, format_check_evidence
 from stigmergy.filing import file_proposals
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.statemachine import (
@@ -436,7 +436,10 @@ class Weaver:
             rubric_items = self._rubric_items(ticket_row)
 
             try:
-                verdict, gate_fields, filed_tickets = self.critic.judge(artifact, rubric_items)
+                check_evidence = format_check_evidence(check_results)
+                verdict, gate_fields, filed_tickets = self.critic.judge(
+                    artifact, rubric_items, check_evidence=check_evidence
+                )
             except CriticInfraError as exc:
                 return self._die(
                     ticket_id=ticket_id,
