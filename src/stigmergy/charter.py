@@ -589,8 +589,8 @@ def _validate_loop(loop_cfg: Any) -> None:
 
 def _validate_workers(concurrency_cfg: dict[str, Any]) -> None:
     workers = concurrency_cfg.get("workers", 1)
-    if isinstance(workers, bool) or not isinstance(workers, int) or workers != 1:
-        raise CharterError(f"loop.concurrency.workers must be exactly 1 in v0 (got {workers!r})")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise CharterError(f"loop.concurrency.workers must be a positive integer (got {workers!r})")
 
 
 def _validate_timers(timers_cfg: Any) -> None:

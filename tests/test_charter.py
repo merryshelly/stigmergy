@@ -83,11 +83,11 @@ def test_unknown_key_in_loop_budgets_rejected(tmp_path: Path) -> None:
 # --- rule 2: workers -----------------------------------------------------
 
 
-def test_workers_greater_than_one_rejected(tmp_path: Path) -> None:
+def test_workers_greater_than_one_accepted(tmp_path: Path) -> None:
     content = mutate("workers = 1", "workers = 2")
     charter_path = make_charter(tmp_path, content)
-    with pytest.raises(CharterError):
-        load_charter(charter_path, env={})
+    charter = load_charter(charter_path, env={})
+    assert charter.raw["loop"]["concurrency"]["workers"] == 2
 
 
 def test_workers_equal_one_ok(tmp_path: Path) -> None:
@@ -101,6 +101,41 @@ def test_workers_absent_defaults_to_one_ok(tmp_path: Path) -> None:
     charter_path = make_charter(tmp_path, content)
     charter = load_charter(charter_path, env={})
     assert charter.raw["loop"]["concurrency"]["workers"] == 1
+
+
+def test_workers_zero_rejected(tmp_path: Path) -> None:
+    content = mutate("workers = 1", "workers = 0")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_workers_negative_rejected(tmp_path: Path) -> None:
+    content = mutate("workers = 1", "workers = -1")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_workers_bool_rejected(tmp_path: Path) -> None:
+    content = mutate("workers = 1", "workers = true")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_workers_non_integer_rejected(tmp_path: Path) -> None:
+    content = mutate("workers = 1", "workers = 1.5")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_workers_larger_positive_integer_accepted(tmp_path: Path) -> None:
+    content = mutate("workers = 1", "workers = 4")
+    charter_path = make_charter(tmp_path, content)
+    charter = load_charter(charter_path, env={})
+    assert charter.raw["loop"]["concurrency"]["workers"] == 4
 
 
 # --- rule 3: unknown model / registry miss ---------------------------------

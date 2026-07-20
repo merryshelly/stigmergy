@@ -163,7 +163,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
 
 def test_invalid_charter_raises_and_leaves_no_rig_dir(tmp_path: Path) -> None:
     repo = make_local_repo(tmp_path)
-    content = mutate("workers = 1", "workers = 2")
+    content = mutate("workers = 1", "workers = 0")
     charter_path = make_charter(tmp_path, repo, content=content)
     base_dir = tmp_path / "rigs"
 
@@ -178,7 +178,7 @@ def test_invalid_charter_raises_and_leaves_no_rig_dir(tmp_path: Path) -> None:
 
 def test_cli_rig_new_invalid_charter_exits_nonzero(tmp_path: Path) -> None:
     repo = make_local_repo(tmp_path)
-    content = mutate("workers = 1", "workers = 2")
+    content = mutate("workers = 1", "workers = 0")
     charter_path = make_charter(tmp_path, repo, content=content)
     base_dir = tmp_path / "rigs"
 
@@ -547,7 +547,7 @@ def test_resolve_rig_missing_ticket_db_raises(tmp_path: Path) -> None:
 def test_resolve_rig_invalid_charter_propagates_charter_error(tmp_path: Path) -> None:
     rigs_root = tmp_path / "rigs"
     rig_root = rigs_root / "shipyard"
-    _write_scaffold(rig_root, charter_content=mutate("workers = 1", "workers = 2"))
+    _write_scaffold(rig_root, charter_content=mutate("workers = 1", "workers = 0"))
 
     # NOT wrapped in RigError — a chartering bug surfaces as CharterError.
     with pytest.raises(CharterError):
