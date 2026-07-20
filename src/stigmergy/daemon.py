@@ -420,6 +420,17 @@ class Daemon:
         backoff_seconds = self._compute_backoff(consecutive) if infra_trip else 0.0
 
         if should_halt:
+            # bead .109: log the halt cause to the daemon LOG (not just the
+            # persisted ntfy intent) — `sys.exit` in `run_forever` is
+            # otherwise silent, and this was the actual root cause of "the
+            # daemon exited with no logged reason" (see build-107-109-spec.md
+            # §1: the already-existing global circuit breaker tripping).
+            _logger.error(
+                "stigmergy daemon halting: circuit breaker tripped — "
+                "%d consecutive infra trips >= threshold %d",
+                consecutive,
+                _CIRCUIT_BREAKER_THRESHOLD,
+            )
             self._persist_halt_notification(now)
 
         # Notification delivery: every poll attempts to flush pending

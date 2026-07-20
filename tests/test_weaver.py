@@ -1461,3 +1461,65 @@ def test_rejected_result_has_reason_gate_unmet(tmp_path, store, plane):
 
     assert result.outcome == "rejected"
     assert result.reason == "gate-unmet"
+
+
+# ==========================================================================
+# bead .109: persist the CriticInfraError cause on the gate-infra
+# INTEGRATION event, scoped to gate-infra only. See build-107-109-spec.md
+# §3(a).
+# ==========================================================================
+
+
+def test_gate_infra_integration_event_carries_error_message(tmp_path, store, plane):
+    """.109 #1: when `critic.judge` raises `CriticInfraError(...)`, the
+    emitted gate-infra INTEGRATION event carries an `error` field equal to
+    that exact message."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(
+        tmp_path, staging_repo, name="t-109-error", files={"f.txt": "x\n"}
+    )
+    add_parked_ticket(store, "t-109-error", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_infra_critic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "infra"
+    assert result.reason == "critic-infra"
+
+    events = integration_events(plane, "t-109-error", phase="gate-infra")
+    assert len(events) == 1
+    assert events[0]["error"] == "critic client call failed: RuntimeError('provider 503')"
+
+
+def test_non_gate_infra_integration_event_has_no_error_field(tmp_path, store, plane):
+    """.109 #2: a NON-gate-infra integration event (e.g. the "apply"/"land"
+    phase on a landed ticket) carries no `error` field (or `error is
+    None`) — the field is scoped to gate-infra only."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(
+        tmp_path, staging_repo, name="t-109-noerror", files={"f.txt": "x\n"}
+    )
+    add_parked_ticket(store, "t-109-noerror", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    events = integration_events(plane, "t-109-noerror")
+    assert len(events) >= 1
+    for event in events:
+        assert event.get("error") is None

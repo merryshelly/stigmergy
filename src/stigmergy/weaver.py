@@ -437,7 +437,7 @@ class Weaver:
 
             try:
                 verdict, gate_fields, filed_tickets = self.critic.judge(artifact, rubric_items)
-            except CriticInfraError:
+            except CriticInfraError as exc:
                 return self._die(
                     ticket_id=ticket_id,
                     dispatch_id=dispatch_id,
@@ -455,6 +455,7 @@ class Weaver:
                     touched=touched,
                     detail="critic call failed — infra, never a rejection; work stays parked",
                     now=now,
+                    error=str(exc),
                 )
 
             self._append_gate_event(ctx, verdict=verdict, gate_fields=gate_fields, now=now)
@@ -589,6 +590,7 @@ class Weaver:
         detail: str,
         now: float,
         touched: list[str] | None = None,
+        error: str | None = None,
     ) -> WeaveResult:
         """Shared tail for every non-landing outcome: journal the phase,
         transition to the resting state, write the DISPOSITION event (plus
@@ -606,6 +608,13 @@ class Weaver:
         end. `disposition in {"rejected", "parked"}` maps to
         `REJECTED`/`PARKED` respectively (both legal `GATED->*` edges,
         SPEC §9).
+
+        ``error`` (bead .109): the `str(CriticInfraError)` cause, threaded
+        through ONLY for `phase == "gate-infra"` — persisted onto that
+        INTEGRATION event so a critic-infra failure is self-diagnosing
+        without cross-referencing the weaver's own runtime logs. Every
+        other non-landing phase passes `error=None` (the default), which
+        `_append_integration_event` omits from the event entirely.
         """
         self._journal_append(
             ticket=ticket_id,
@@ -619,7 +628,12 @@ class Weaver:
         transition(self.store, ticket_id, to_state, expected_from=GATED)
         if phase in ("abort", "gate-infra"):
             self._append_integration_event(
-                ctx, phase=phase, pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+                ctx,
+                phase=phase,
+                pinned_oid=pinned_oid,
+                candidate_oid=candidate_oid,
+                now=now,
+                error=error if phase == "gate-infra" else None,
             )
         combined_reason = self._combine_reason(reason, touched)
         record_disposition(
@@ -952,6 +966,7 @@ class Weaver:
         pinned_oid: str | None,
         candidate_oid: str | None,
         now: float,
+        error: str | None = None,
     ) -> None:
         fields = {key: ctx.get(key) for key in _CTX_FIELDS}
         fields["ticket"] = ctx["ticket"]
@@ -962,6 +977,11 @@ class Weaver:
         fields["pinned_oid"] = pinned_oid
         fields["candidate_oid"] = candidate_oid
         fields["ts"] = now
+        # bead .109: the CriticInfraError cause, scoped to gate-infra only
+        # (every other INTEGRATION event passes error=None -> omitted here,
+        # never set to a literal None value on the event itself).
+        if error is not None:
+            fields["error"] = error
         event = make_event(EventType.INTEGRATION, **fields)
         self.record_plane.append(event)
 

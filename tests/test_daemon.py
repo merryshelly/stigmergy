@@ -18,6 +18,7 @@ Case numbering below matches the bead .22 build spec's frozen case list
 from __future__ import annotations
 
 import hashlib
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -1237,6 +1238,38 @@ def test_107_11_cas_abort_infra_does_not_use_per_ticket_escalation(env: Env) -> 
 
     escalation_intents = [i for i in env.notification_store.all_intents() if i.kind == "escalation"]
     assert escalation_intents == []
+
+
+# ==========================================================================
+# bead .109 — diagnosability: log the circuit-breaker halt reason. See
+# build-107-109-spec.md §3(b).
+# ==========================================================================
+
+
+def test_109_3_circuit_breaker_halt_logs_breaker_and_consecutive_count(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    """.109 #3: when the poll reaches should_halt=True, a daemon LOG record
+    at ERROR (or WARNING) level names the circuit breaker + the consecutive
+    trip count — not just the persisted ntfy intent."""
+    add_dispatchable_ticket(env, "t-109-halt")
+    spawn_fn = AlwaysInfraSpawn()
+    daemon = make_daemon(env, spawn_fn=spawn_fn)
+
+    with caplog.at_level(logging.WARNING, logger="stigmergy.daemon"):
+        summaries = [daemon.poll_once() for _ in range(_CIRCUIT_BREAKER_THRESHOLD)]
+
+    assert summaries[-1].should_halt is True
+
+    halt_records = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "circuit breaker" in r.getMessage().lower()
+    ]
+    assert len(halt_records) == 1
+    message = halt_records[0].getMessage()
+    assert "circuit breaker" in message.lower()
+    assert str(_CIRCUIT_BREAKER_THRESHOLD) in message
 
 
 # ==========================================================================
