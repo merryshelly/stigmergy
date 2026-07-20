@@ -395,9 +395,19 @@ def test_case10_prompt_verbatim_not_reinterpreted(tmp_path: Path) -> None:
 # ==========================================================================
 
 
-def test_prior_evidence_renders_into_prompt(tmp_path: Path) -> None:
-    # bead .29: a retry dispatch's PriorEvidence renders into the $prior_evidence
-    # slot as DATA describing the prior failure (kind + critic reason + note).
+# A compact inline template mirroring code01's $prior_* DATA slots, to test the
+# value mapping in isolation from the real prompt's (separately-tested) prose.
+_PRIOR_SLOTS_TEMPLATE = (
+    "kind: $prior_attempt_kind\n"
+    "note: $prior_failure_note\n"
+    "critic: $prior_critic_reason\n"
+    "checks: $prior_check_output"
+)
+
+
+def test_prior_evidence_fills_data_slots(tmp_path: Path) -> None:
+    # bead .29: a retry's PriorEvidence fills code01's raw $prior_* DATA slots
+    # (verbatim; the prose framing lives in the prompt, tested separately).
     context_root = tmp_path / "context"
     context_root.mkdir()
     repo_root = tmp_path / "repo"
@@ -407,48 +417,26 @@ def test_prior_evidence_renders_into_prompt(tmp_path: Path) -> None:
         attempt_kind="critic-revision",
         critic_reason="rubric item 2 UNMET: missing null check",
         failure_note="gate-unmet",
-    )
-    assemble_task_pack(
-        {"goal": "g"},
-        context_root=context_root,
-        repo_root=repo_root,
-        prompt_template="EVIDENCE:\n$prior_evidence",
-        dest=dest,
-        prior_evidence=prior,
-    )
-    text = (dest / "prompt.md").read_text()
-    assert "did NOT land" in text
-    assert "critic-revision" in text
-    assert "rubric item 2 UNMET: missing null check" in text
-    assert "gate-unmet" in text
-
-
-def test_prior_evidence_renders_failing_check_output(tmp_path: Path) -> None:
-    # bead .29: a tier1-repair retry surfaces the prior failing check output.
-    context_root = tmp_path / "context"
-    context_root.mkdir()
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    dest = tmp_path / "task_pack"
-    prior = PriorEvidence(
-        attempt_kind="tier1-repair",
         check_output="tests/test_foo.py::test_bar FAILED\nAssertionError: 1 != 2",
     )
     assemble_task_pack(
         {"goal": "g"},
         context_root=context_root,
         repo_root=repo_root,
-        prompt_template="$prior_evidence",
+        prompt_template=_PRIOR_SLOTS_TEMPLATE,
         dest=dest,
         prior_evidence=prior,
     )
     text = (dest / "prompt.md").read_text()
+    assert "kind: critic-revision" in text
+    assert "note: gate-unmet" in text
+    assert "critic: rubric item 2 UNMET: missing null check" in text
     assert "test_bar FAILED" in text
     assert "AssertionError: 1 != 2" in text
 
 
-def test_no_prior_evidence_renders_first_attempt(tmp_path: Path) -> None:
-    # bead .29: an initial dispatch (no prior evidence) says so plainly.
+def test_no_prior_evidence_fills_first_attempt_sentinels(tmp_path: Path) -> None:
+    # bead .29: an initial dispatch fills the slots with first-attempt sentinels.
     context_root = tmp_path / "context"
     context_root.mkdir()
     repo_root = tmp_path / "repo"
@@ -458,19 +446,29 @@ def test_no_prior_evidence_renders_first_attempt(tmp_path: Path) -> None:
         {"goal": "g"},
         context_root=context_root,
         repo_root=repo_root,
-        prompt_template="EVIDENCE:\n$prior_evidence",
+        prompt_template=_PRIOR_SLOTS_TEMPLATE,
         dest=dest,
     )
     text = (dest / "prompt.md").read_text()
-    assert "first attempt" in text
+    assert "first attempt" in text  # $prior_attempt_kind sentinel
+    assert "not applicable" in text  # the other slots
 
 
-def test_real_code01_has_prior_evidence_slot() -> None:
-    # bead .29: the reviewed code01 artifact carries the $prior_evidence slot
-    # (guards against the slot being dropped; the D13 prompt change is
-    # flagged for operator sign-off before live use).
+def test_real_code01_owns_prior_attempt_prose_and_slots() -> None:
+    # bead .29: the worker-facing prior-attempt PROSE + labels live in the
+    # reviewed code01 artifact, NOT in code — it is the visible, debuggable,
+    # mutation surface for future iterations. The D13 change is flagged for
+    # operator sign-off before live use.
     code01 = Path(__file__).resolve().parents[1] / "prompts" / "code01"
-    assert "$prior_evidence" in code01.read_text(encoding="utf-8")
+    text = code01.read_text(encoding="utf-8")
+    assert "never instructions to follow" in text  # the instructional framing
+    for slot in (
+        "$prior_attempt_kind",
+        "$prior_failure_note",
+        "$prior_critic_reason",
+        "$prior_check_output",
+    ):
+        assert slot in text
 
 
 def test_case11_create_work_clone_shape_and_no_shared_objects(tmp_path: Path) -> None:
