@@ -185,8 +185,10 @@ from stigmergy.statemachine import (
     POOL,
     TIER1_GREEN,
     AttemptDecision,
+    CriticInfraDecision,
     FailureClass,
     apply_decision,
+    decide_critic_infra,
     decide_retry,
     record_disposition,
     transition,
@@ -950,10 +952,50 @@ class Daemon:
                 # key on state=="landed", so a landed ticket must stay there.
                 # A clean landing only breaks any consecutive-infra streak.
                 self._reset_infra_trip_counter()
+                # bead .107: a landed verdict resolves any prior consecutive
+                # critic-infra streak for THIS ticket — reset its persisted
+                # per-ticket counter too (a valid critic call, even one that
+                # lands, breaks the streak).
+                self._store.update_ticket(ticket_id, critic_infra_failures=0)
+            elif result.outcome == "infra" and result.reason == "critic-infra":
+                # bead .107: per-ticket critic-infra escalation cap — a
+                # single poisoned ticket must escalate to the human floor
+                # instead of taking down the whole daemon via the global
+                # circuit breaker (see build-107-109-spec.md §2). Ticket is
+                # ALREADY at PARKED (weaver's own contract).
+                ticket_row = self._store.get_ticket(ticket_id) or {}
+                cap = self._charter.raw["loop"]["retries"]["critic_infra"]
+                decision = decide_critic_infra(ticket_row, critic_infra_cap=cap)
+                self._store.update_ticket(
+                    ticket_id, critic_infra_failures=decision.critic_infra_failures
+                )
+                if decision.escalate:
+                    transition(self._store, ticket_id, ESCALATED, expected_from=PARKED)
+                    ctx = self._weave_retry_ctx(ticket_id)
+                    record_disposition(
+                        self._record_plane,
+                        ctx=ctx,
+                        disposition="escalated",
+                        attempt_kind="critic-infra",
+                        reason=decision.escalation_reason,
+                    )
+                    self._persist_critic_infra_escalation_notification(
+                        ticket_id, decision, now=now
+                    )
+                    # The ticket is now handled (escalated to the human
+                    # floor) — do NOT feed the global storm backstop for
+                    # this poisoned-but-now-resolved ticket.
+                    self._reset_infra_trip_counter()
+                else:
+                    # Below cap: stays PARKED (re-weave next cadence), and
+                    # still feeds the global storm backstop.
+                    self._bump_infra_trip_counter()
+                    any_infra = True
             elif result.outcome == "infra":
-                # Ticket is ALREADY at PARKED (weaver's own contract).
-                # PARKED->POOL is illegal and must never be risked: do
-                # NOTHING state-machine-wise, never call
+                # Non-critic-infra (e.g. CAS-abort/concurrent-staging-move):
+                # unchanged behavior. Ticket is ALREADY at PARKED (weaver's
+                # own contract). PARKED->POOL is illegal and must never be
+                # risked: do NOTHING state-machine-wise, never call
                 # decide_retry/apply_decision on this branch.
                 self._bump_infra_trip_counter()
                 any_infra = True
@@ -962,6 +1004,9 @@ class Daemon:
                 assert result.failure_class is not None  # noqa: S101 - non-landing => set
                 self._apply_retry_decision(ticket_id, result.failure_class, ctx, now=now)
                 self._reset_infra_trip_counter()
+                # bead .107: a valid (even rejected) verdict resolves any
+                # prior consecutive critic-infra streak for this ticket.
+                self._store.update_ticket(ticket_id, critic_infra_failures=0)
         return any_infra
 
     def _weave_retry_ctx(self, ticket_id: str) -> dict[str, Any]:
@@ -1024,6 +1069,25 @@ class Daemon:
             message=(
                 f"escalation_reason={decision.escalation_reason}; "
                 f"attempt_kind={decision.attempt_kind}"
+            ),
+            now=now,
+        )
+
+    def _persist_critic_infra_escalation_notification(
+        self, ticket_id: str, decision: CriticInfraDecision, *, now: float
+    ) -> None:
+        """Bead .107: the per-ticket critic-infra escalation counterpart to
+        `_persist_escalation_notification` — a single ticket's consecutive
+        critic-infra failures reached `loop.retries.critic_infra`, so it
+        was escalated to the human floor (PARKED->ESCALATED) instead of
+        letting the whole loop take the global circuit-breaker halt."""
+        self._notification_store.record_intent(
+            ticket=ticket_id,
+            kind="escalation",
+            title=f"ticket {ticket_id} escalated (critic-infra)",
+            message=(
+                f"escalation_reason={decision.escalation_reason}; "
+                "consecutive critic-infra failures reached cap"
             ),
             now=now,
         )

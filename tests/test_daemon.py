@@ -41,8 +41,8 @@ from stigmergy.registry import load_registry
 from stigmergy.relay import Capability, CapabilityStore
 from stigmergy.rig import RigStore
 from stigmergy.spend import Budgets, SpendLeash
-from stigmergy.statemachine import ESCALATED, LANDED, PARKED, POOL
-from stigmergy.weaver import Weaver
+from stigmergy.statemachine import ESCALATED, LANDED, PARKED, POOL, FailureClass
+from stigmergy.weaver import Weaver, WeaveResult
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VALID_CHARTER_PATH = FIXTURES / "charter_valid.toml"
@@ -167,6 +167,60 @@ class FakeWeaver:
     def weave(self, *, now: float) -> list:
         self.weave_calls += 1
         return []
+
+
+class ScriptedWeaver:
+    """A fake satisfying `Weaver`'s public shape (bead .107): `weave()`
+    pops ONE scripted list of `WeaveResult`s per call, in order — lets
+    tests drive `_process_weave_results` directly against a scripted
+    `WeaveResult` (e.g. a repeated critic-infra outcome) without needing
+    the real Weaver/critic/git machinery for every poll. Raises
+    `AssertionError` if called more times than scripted (mirrors
+    `ScriptedSpawn`'s discipline)."""
+
+    def __init__(self, results_per_call: list[list[WeaveResult]]):
+        self._results_per_call = list(results_per_call)
+        self.weave_calls = 0
+
+    def in_progress(self) -> bool:
+        return False
+
+    def resolve(self) -> str:
+        return "rolled-back"
+
+    def weave(self, *, now: float) -> list[WeaveResult]:
+        self.weave_calls += 1
+        if not self._results_per_call:
+            raise AssertionError("ScriptedWeaver called more times than scripted")
+        return self._results_per_call.pop(0)
+
+
+def critic_infra_weave_result(ticket_id: str) -> WeaveResult:
+    return WeaveResult(
+        ticket=ticket_id,
+        outcome="infra",
+        landed_oid=None,
+        failure_class=FailureClass.INFRA,
+        verdict=None,
+        check_results=None,
+        flagged_for_human=False,
+        detail="critic call failed — infra, never a rejection; work stays parked",
+        reason="critic-infra",
+    )
+
+
+def cas_abort_weave_result(ticket_id: str) -> WeaveResult:
+    return WeaveResult(
+        ticket=ticket_id,
+        outcome="infra",
+        landed_oid=None,
+        failure_class=FailureClass.INFRA,
+        verdict=None,
+        check_results=None,
+        flagged_for_human=False,
+        detail="CAS aborted cleanly: staging moved concurrently; candidate NOT landed",
+        reason="concurrent-staging-move",
+    )
 
 
 class FakeReaper:
@@ -1060,6 +1114,129 @@ def test_case13_weave_landed_rests_at_landed(env: Env) -> None:
 
     dispositions = disposition_events(env, "t13")
     assert any(d["disposition"] == "landed" for d in dispositions)
+
+
+# ==========================================================================
+# bead .107 — per-ticket critic-infra escalation cap (loop liveness).
+# A single ticket that repeatedly fails the critic as INFRA escalates to
+# the human floor after a per-ticket cap, instead of taking down the whole
+# daemon via the global circuit breaker. See build-107-109-spec.md §2.
+# ==========================================================================
+
+
+def test_107_8_critic_infra_streak_escalates_ticket_without_halting(env: Env) -> None:
+    """.107 #8: a parked ticket whose weave returns
+    WeaveResult(outcome="infra", reason="critic-infra", ...) cap-times in a
+    row ends ESCALATED, records a disposition="escalated" event, persists
+    an escalation notification, and never halts the daemon."""
+    cap = env.charter.raw["loop"]["retries"]["critic_infra"]
+    add_parked_ticket_for_weave(env, "t-cif-escalate", work_product="unused.bundle")
+
+    weaver = ScriptedWeaver(
+        [[critic_infra_weave_result("t-cif-escalate")] for _ in range(cap)]
+    )
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
+
+    for _ in range(cap):
+        summary = daemon.poll_once()
+        assert summary.should_halt is False
+
+    row = env.store.get_ticket("t-cif-escalate")
+    assert row["state"] == ESCALATED
+    assert row["critic_infra_failures"] == cap
+
+    dispositions = disposition_events(env, "t-cif-escalate")
+    assert any(d["disposition"] == "escalated" for d in dispositions)
+
+    escalation_intents = [
+        i
+        for i in env.notification_store.all_intents()
+        if i.kind == "escalation" and i.ticket == "t-cif-escalate"
+    ]
+    assert len(escalation_intents) == 1
+
+
+def test_107_9_below_cap_critic_infra_leaves_ticket_parked(env: Env) -> None:
+    """.107 #9: a below-cap critic-infra leaves the ticket PARKED,
+    increments the persisted per-ticket counter, and still bumps the
+    global infra-trip counter (the storm backstop is preserved)."""
+    add_parked_ticket_for_weave(env, "t-cif-below", work_product="unused.bundle")
+
+    weaver = ScriptedWeaver([[critic_infra_weave_result("t-cif-below")]])
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
+
+    summary = daemon.poll_once()
+
+    assert summary.infra_trip is True
+    assert summary.consecutive_infra_trips == 1
+
+    row = env.store.get_ticket("t-cif-below")
+    assert row["state"] == PARKED
+    assert row["critic_infra_failures"] == 1
+
+
+def test_107_10_critic_infra_streak_then_landed_resets_counter(env: Env) -> None:
+    """.107 #10: a critic-infra streak that then LANDS resets
+    `critic_infra_failures` back to 0 — a successful critic call (even a
+    later one) breaks the consecutive streak."""
+    bundle = make_bundle(env.tmp_path, env.staging_repo, name="t-cif-reset", files={"f.txt": "x\n"})
+    add_parked_ticket_for_weave(env, "t-cif-reset", work_product=bundle)
+
+    class FlippableCriticClient:
+        def __init__(self) -> None:
+            self.raise_infra = True
+
+        def __call__(self, prompt, *, model, **kwargs):
+            if self.raise_infra:
+                raise RuntimeError("provider 503")
+            return {"outcome": "met", "tier": 1, "reason": "looks good", "severity": "none"}
+
+    from stigmergy.critic import Critic
+
+    client = FlippableCriticClient()
+    critic = Critic(
+        client=client, model="stub-model", decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+    weaver = make_real_weaver(env, run_checks_fn=ScriptedChecks([pass_result()]), critic=critic)
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
+
+    for _ in range(2):
+        daemon.poll_once()
+
+    row = env.store.get_ticket("t-cif-reset")
+    assert row["state"] == PARKED
+    assert row["critic_infra_failures"] == 2
+
+    client.raise_infra = False
+    daemon.poll_once()
+
+    row = env.store.get_ticket("t-cif-reset")
+    assert row["state"] == LANDED
+    assert row["critic_infra_failures"] == 0
+
+
+def test_107_11_cas_abort_infra_does_not_use_per_ticket_escalation(env: Env) -> None:
+    """.107 #11: CAS-abort infra (reason="concurrent-staging-move") still
+    goes through the OLD path — bumps the global counter, leaves the
+    ticket PARKED, and is NEVER per-ticket-escalated (regression guard:
+    the new critic-infra-only branch must not fire for this reason)."""
+    add_parked_ticket_for_weave(env, "t-cas-abort", work_product="unused.bundle")
+
+    weaver = ScriptedWeaver([[cas_abort_weave_result("t-cas-abort")]])
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
+
+    summary = daemon.poll_once()
+
+    assert summary.infra_trip is True
+    assert summary.consecutive_infra_trips == 1
+
+    row = env.store.get_ticket("t-cas-abort")
+    assert row["state"] == PARKED
+    assert row["critic_infra_failures"] == 0
+
+    escalation_intents = [i for i in env.notification_store.all_intents() if i.kind == "escalation"]
+    assert escalation_intents == []
 
 
 # ==========================================================================

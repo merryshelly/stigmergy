@@ -148,7 +148,7 @@ def test_rig_meta_populated(tmp_path: Path) -> None:
 
     store = RigStore(rig_root / "tickets.db")
     try:
-        assert store.get_meta("schema_version") == "4"
+        assert store.get_meta("schema_version") == "5"
         assert store.get_meta("stigmergy_version") == __version__
         charter_hash = store.get_meta("charter_hash")
         assert charter_hash
@@ -270,6 +270,65 @@ def test_rigstore_get_ticket_missing_returns_none(tmp_path: Path) -> None:
         store.close()
 
 
+# --- bead .107: critic_infra_failures per-ticket counter --------------------
+
+
+def test_fresh_ticket_has_critic_infra_failures_zero(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_ticket(id="ticket-cif", title="t")
+        ticket = store.get_ticket("ticket-cif")
+        assert ticket["critic_infra_failures"] == 0
+    finally:
+        store.close()
+
+
+def test_update_ticket_critic_infra_failures_round_trips(tmp_path: Path) -> None:
+    store = RigStore.create(tmp_path / "tickets.db")
+    try:
+        store.add_ticket(id="ticket-cif2", title="t")
+        store.update_ticket("ticket-cif2", critic_infra_failures=2)
+        assert store.get_ticket("ticket-cif2")["critic_infra_failures"] == 2
+    finally:
+        store.close()
+
+
+def test_critic_infra_failures_column_migrated_on_open(tmp_path: Path) -> None:
+    """A tickets table WITHOUT critic_infra_failures (pre-.107 scaffold)
+    gains the column on the next plain open; idempotent on a second open
+    (mirrors test_A6_functional_summary_column_migrated_on_open's pattern
+    for the prior self-healing migration)."""
+    db_path = tmp_path / "tickets.db"
+    store = RigStore.create(db_path)
+    store._conn.execute("ALTER TABLE tickets DROP COLUMN critic_infra_failures")
+    store._conn.commit()
+    cols = {row["name"] for row in store._conn.execute("PRAGMA table_info(tickets)")}
+    assert "critic_infra_failures" not in cols  # precondition: really absent
+    store.close()
+
+    reopened = RigStore(db_path)  # plain open triggers the guarded-ALTER migration
+    try:
+        cols = {row["name"] for row in reopened._conn.execute("PRAGMA table_info(tickets)")}
+        assert "critic_infra_failures" in cols
+        # A pre-existing row reads back the migrated column as 0, not NULL.
+        reopened._conn.execute(
+            "INSERT INTO tickets (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("pre-existing", "t", 0.0, 0.0),
+        )
+        reopened._conn.commit()
+        assert reopened.get_ticket("pre-existing")["critic_infra_failures"] == 0
+    finally:
+        reopened.close()
+
+    # idempotent: a second open does not raise / double-add.
+    reopened2 = RigStore(db_path)
+    try:
+        cols = {row["name"] for row in reopened2._conn.execute("PRAGMA table_info(tickets)")}
+        assert "critic_infra_failures" in cols
+    finally:
+        reopened2.close()
+
+
 # --- case 7: add_dep / deps_of + list_tickets(state=) filter ------------------
 
 
@@ -361,7 +420,7 @@ def test_tickets_db_is_self_contained_plain_sqlite(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute("SELECT value FROM rig_meta WHERE key = 'schema_version'").fetchall()
-        assert rows == [("4",)]
+        assert rows == [("5",)]
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -830,7 +889,8 @@ def _full_ticket_fields() -> dict:
 
 def test_A5_fresh_create_has_functional_summary_column(tmp_path: Path) -> None:
     """A fresh RigStore.create carries functional_summary in the tickets DDL.
-    (schema_version == "4" after scaffold is asserted by test_rig_meta_populated.)"""
+    (schema_version == "5" after scaffold is asserted by test_rig_meta_populated —
+    bumped to "5" by bead .107's critic_infra_failures column.)"""
     store = RigStore.create(tmp_path / "tickets.db")
     try:
         cols = {row["name"] for row in store._conn.execute("PRAGMA table_info(tickets)")}

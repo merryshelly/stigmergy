@@ -288,6 +288,48 @@ def test_retries_attempts_per_rung_zero_rejected(tmp_path: Path) -> None:
         load_charter(charter_path, env={})
 
 
+# --- bead .107: loop.retries.critic_infra -----------------------------------
+
+
+def test_critic_infra_absent_defaults_to_three(tmp_path: Path) -> None:
+    """Absence -> default 3 (MUST stay < the daemon's
+    `_CIRCUIT_BREAKER_THRESHOLD` (5) so a single poisoned ticket escalates
+    itself before the global storm breaker halts the whole loop)."""
+    charter_path = make_charter(tmp_path, BASE_CHARTER_TOML)
+    charter = load_charter(charter_path, env={})
+    assert charter.raw["loop"]["retries"]["critic_infra"] == 3
+
+
+def test_critic_infra_explicit_value_loads(tmp_path: Path) -> None:
+    content = mutate(
+        "integration_failures = 2\nflake_reruns = 2\n",
+        "integration_failures = 2\nflake_reruns = 2\ncritic_infra = 4\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    charter = load_charter(charter_path, env={})
+    assert charter.raw["loop"]["retries"]["critic_infra"] == 4
+
+
+def test_critic_infra_zero_rejected(tmp_path: Path) -> None:
+    content = mutate(
+        "integration_failures = 2\nflake_reruns = 2\n",
+        "integration_failures = 2\nflake_reruns = 2\ncritic_infra = 0\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_critic_infra_negative_rejected(tmp_path: Path) -> None:
+    content = mutate(
+        "integration_failures = 2\nflake_reruns = 2\n",
+        "integration_failures = 2\nflake_reruns = 2\ncritic_infra = -1\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
 # --- env overrides -----------------------------------------------------------
 
 

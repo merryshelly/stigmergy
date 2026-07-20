@@ -33,9 +33,11 @@ from stigmergy.statemachine import (
     STATES,
     TIER1_GREEN,
     AttemptDecision,
+    CriticInfraDecision,
     FailureClass,
     IllegalTransition,
     apply_decision,
+    decide_critic_infra,
     decide_retry,
     is_legal,
     record_disposition,
@@ -115,7 +117,7 @@ _EXPECTED_LEGAL_TRANSITIONS: dict[str, set[str]] = {
     CLAIMED: {IN_FLIGHT, POOL},
     IN_FLIGHT: {TIER1_GREEN, FAILED, POOL},
     TIER1_GREEN: {PARKED},
-    PARKED: {GATED},
+    PARKED: {GATED, ESCALATED},
     GATED: {LANDED, REJECTED, PARKED},
     FAILED: {POOL, ESCALATED},
     REJECTED: {POOL, ESCALATED},
@@ -599,6 +601,86 @@ def test_apply_decision_enforces_legal_state_edge(store: RigStore) -> None:
     row_after = store.get_ticket("t-illegal-apply")
     assert row_after["state"] == POOL
     assert row_after["attempts_used"] == 1
+
+
+# ==========================================================================
+# bead .107 — per-ticket critic-infra escalation cap (PARKED->ESCALATED
+# edge + decide_critic_infra). See build-107-109-spec.md §2.
+# ==========================================================================
+
+
+# --- .107 #4: PARKED->ESCALATED is now a legal edge -------------------------
+
+
+def test_transition_parked_to_escalated_now_legal(store: RigStore) -> None:
+    """The escalation edge did not exist before .107 — PARKED could only
+    ever re-enter GATED (a weave trigger re-gating the parked bundle). A
+    ticket that has exhausted its per-ticket critic-infra cap must be able
+    to move PARKED->ESCALATED directly (the human floor)."""
+    add_ticket(store, "t-parked-escalate", state=PARKED)
+
+    result = transition(store, "t-parked-escalate", ESCALATED, expected_from=PARKED)
+
+    assert result == {"ticket": "t-parked-escalate", "from": PARKED, "to": ESCALATED}
+    assert store.get_ticket("t-parked-escalate")["state"] == ESCALATED
+
+
+# --- .107 #1-3: decide_critic_infra -----------------------------------------
+
+
+def test_decide_critic_infra_below_cap_does_not_escalate() -> None:
+    ticket_row = {"critic_infra_failures": 0}
+
+    decision = decide_critic_infra(ticket_row, critic_infra_cap=3)
+
+    assert decision.escalate is False
+    assert decision.critic_infra_failures == 1
+    assert decision.escalation_reason is None
+
+
+def test_decide_critic_infra_at_cap_escalates() -> None:
+    ticket_row = {"critic_infra_failures": 2}
+
+    decision = decide_critic_infra(ticket_row, critic_infra_cap=3)
+
+    assert decision.escalate is True
+    assert decision.critic_infra_failures == 3
+    assert decision.escalation_reason == "critic-infra-cap"
+
+
+def test_decide_critic_infra_over_cap_still_escalates() -> None:
+    ticket_row = {"critic_infra_failures": 5}
+
+    decision = decide_critic_infra(ticket_row, critic_infra_cap=3)
+
+    assert decision.escalate is True
+    assert decision.critic_infra_failures == 6
+    assert decision.escalation_reason == "critic-infra-cap"
+
+
+def test_decide_critic_infra_missing_counter_defaults_to_zero() -> None:
+    """A ticket row with no `critic_infra_failures` key at all (e.g. a
+    freshly-migrated pre-.107 row read before the column ever gets set)
+    is treated as 0, same as the `or 0` convention used throughout this
+    module for other counters."""
+    decision = decide_critic_infra({}, critic_infra_cap=3)
+
+    assert decision.escalate is False
+    assert decision.critic_infra_failures == 1
+
+
+def test_decide_critic_infra_is_pure() -> None:
+    ticket_row = {"critic_infra_failures": 1}
+    ticket_row_copy = dict(ticket_row)
+
+    decide_critic_infra(ticket_row, critic_infra_cap=3)
+
+    assert ticket_row == ticket_row_copy
+
+
+def test_decide_critic_infra_returns_dataclass_type() -> None:
+    decision = decide_critic_infra({"critic_infra_failures": 0}, critic_infra_cap=3)
+    assert isinstance(decision, CriticInfraDecision)
 
 
 # --- 23. test_record_disposition_builds_valid_event -------------------------

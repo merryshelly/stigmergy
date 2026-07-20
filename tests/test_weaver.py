@@ -1354,3 +1354,110 @@ def test_filing_exception_never_crashes_the_weaver(tmp_path, store, plane, monke
     result = weaver.weave(now=1000.0)[0]  # must NOT raise
     assert result.outcome == "landed"
     assert store.get_ticket("t7")["state"] == LANDED
+
+
+# ==========================================================================
+# bead .107: WeaveResult.reason — a structured discriminator distinguishing
+# critic-infra (gate-infra) from CAS-abort (concurrent-staging-move), both
+# of which otherwise share outcome="infra" + FailureClass.INFRA. See
+# build-107-109-spec.md §2(d).
+# ==========================================================================
+
+
+def test_landed_result_has_reason_none(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-reason-landed", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-reason-landed", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "landed"
+    assert result.reason is None
+
+
+def test_critic_infra_result_has_reason_critic_infra(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-reason-infra", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-reason-infra", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_infra_critic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "infra"
+    assert result.reason == "critic-infra"
+
+
+def test_cas_abort_result_has_reason_concurrent_staging_move(tmp_path, store, plane):
+    """CAS-abort (concurrent staging move) is ALSO outcome="infra" but must
+    carry a DIFFERENT `reason` than a genuine critic-infra failure — this is
+    the whole point of the new field (regression guard for daemon.py's new
+    critic-infra-only branch, which must NOT fire on this path)."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(
+        tmp_path, staging_repo, name="t-reason-cas", files={"feature.txt": "x\n"}
+    )
+    add_parked_ticket(store, "t-reason-cas", work_product=bundle)
+
+    class RacingWeaver(Weaver):
+        def _fetch_candidate_into_staging(self, candidate_dir, ticket_id):
+            concurrent_dir = tmp_path / "concurrent-writer-reason"
+            run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(concurrent_dir)])
+            run_git(concurrent_dir, ["checkout", "--quiet", "-b", "staging", "origin/staging"])
+            (concurrent_dir / "concurrent.txt").write_text("a concurrent, out-of-band commit\n")
+            run_git(concurrent_dir, ["add", "concurrent.txt"])
+            run_git(concurrent_dir, ["commit", "--quiet", "-m", "concurrent move"])
+            run_git(concurrent_dir, ["push", "--quiet", "origin", "staging"])
+            super()._fetch_candidate_into_staging(candidate_dir, ticket_id)
+
+    weaver = RacingWeaver(
+        store=store,
+        record_plane=plane,
+        staging_repo=staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+        checker_image="unused",
+        flake_reruns=0,
+        protected_paths=[],
+        journal_path=tmp_path / "journal-reason-cas.jsonl",
+        ctx_of=stub_ctx_of,
+        filing_max_filings=5,
+        filing_max_bytes=16384,
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "infra"
+    assert result.reason == "concurrent-staging-move"
+
+
+def test_rejected_result_has_reason_gate_unmet(tmp_path, store, plane):
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-reason-rej", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-reason-rej", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="unmet", reason="missing tests"),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    assert result.outcome == "rejected"
+    assert result.reason == "gate-unmet"

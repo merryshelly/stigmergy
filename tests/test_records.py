@@ -170,6 +170,11 @@ def test_attempt_kinds_matches_spec_enumeration() -> None:
             # 'report' is the honest attempt_kind for a REPORT event
             # (SPEC §9 enumeration gains this member — follow-up note for SB).
             "report",
+            # bead .107: a per-ticket critic-infra escalation
+            # (PARKED->ESCALATED) is a distinct, queryable outcome from a
+            # dispatch-side 'infra-retry' (SPEC §9 enumeration gains this
+            # member too — follow-up note for SB).
+            "critic-infra",
         }
     )
 

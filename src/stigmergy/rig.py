@@ -63,6 +63,7 @@ CREATE TABLE tickets (
   lease_heartbeat_at   REAL,
   attempts_used        INTEGER NOT NULL DEFAULT 0,
   integration_failures INTEGER NOT NULL DEFAULT 0,
+  critic_infra_failures INTEGER NOT NULL DEFAULT 0,
   current_rung         TEXT,
   created_at           REAL NOT NULL,
   updated_at           REAL NOT NULL
@@ -134,6 +135,7 @@ _TICKET_OPTIONAL_FIELDS = {
     "lease_heartbeat_at",
     "attempts_used",
     "integration_failures",
+    "critic_infra_failures",
     "current_rung",
 }
 
@@ -173,6 +175,34 @@ class RigStore:
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._ensure_filed_tickets_table()
         self._ensure_functional_summary_column()
+        self._ensure_critic_infra_failures_column()
+
+    def _ensure_critic_infra_failures_column(self) -> None:
+        """Self-healing migration (bead .107): add the
+        `critic_infra_failures` column to `tickets` if absent — the
+        per-ticket, PERSISTED consecutive-critic-infra counter behind
+        `decide_critic_infra` (statemachine.py).
+
+        Same guarded-ALTER pattern as `_ensure_functional_summary_column`:
+        idempotent for fresh `.create()` rigs (the column is already in
+        `_SCHEMA_SQL`) and the only migration path for a rig scaffolded
+        before `.107` (schema_version < 5) reopened via plain
+        `RigStore(path)`/`resolve_rig`.
+        """
+        table_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
+        ).fetchone()
+        if table_exists is None:
+            # Fresh store: `.create()` runs `__init__` BEFORE `_SCHEMA_SQL`
+            # builds `tickets`, and that DDL already carries the column — the
+            # ALTER would only ever fire here on a real pre-.107 rig reopen.
+            return
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
+        if "critic_infra_failures" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tickets ADD COLUMN critic_infra_failures INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
 
     def _ensure_functional_summary_column(self) -> None:
         """Self-healing migration (bead .42): add the `functional_summary`
@@ -661,7 +691,7 @@ def _scaffold_rig(rig_root: Path, charter_path: Path, charter: Charter, repo: st
 
     store = RigStore.create(rig_root / "tickets.db")
     try:
-        store.set_meta("schema_version", "4")
+        store.set_meta("schema_version", "5")
         store.set_meta("stigmergy_version", __version__)
         store.set_meta("charter_hash", charter.resolved_hash)
         store.set_meta("rig_name", charter.raw["rig"]["name"])

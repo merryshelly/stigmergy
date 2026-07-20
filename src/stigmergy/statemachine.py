@@ -107,8 +107,12 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     # the weaver to pick up.
     TIER1_GREEN: frozenset({PARKED}),
     # parked->gated: a weave trigger (SPEC §9 "Weave triggers") fires and
-    # picks up the parked bundle for gating.
-    PARKED: frozenset({GATED}),
+    # picks up the parked bundle for gating. parked->escalated (bead .107):
+    # a single ticket's per-ticket critic-infra failures reached the cap
+    # (`decide_critic_infra`) — escalate to the human floor instead of
+    # letting the whole loop take the global circuit-breaker halt for one
+    # poisoned ticket.
+    PARKED: frozenset({GATED, ESCALATED}),
     # gated->landed: critic pass + CAS land. gated->rejected: any gate
     # FAILURE class (critic quality-reject, integration-conflict,
     # integration-regression) — the single edge serves all three; the
@@ -458,6 +462,52 @@ def apply_decision(
         attempts_used=decision.attempts_used,
         current_rung=decision.current_rung,
         integration_failures=decision.integration_failures,
+    )
+
+
+# --- per-ticket critic-infra escalation (bead .107) --------------------------
+
+
+@dataclass(frozen=True)
+class CriticInfraDecision:
+    """The pure output of :func:`decide_critic_infra`: whether this
+    ticket's per-ticket, PERSISTED consecutive-critic-infra streak has
+    reached its cap, plus the resulting counter value to persist. Never
+    itself mutates anything."""
+
+    escalate: bool
+    critic_infra_failures: int
+    escalation_reason: str | None
+
+
+def decide_critic_infra(
+    ticket_row: dict[str, Any], *, critic_infra_cap: int
+) -> CriticInfraDecision:
+    """Decide the outcome of ONE critic-infra weave failure for a parked
+    ticket (bead .107). PURE: reads `ticket_row["critic_infra_failures"]`
+    (defaulting to 0 if absent/None, same convention as `decide_retry`'s
+    own counter reads), increments it, and — at or past
+    ``critic_infra_cap`` — escalates (PARKED->ESCALATED). Mutates nothing,
+    not even ``ticket_row`` itself.
+
+    This is a DIFFERENT, dedicated counter from `integration_failures`
+    (conflating the two would corrupt the integration-failure escalation
+    path — a different failure mode needs a different counter) and is
+    per-ticket + persisted (survives daemon restarts; an in-memory counter
+    would reset and re-livelock on a poisoned ticket).
+
+    ``critic_infra_cap`` MUST be configured below the daemon's global
+    circuit-breaker threshold (`daemon._CIRCUIT_BREAKER_THRESHOLD`, 5) —
+    the charter default (`loop.retries.critic_infra` == 3) preserves this
+    invariant so a single poisoned ticket escalates itself before a
+    genuine multi-ticket infra storm would trip the global halt.
+    """
+    failures = (ticket_row.get("critic_infra_failures") or 0) + 1
+    escalate = failures >= critic_infra_cap
+    return CriticInfraDecision(
+        escalate=escalate,
+        critic_infra_failures=failures,
+        escalation_reason="critic-infra-cap" if escalate else None,
     )
 
 

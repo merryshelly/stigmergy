@@ -76,7 +76,16 @@ DEFAULT_CHARTER: dict[str, Any] = {
             "filed_tickets": 5,
             "filed_ticket_bytes": 16384,
         },
-        "retries": {"attempts_per_rung": 3, "integration_failures": 2, "flake_reruns": 2},
+        # bead .107: `critic_infra` (default 3) MUST stay strictly below
+        # the daemon's `_CIRCUIT_BREAKER_THRESHOLD` (5) — a single
+        # poisoned ticket must escalate itself to the human floor before a
+        # genuine multi-ticket infra storm would trip the global halt.
+        "retries": {
+            "attempts_per_rung": 3,
+            "integration_failures": 2,
+            "flake_reruns": 2,
+            "critic_infra": 3,
+        },
         "cadences": {"staging_quiescent_tickets": 3, "staging_max_wait_seconds": 7200},
         "timers": {
             "poll_seconds": 15,
@@ -130,7 +139,12 @@ _KNOWN_DISPATCH_LIMITS_KEYS = {
     "filed_tickets",
     "filed_ticket_bytes",
 }
-_KNOWN_RETRIES_KEYS = {"attempts_per_rung", "integration_failures", "flake_reruns"}
+_KNOWN_RETRIES_KEYS = {
+    "attempts_per_rung",
+    "integration_failures",
+    "flake_reruns",
+    "critic_infra",
+}
 _KNOWN_CADENCES_KEYS = {"staging_quiescent_tickets", "staging_max_wait_seconds"}
 # loop.timers is intentionally open-ended: any key is legal as long as it is
 # `_seconds`-suffixed (rule 6) — there is no fixed key set for this section.
@@ -575,6 +589,7 @@ def _validate_loop(loop_cfg: Any) -> None:
     _validate_positive_int(retries, "attempts_per_rung", "loop.retries.attempts_per_rung")
     _validate_positive_int(retries, "integration_failures", "loop.retries.integration_failures")
     _validate_positive_int(retries, "flake_reruns", "loop.retries.flake_reruns")
+    _validate_positive_int(retries, "critic_infra", "loop.retries.critic_infra")
 
     cadences = loop_cfg.get("cadences", {})
     _validate_keys(cadences, _KNOWN_CADENCES_KEYS, "loop.cadences")

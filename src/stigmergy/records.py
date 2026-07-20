@@ -113,6 +113,12 @@ _LLM_INVOCATION_TYPES = frozenset({EventType.DISPATCH, EventType.GATE, EventType
 # a ticket attempt; `initial` would be a recorded lie in an audit log, so a
 # dedicated honest value is used. SPEC §9's enumeration gains this member — a
 # tracked follow-up note for SB's next review (see bead42-build-spec.md).
+# `critic-infra` (bead .107): a per-ticket critic-infra escalation
+# (PARKED->ESCALATED, `decide_critic_infra`) is a distinct, queryable
+# outcome from a dispatch-side `infra-retry` — reusing `infra-retry` here
+# would be a recorded lie in an audit log (same precedent as `report`
+# above). SPEC §9's enumeration gains this member too — another tracked
+# follow-up note for SB's next review.
 ATTEMPT_KINDS: frozenset[str] = frozenset(
     {
         "initial",
@@ -123,6 +129,7 @@ ATTEMPT_KINDS: frozenset[str] = frozenset(
         "stepup-initial",
         "clean-restart",
         "report",
+        "critic-infra",
     }
 )
 

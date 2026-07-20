@@ -168,6 +168,7 @@ class WeaveResult:
     check_results: list[CheckResult] | None
     flagged_for_human: bool
     detail: str
+    reason: str | None = None
 
 
 class Weaver:
@@ -564,6 +565,7 @@ class Weaver:
                 check_results=check_results,
                 flagged_for_human=flagged,
                 detail="critic MET; CAS land succeeded",
+                reason=None,
             )
         finally:
             self._cleanup_candidate(candidate_dir)
@@ -645,6 +647,7 @@ class Weaver:
             check_results=check_results,
             flagged_for_human=flagged,
             detail=detail,
+            reason=reason,
         )
 
     @staticmethod
