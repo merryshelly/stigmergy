@@ -59,6 +59,17 @@ class CharterError(Exception):
     """Raised on any charter validation failure. Fail closed."""
 
 
+# bead .107/review-followup: the daemon's global circuit-breaker threshold
+# (SPEC §9, bead .22 build spec §3) — the SINGLE source of truth for both
+# `daemon.py` (which imports this constant rather than defining its own)
+# and this module's own `_validate_loop` check that `loop.retries.
+# critic_infra` stays strictly below it. Defined here, not in daemon.py,
+# so charter validation can enforce the invariant without daemon.py
+# importing charter.py importing daemon.py (a cycle) — charter.py has no
+# dependency on daemon.py either way.
+CIRCUIT_BREAKER_THRESHOLD = 5
+
+
 # --- in-code defaults (SPEC §5) -------------------------------------------
 #
 # Only `[loop.*]` policy knobs get in-code defaults — everything else
@@ -77,9 +88,11 @@ DEFAULT_CHARTER: dict[str, Any] = {
             "filed_ticket_bytes": 16384,
         },
         # bead .107: `critic_infra` (default 3) MUST stay strictly below
-        # the daemon's `_CIRCUIT_BREAKER_THRESHOLD` (5) — a single
-        # poisoned ticket must escalate itself to the human floor before a
-        # genuine multi-ticket infra storm would trip the global halt.
+        # `CIRCUIT_BREAKER_THRESHOLD` (5) — a single poisoned ticket must
+        # escalate itself to the human floor before a genuine multi-ticket
+        # infra storm would trip the global halt. `_validate_loop` enforces
+        # this invariant at charter-load time (fail closed), not just here
+        # in the comment.
         "retries": {
             "attempts_per_rung": 3,
             "integration_failures": 2,
@@ -590,6 +603,14 @@ def _validate_loop(loop_cfg: Any) -> None:
     _validate_positive_int(retries, "integration_failures", "loop.retries.integration_failures")
     _validate_positive_int(retries, "flake_reruns", "loop.retries.flake_reruns")
     _validate_positive_int(retries, "critic_infra", "loop.retries.critic_infra")
+    if retries["critic_infra"] >= CIRCUIT_BREAKER_THRESHOLD:
+        raise CharterError(
+            f"loop.retries.critic_infra ({retries['critic_infra']}) must be strictly less "
+            f"than the circuit-breaker threshold ({CIRCUIT_BREAKER_THRESHOLD}) — otherwise "
+            "the global halt can fire before a single poisoned ticket escalates itself, "
+            "reconstituting the single-ticket livelock-then-global-halt incident bead .107 "
+            "fixed"
+        )
 
     cadences = loop_cfg.get("cadences", {})
     _validate_keys(cadences, _KNOWN_CADENCES_KEYS, "loop.cadences")

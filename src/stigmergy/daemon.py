@@ -160,7 +160,11 @@ from stigmergy import checks, egress
 from stigmergy import intake as intake_module
 from stigmergy import recover as recover_module
 from stigmergy import triggers as triggers_module
-from stigmergy.charter import Charter, resolve_check_resources
+from stigmergy.charter import (
+    CIRCUIT_BREAKER_THRESHOLD,
+    Charter,
+    resolve_check_resources,
+)
 from stigmergy.checks import CheckOutcome, CheckResult
 from stigmergy.dispatch import DispatchPlan, prepare_dispatch, select_lane
 from stigmergy.drivers import claude_code
@@ -218,7 +222,13 @@ HALT_EXIT_CODE = 3
 # pattern for what the charter doesn't expose a knob for yet.
 _BACKOFF_BASE_SECONDS = 5.0
 _BACKOFF_CAP_SECONDS = 300.0
-_CIRCUIT_BREAKER_THRESHOLD = 5
+# review-followup (.107/.109): the threshold's single source of truth now
+# lives in charter.py (`CIRCUIT_BREAKER_THRESHOLD`) so charter validation
+# can enforce `loop.retries.critic_infra < threshold` at charter-load time
+# without a circular import (charter.py does not import daemon.py). This
+# module-private alias keeps every existing `_CIRCUIT_BREAKER_THRESHOLD`
+# reference in this file (and in tests) unchanged.
+_CIRCUIT_BREAKER_THRESHOLD = CIRCUIT_BREAKER_THRESHOLD
 
 _REQUIRED_RIG_PATH_KEYS = (
     "context_root",
@@ -993,10 +1003,16 @@ class Daemon:
                     self._persist_critic_infra_escalation_notification(
                         ticket_id, decision, now=now
                     )
-                    # The ticket is now handled (escalated to the human
-                    # floor) — do NOT feed the global storm backstop for
-                    # this poisoned-but-now-resolved ticket.
-                    self._reset_infra_trip_counter()
+                    # review-followup: do NOT reset the global infra-trip
+                    # counter here. This branch already omits
+                    # _bump_infra_trip_counter() above, which is enough to
+                    # keep a single poisoned ticket's escalation from ever
+                    # feeding the global halt on its own; resetting it too
+                    # would ALSO erase any storm evidence already
+                    # accumulated by OTHER tickets (dispatch-side infra or
+                    # other parked tickets' below-cap critic-infra bumps)
+                    # in this same poll or a prior one — masking a genuine
+                    # multi-ticket infra storm. Neither feed nor forgive.
                 else:
                     # Below cap: stays PARKED (re-weave next cadence), and
                     # still feeds the global storm backstop.
@@ -1007,9 +1023,20 @@ class Daemon:
                 # unchanged behavior. Ticket is ALREADY at PARKED (weaver's
                 # own contract). PARKED->POOL is illegal and must never be
                 # risked: do NOTHING state-machine-wise, never call
-                # decide_retry/apply_decision on this branch.
+                # decide_retry/apply_decision on this branch. Still feeds
+                # the global storm backstop as always.
                 self._bump_infra_trip_counter()
                 any_infra = True
+                # review-followup: a CAS-abort (reason=="concurrent-staging-
+                # move") is produced ONLY after the critic returned a valid
+                # MET verdict (weaver.py's CAS-land path is reached AFTER
+                # critic.judge() succeeds) — the consecutive-critic-infra
+                # streak is genuinely broken here, exactly like the landed/
+                # rejected branches above. Reset the per-ticket counter too
+                # (the global storm counter above is UNAFFECTED — CAS-abort
+                # is still a transient infra event for storm accounting).
+                if result.reason == "concurrent-staging-move":
+                    self._store.update_ticket(ticket_id, critic_infra_failures=0)
             else:  # "rejected" | "integration-conflict" | "integration-regression"
                 ctx = self._weave_retry_ctx(ticket_id)
                 assert result.failure_class is not None  # noqa: S101 - non-landing => set

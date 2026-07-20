@@ -1221,10 +1221,24 @@ def test_107_11_cas_abort_infra_does_not_use_per_ticket_escalation(env: Env) -> 
     """.107 #11: CAS-abort infra (reason="concurrent-staging-move") still
     goes through the OLD path — bumps the global counter, leaves the
     ticket PARKED, and is NEVER per-ticket-escalated (regression guard:
-    the new critic-infra-only branch must not fire for this reason)."""
-    add_parked_ticket_for_weave(env, "t-cas-abort", work_product="unused.bundle")
+    the new critic-infra-only branch must not fire for this reason).
 
-    weaver = ScriptedWeaver([[cas_abort_weave_result("t-cas-abort")]])
+    review-followup (Fix 3): a CAS-abort is produced ONLY after the critic
+    returned a valid MET verdict (weaver.py's CAS-land path), so it also
+    RESETS the per-ticket `critic_infra_failures` streak — seeded here at a
+    non-zero value (2) so "reset" and "never incremented" are
+    distinguishable (the .107-era version of this test started from 0 and
+    could not tell the two apart). A later critic-infra failure then starts
+    a fresh streak at 1, not 3."""
+    add_parked_ticket_for_weave(env, "t-cas-abort", work_product="unused.bundle")
+    env.store.update_ticket("t-cas-abort", critic_infra_failures=2)
+
+    weaver = ScriptedWeaver(
+        [
+            [cas_abort_weave_result("t-cas-abort")],
+            [critic_infra_weave_result("t-cas-abort")],
+        ]
+    )
     daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
 
     summary = daemon.poll_once()
@@ -1239,6 +1253,61 @@ def test_107_11_cas_abort_infra_does_not_use_per_ticket_escalation(env: Env) -> 
     escalation_intents = [i for i in env.notification_store.all_intents() if i.kind == "escalation"]
     assert escalation_intents == []
 
+    # A later critic-infra failure starts a FRESH streak at 1 (not 3) —
+    # proving the CAS-abort genuinely broke the prior consecutive streak.
+    daemon.poll_once()
+    row = env.store.get_ticket("t-cas-abort")
+    assert row["critic_infra_failures"] == 1
+
+
+def test_review_followup_multi_ticket_critic_storm_still_halts(env: Env) -> None:
+    """review-followup (Fix 2): per-ticket escalation must NOT erase
+    accumulated global storm evidence contributed by OTHER tickets. Ticket
+    `t-storm-a` fails critic-infra through to its escalation (cap-th
+    consecutive failure) while `t-storm-b`/`t-storm-c` are still
+    below-cap in the SAME poll — a genuine multi-ticket critic storm must
+    still trip the global circuit breaker, even though one ticket's
+    escalation happens along the way. Before the fix, the escalation
+    branch's `_reset_infra_trip_counter()` call zeroes this accumulated
+    evidence and the storm never halts (see the cross-family review's
+    reproduction: counts 2, 4, then 0 for two tickets)."""
+    cap = env.charter.raw["loop"]["retries"]["critic_infra"]
+    assert cap == 3  # default; this test's arithmetic assumes the default cap
+    for tid in ("t-storm-a", "t-storm-b", "t-storm-c"):
+        add_parked_ticket_for_weave(env, tid, work_product="unused.bundle")
+
+    weaver = ScriptedWeaver(
+        [
+            [critic_infra_weave_result("t-storm-a")],
+            [
+                critic_infra_weave_result("t-storm-a"),
+                critic_infra_weave_result("t-storm-b"),
+            ],
+            [
+                critic_infra_weave_result("t-storm-a"),
+                critic_infra_weave_result("t-storm-b"),
+                critic_infra_weave_result("t-storm-c"),
+            ],
+        ]
+    )
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
+
+    summaries = [daemon.poll_once() for _ in range(3)]
+
+    # poll 1: t-storm-a's 1st (below-cap) failure -> global=1.
+    assert summaries[0].should_halt is False
+    # poll 2: t-storm-a's 2nd (below-cap), t-storm-b's 1st (below-cap) -> global=3.
+    assert summaries[1].should_halt is False
+    # poll 3: t-storm-a's 3rd failure == cap -> ESCALATES (must stay neutral,
+    # not reset); t-storm-b's 2nd + t-storm-c's 1st (both below-cap) bump ->
+    # global = 3 + 1 + 1 = 5 == threshold -> the storm still halts.
+    assert summaries[2].should_halt is True
+    assert summaries[2].consecutive_infra_trips == _CIRCUIT_BREAKER_THRESHOLD
+
+    row_a = env.store.get_ticket("t-storm-a")
+    assert row_a["state"] == ESCALATED
+    assert row_a["critic_infra_failures"] == cap
+
 
 # ==========================================================================
 # bead .109 — diagnosability: log the circuit-breaker halt reason. See
@@ -1250,16 +1319,35 @@ def test_109_3_circuit_breaker_halt_logs_breaker_and_consecutive_count(
     env: Env, caplog: pytest.LogCaptureFixture
 ) -> None:
     """.109 #3: when the poll reaches should_halt=True, a daemon LOG record
-    at ERROR (or WARNING) level names the circuit breaker + the consecutive
-    trip count — not just the persisted ntfy intent."""
-    add_dispatchable_ticket(env, "t-109-halt")
-    spawn_fn = AlwaysInfraSpawn()
-    daemon = make_daemon(env, spawn_fn=spawn_fn)
+    at ERROR (or WARNING) level names the circuit breaker + the EXACT
+    consecutive trip count — not just the threshold, and not just the
+    persisted ntfy intent.
+
+    review-followup (Fix 4): the count-bearing assertion must be provable.
+    Driving the count to exactly `_CIRCUIT_BREAKER_THRESHOLD` (as the
+    original version of this test did) makes count and threshold the SAME
+    number, so an implementation that logs only the threshold ("...
+    threshold 5") and omits the actual consecutive count would still
+    satisfy `str(_CIRCUIT_BREAKER_THRESHOLD) in message` — the test could
+    never catch that omission. Here a single weave batch of SIX distinct
+    tickets each failing critic-infra below their own per-ticket cap bumps
+    the global counter six times in ONE poll, so `consecutive_infra_trips
+    == 6` while the threshold stays 5 — count and threshold are now
+    different numbers, and the log line must carry the count-specific
+    phrase separately from the threshold text."""
+    tickets = [f"t-109-halt-{i}" for i in range(6)]
+    for tid in tickets:
+        add_parked_ticket_for_weave(env, tid, work_product="unused.bundle")
+
+    weaver = ScriptedWeaver([[critic_infra_weave_result(tid) for tid in tickets]])
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver)
 
     with caplog.at_level(logging.WARNING, logger="stigmergy.daemon"):
-        summaries = [daemon.poll_once() for _ in range(_CIRCUIT_BREAKER_THRESHOLD)]
+        summary = daemon.poll_once()
 
-    assert summaries[-1].should_halt is True
+    assert summary.should_halt is True
+    assert summary.consecutive_infra_trips == 6
+    assert summary.consecutive_infra_trips != _CIRCUIT_BREAKER_THRESHOLD
 
     halt_records = [
         r
@@ -1270,6 +1358,7 @@ def test_109_3_circuit_breaker_halt_logs_breaker_and_consecutive_count(
     message = halt_records[0].getMessage()
     assert "circuit breaker" in message.lower()
     assert str(_CIRCUIT_BREAKER_THRESHOLD) in message
+    assert "6 consecutive infra trips" in message
 
 
 # ==========================================================================

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from stigmergy.charter import (
+    CIRCUIT_BREAKER_THRESHOLD,
     Charter,
     CharterError,
     classify_diff,
@@ -328,6 +329,45 @@ def test_critic_infra_negative_rejected(tmp_path: Path) -> None:
     charter_path = make_charter(tmp_path, content)
     with pytest.raises(CharterError):
         load_charter(charter_path, env={})
+
+
+def test_critic_infra_at_circuit_breaker_threshold_rejected(tmp_path: Path) -> None:
+    """review-followup: `critic_infra == CIRCUIT_BREAKER_THRESHOLD` (5) must
+    be rejected — at this value the global breaker can fire at exactly the
+    same trip count a single poisoned ticket would need to escalate itself,
+    defeating bead .107's per-ticket escalation before it ever helps."""
+    assert CIRCUIT_BREAKER_THRESHOLD == 5
+    content = mutate(
+        "integration_failures = 2\nflake_reruns = 2\n",
+        "integration_failures = 2\nflake_reruns = 2\ncritic_infra = 5\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_critic_infra_above_circuit_breaker_threshold_rejected(tmp_path: Path) -> None:
+    """review-followup: `critic_infra = 6` (> threshold) is the exact
+    footgun the cross-family review flagged — an operator's "let it retry a
+    bit more" edit must be rejected, not silently reconstitute the
+    single-ticket livelock-then-global-halt incident bead .107 fixed."""
+    content = mutate(
+        "integration_failures = 2\nflake_reruns = 2\n",
+        "integration_failures = 2\nflake_reruns = 2\ncritic_infra = 6\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_critic_infra_env_override_at_threshold_rejected(tmp_path: Path) -> None:
+    """review-followup: the invariant is enforced on the MERGED (post-env-
+    override) value, not just the file/default value — an
+    `SG_LOOP__RETRIES__CRITIC_INFRA` override that lands on/above the
+    threshold must be rejected exactly like a bad file value."""
+    charter_path = make_charter(tmp_path, BASE_CHARTER_TOML)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={"SG_LOOP__RETRIES__CRITIC_INFRA": "5"})
 
 
 # --- env overrides -----------------------------------------------------------
