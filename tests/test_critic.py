@@ -203,6 +203,85 @@ def test_malformed_response_is_infra_not_rejection():
 
 
 # --------------------------------------------------------------------------
+# Bounded repair-retry on a malformed verdict (bead .108)
+# --------------------------------------------------------------------------
+
+
+class SequenceClient:
+    """One-shot client stand-in returning a different canned response per
+    successive call (exercises the bead .108 repair-retry). Fails loudly if
+    called more times than responses were scripted, so a test expecting N
+    calls catches an unexpected (N+1)th."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    def __call__(self, prompt, *, model, **kwargs):
+        idx = len(self.calls)
+        self.calls.append({"prompt": prompt, "model": model, "kwargs": kwargs})
+        assert idx < len(self._responses), (
+            f"client called {idx + 1} times; only {len(self._responses)} responses scripted"
+        )
+        return self._responses[idx]
+
+
+def _incomplete_response():
+    # A verdict that OMITS reason + severity — the exact self-referential
+    # failure mode from the gatefix01/evidence-103 dogfood (bead .108).
+    return {"outcome": "unmet", "tier": 2}
+
+
+def test_judge_repairs_malformed_verdict_on_one_retry():
+    # First call: incomplete verdict (missing reason/severity). Second call
+    # (the repair): a complete verdict. judge must return the repaired verdict.
+    client = SequenceClient([_incomplete_response(), _ok_response(reason="now complete")])
+    critic = _critic(client)
+    verdict, _gate_fields, _filed = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert isinstance(verdict, Verdict)
+    assert verdict.reason == "now complete"
+    # Exactly one repair-retry: the client was called twice, no more.
+    assert len(client.calls) == 2
+    # The repair prompt is DISTINCT from the first, preserves it verbatim, and
+    # names the defect + demands the missing fields.
+    first_prompt = client.calls[0]["prompt"]
+    repair_prompt = client.calls[1]["prompt"]
+    assert repair_prompt != first_prompt
+    assert repair_prompt.startswith(first_prompt)  # original preserved, correction appended
+    assert "REPAIR REQUEST" in repair_prompt
+    assert "reason" in repair_prompt and "severity" in repair_prompt
+
+
+def test_judge_repair_retry_is_bounded_to_one_then_infra():
+    # BOTH calls return an incomplete verdict -> CriticInfraError after exactly
+    # one repair-retry (client called exactly twice, never a 3rd).
+    client = SequenceClient([_incomplete_response(), _incomplete_response()])
+    critic = _critic(client)
+    with pytest.raises(CriticInfraError) as excinfo:
+        critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert len(client.calls) == 2
+    assert "after one repair-retry" in str(excinfo.value)
+
+
+def test_judge_transport_failure_is_not_repair_retried():
+    # A client-side/transport exception is INFRA and must NOT be repair-retried
+    # (no response came back to parse) — client called exactly once.
+    client = StubClient(raises=RuntimeError("provider 503"))
+    critic = _critic(client)
+    with pytest.raises(CriticInfraError):
+        critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert len(client.calls) == 1
+
+
+def test_judge_valid_first_response_does_not_repair_retry():
+    # A valid verdict on the first call spends no repair call.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert len(client.calls) == 1
+
+
+# --------------------------------------------------------------------------
 # Severity recorded but does not drive landing (SPEC §4 / D4)
 # --------------------------------------------------------------------------
 
