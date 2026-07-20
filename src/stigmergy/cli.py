@@ -35,7 +35,11 @@ from stigmergy import approval, checks, egress, spend, triage
 from stigmergy.charter import Charter, CharterError, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
-from stigmergy.critic_client import make_critic_client, make_range_critic_client
+from stigmergy.critic_client import (
+    DEFAULT_MAX_TOKENS,
+    make_critic_client,
+    make_range_critic_client,
+)
 from stigmergy.daemon import Daemon, DaemonError
 from stigmergy.filing import file_proposals
 from stigmergy.keyprovider import make_op_key_provider
@@ -277,7 +281,13 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
     critic = Critic.from_prompt_file(
         rig_paths["prompts_dir"] / "critic02",  # hardcoded filename -- see §3.7 note
-        client=make_critic_client(key_provider=critic_key_provider, registry=registry),
+        client=make_critic_client(
+            key_provider=critic_key_provider,
+            registry=registry,
+            # bead .118: charter-overridable verdict-critic output budget
+            # (default 4096) so a long verdict reason can't truncate.
+            max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
+        ),
         model=critic_cfg["model"],
         decoding_params=_critic_decoding_params(critic_cfg),
     )

@@ -27,6 +27,7 @@ import pytest
 from stigmergy.critic import Critic, CriticInfraError
 from stigmergy.critic_client import (
     ANTHROPIC_VERSION,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_RANGE_MAX_TOKENS,
     DEFAULT_TIMEOUT,
     RANGE_REVIEW_TOOL_NAME,
@@ -670,3 +671,69 @@ def test_range_client_tool_input_not_a_dict_raises(registry):
     client = _range_client(registry, http)
     with pytest.raises(CriticClientError):
         client(PROMPT, model="opus", temperature=0.0)
+
+
+# --------------------------------------------------------------------------
+# bead .118: strict tool use + generous max_tokens + stop_reason guard
+# --------------------------------------------------------------------------
+
+
+def test_verdict_tool_is_strict_for_server_side_required_field_enforcement():
+    """Strict tool use compiles the schema into a grammar and constrains
+    sampling, so required fields cannot be omitted. Requires
+    additionalProperties:false on every object, incl. the nested
+    filed_tickets items."""
+    tool = build_verdict_tool()
+    assert tool["strict"] is True
+    schema = tool["input_schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["filed_tickets"]["items"]["additionalProperties"] is False
+
+
+def test_verdict_client_default_max_tokens_is_generous(registry):
+    """A verdict `reason` for a real artifact can exceed 1024 output tokens;
+    at 1024 the tool_use JSON truncates and drops trailing required fields
+    (bead .118 root cause). The default must give room to finish a verdict."""
+    http = FakeHttp()
+    client = make_critic_client(key_provider=_key_provider(), registry=registry, http_post=http)
+    client(PROMPT, model="opus")
+    body = json.loads(http.calls[0]["body"])
+    assert body["max_tokens"] == DEFAULT_MAX_TOKENS
+    assert DEFAULT_MAX_TOKENS >= 4096
+
+
+def test_verdict_client_max_tokens_override_is_honored(registry):
+    http = FakeHttp()
+    client = make_critic_client(
+        key_provider=_key_provider(), registry=registry, http_post=http, max_tokens=8192
+    )
+    client(PROMPT, model="opus")
+    assert json.loads(http.calls[0]["body"])["max_tokens"] == 8192
+
+
+def test_truncated_verdict_raises_specific_error_not_missing_fields(registry):
+    """stop_reason=max_tokens means the tool_use JSON was truncated. Surface
+    THAT specifically, not a misleading downstream 'missing required fields'."""
+    truncated = {
+        "stop_reason": "max_tokens",
+        "content": [{"type": "tool_use", "name": VERDICT_TOOL_NAME, "input": {"tier": 1}}],
+    }
+    client = make_critic_client(
+        key_provider=_key_provider(), registry=registry, http_post=FakeHttp(response=truncated)
+    )
+    with pytest.raises(CriticClientError) as ei:
+        client(PROMPT, model="opus")
+    msg = str(ei.value).lower()
+    assert "max_tokens" in msg or "truncat" in msg
+
+
+def test_refused_verdict_raises_specific_error(registry):
+    """stop_reason=refusal (safety override) surfaces as its own specific
+    error rather than a confusing shape/parse failure."""
+    refused = {"stop_reason": "refusal", "content": []}
+    client = make_critic_client(
+        key_provider=_key_provider(), registry=registry, http_post=FakeHttp(response=refused)
+    )
+    with pytest.raises(CriticClientError) as ei:
+        client(PROMPT, model="opus")
+    assert "refus" in str(ei.value).lower()

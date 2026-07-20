@@ -56,7 +56,11 @@ from stigmergy.registry import Registry
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
-DEFAULT_MAX_TOKENS = 1024
+# bead .118: a verdict `reason` for a real artifact routinely exceeds 1024
+# output tokens; at 1024 the tool_use JSON truncates (stop_reason=max_tokens)
+# and drops trailing required fields -> spurious CriticInfraError. Generous
+# default; charter-overridable via roles.critic.max_tokens.
+DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TIMEOUT = 60.0
 VERDICT_TOOL_NAME = "submit_verdict"
 RANGE_REVIEW_TOOL_NAME = "submit_range_review"
@@ -118,12 +122,22 @@ def build_verdict_tool() -> dict[str, Any]:
     """
     return {
         "name": VERDICT_TOOL_NAME,
+        # bead .118: strict tool use compiles this schema into a grammar and
+        # constrains sampling, so the model cannot omit a `required` field
+        # (server-side enforcement, not a prompting hint). Requires
+        # additionalProperties:false on every object below. GA on the current
+        # opus/sonnet generation; empirically verified with tool_choice=
+        # {type:tool,name:submit_verdict} + the optional filed_tickets field
+        # (2026-07-20 spike). NOTE strict does NOT override max_tokens
+        # truncation -- see DEFAULT_MAX_TOKENS.
+        "strict": True,
         "description": (
             "Submit the final structured verdict for the artifact under review. "
             "Call this exactly once with your judgment."
         ),
         "input_schema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 # Field order is deliberate: `reason` precedes `outcome` so the
                 # model emits its evidence-anchored justification BEFORE it
@@ -158,6 +172,7 @@ def build_verdict_tool() -> dict[str, Any]:
                             "evidence": {"type": "string"},
                         },
                         "required": ["title", "description"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -190,8 +205,22 @@ def _extract_verdict_input(response: dict[str, Any]) -> dict[str, Any]:
 
     Raises :class:`CriticClientError` if `content` is missing/not a list,
     no `type=="tool_use"`/`name==VERDICT_TOOL_NAME` block exists, or the
-    matching block's `input` is not a dict.
+    matching block's `input` is not a dict. A truncated
+    (stop_reason=max_tokens) or refused (stop_reason=refusal) response raises
+    a SPECIFIC error so the real cause is legible instead of a misleading
+    downstream 'missing required fields' (bead .118).
     """
+    stop_reason = response.get("stop_reason")
+    if stop_reason == "max_tokens":
+        raise CriticClientError(
+            "critic verdict truncated at stop_reason=max_tokens (the submit_verdict "
+            "tool_use JSON was cut off, dropping trailing required fields) — raise "
+            "roles.critic.max_tokens"
+        )
+    if stop_reason == "refusal":
+        raise CriticClientError(
+            "critic refused to produce a verdict (stop_reason=refusal)"
+        )
     content = response.get("content")
     if not isinstance(content, list):
         raise CriticClientError(

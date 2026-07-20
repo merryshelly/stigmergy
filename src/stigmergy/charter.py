@@ -165,7 +165,7 @@ _KNOWN_PROMPTS_KEYS = {"dir"}
 _KNOWN_LANE_KEYS = {"selector", "driver", "model", "prompt", "egress", "entry"}
 _KNOWN_STEPUP_KEYS = {"ladder"}
 _KNOWN_ROLES_KEYS = {"critic"}
-_KNOWN_CRITIC_KEYS = {"model", "temperature"}
+_KNOWN_CRITIC_KEYS = {"model", "temperature", "max_tokens"}
 _KNOWN_MODELS_KEYS = {"registry"}
 _KNOWN_EGRESS_GROUP_KEYS = {"hosts"}
 _KNOWN_NOTIFY_KEYS = {"ntfy_topic"}
@@ -566,6 +566,10 @@ def _validate_roles_keys(roles_cfg: Any) -> None:
     critic_cfg = roles_cfg.get("critic")
     if critic_cfg is not None:
         _validate_keys(critic_cfg, _KNOWN_CRITIC_KEYS, "roles.critic")
+        # bead .118: optional per-rig verdict-critic output budget. Must be a
+        # positive int when present; absent -> critic_client.DEFAULT_MAX_TOKENS.
+        if "max_tokens" in critic_cfg:
+            _validate_positive_int(critic_cfg, "max_tokens", "roles.critic.max_tokens")
 
 
 def _validate_egress_keys(egress_cfg: Any) -> None:

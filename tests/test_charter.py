@@ -700,3 +700,24 @@ def test_provision_unknown_key_rejected(tmp_path: Path) -> None:
     content = BASE_CHARTER_TOML + '\n[provision]\npip = ["ruff"]\nbogus_key = 1\n'
     with pytest.raises(CharterError):
         load_charter(make_charter(tmp_path, content), env={})
+
+
+# --- bead .118: roles.critic.max_tokens (optional, positive int) -----------
+
+
+def test_critic_max_tokens_accepted(tmp_path: Path) -> None:
+    content = mutate(
+        '[roles.critic]\nmodel = "opus"',
+        '[roles.critic]\nmodel = "opus"\nmax_tokens = 8192',
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["roles"]["critic"]["max_tokens"] == 8192
+
+
+def test_critic_max_tokens_must_be_positive_int(tmp_path: Path) -> None:
+    content = mutate(
+        '[roles.critic]\nmodel = "opus"',
+        '[roles.critic]\nmodel = "opus"\nmax_tokens = 0',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
