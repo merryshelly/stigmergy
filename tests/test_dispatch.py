@@ -23,6 +23,7 @@ from stigmergy.dispatch import (
     _NAME_RETRY_LIMIT,
     _WORDLIST_PATH,
     DispatchError,
+    PriorEvidence,
     assemble_task_pack,
     create_work_clone,
     generate_worker_name,
@@ -392,6 +393,84 @@ def test_case10_prompt_verbatim_not_reinterpreted(tmp_path: Path) -> None:
 # ==========================================================================
 # Per-dispatch clone. Cases 11-12.
 # ==========================================================================
+
+
+def test_prior_evidence_renders_into_prompt(tmp_path: Path) -> None:
+    # bead .29: a retry dispatch's PriorEvidence renders into the $prior_evidence
+    # slot as DATA describing the prior failure (kind + critic reason + note).
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    dest = tmp_path / "task_pack"
+    prior = PriorEvidence(
+        attempt_kind="critic-revision",
+        critic_reason="rubric item 2 UNMET: missing null check",
+        failure_note="gate-unmet",
+    )
+    assemble_task_pack(
+        {"goal": "g"},
+        context_root=context_root,
+        repo_root=repo_root,
+        prompt_template="EVIDENCE:\n$prior_evidence",
+        dest=dest,
+        prior_evidence=prior,
+    )
+    text = (dest / "prompt.md").read_text()
+    assert "did NOT land" in text
+    assert "critic-revision" in text
+    assert "rubric item 2 UNMET: missing null check" in text
+    assert "gate-unmet" in text
+
+
+def test_prior_evidence_renders_failing_check_output(tmp_path: Path) -> None:
+    # bead .29: a tier1-repair retry surfaces the prior failing check output.
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    dest = tmp_path / "task_pack"
+    prior = PriorEvidence(
+        attempt_kind="tier1-repair",
+        check_output="tests/test_foo.py::test_bar FAILED\nAssertionError: 1 != 2",
+    )
+    assemble_task_pack(
+        {"goal": "g"},
+        context_root=context_root,
+        repo_root=repo_root,
+        prompt_template="$prior_evidence",
+        dest=dest,
+        prior_evidence=prior,
+    )
+    text = (dest / "prompt.md").read_text()
+    assert "test_bar FAILED" in text
+    assert "AssertionError: 1 != 2" in text
+
+
+def test_no_prior_evidence_renders_first_attempt(tmp_path: Path) -> None:
+    # bead .29: an initial dispatch (no prior evidence) says so plainly.
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    dest = tmp_path / "task_pack"
+    assemble_task_pack(
+        {"goal": "g"},
+        context_root=context_root,
+        repo_root=repo_root,
+        prompt_template="EVIDENCE:\n$prior_evidence",
+        dest=dest,
+    )
+    text = (dest / "prompt.md").read_text()
+    assert "first attempt" in text
+
+
+def test_real_code01_has_prior_evidence_slot() -> None:
+    # bead .29: the reviewed code01 artifact carries the $prior_evidence slot
+    # (guards against the slot being dropped; the D13 prompt change is
+    # flagged for operator sign-off before live use).
+    code01 = Path(__file__).resolve().parents[1] / "prompts" / "code01"
+    assert "$prior_evidence" in code01.read_text(encoding="utf-8")
 
 
 def test_case11_create_work_clone_shape_and_no_shared_objects(tmp_path: Path) -> None:

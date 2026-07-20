@@ -166,7 +166,7 @@ from stigmergy.charter import (
     resolve_check_resources,
 )
 from stigmergy.checks import CheckOutcome, CheckResult
-from stigmergy.dispatch import DispatchPlan, prepare_dispatch, select_lane
+from stigmergy.dispatch import DispatchPlan, PriorEvidence, prepare_dispatch, select_lane
 from stigmergy.drivers import claude_code
 from stigmergy.drivers.claude_code import DispatchResult, DispatchStatus
 from stigmergy.egress import EgressHandle
@@ -551,6 +551,7 @@ class Daemon:
             image=self._image,
             egress_socket=egress_socket,
             relay_socket=relay_socket,
+            prior_evidence=self._gather_prior_evidence(ticket_id),
         )
         # Reconcile the ticket's lease_dispatch_id to the REAL dispatch
         # identity now that prepare_dispatch has generated it — see module
@@ -928,6 +929,57 @@ class Daemon:
                 if isinstance(kind, str) and kind:
                     return kind
         return "initial"
+
+    def _gather_prior_evidence(self, ticket_id: str) -> PriorEvidence | None:
+        """Bead .29: reconstruct the ticket's most-recent prior-attempt
+        failure evidence from the record plane, to thread into a RETRY
+        dispatch's task pack (SPEC §9 "each [retry] carries the failure
+        evidence"). `None` for a first (initial) dispatch. Evidence is
+        selected by the retry kind (`_last_attempt_kind`), mirroring the
+        `AttemptDecision` that produced it: a tier1/integration retry carries
+        the prior failing check output; a critic-revision carries the
+        critic's reason; any retry carries the most recent non-empty
+        disposition reason as a failure note. This is the informational
+        channel only — physically re-applying the prior work product to the
+        fresh clone (`pre_apply_prior`) is deferred (see `PriorEvidence`)."""
+        attempt_kind = self._last_attempt_kind(ticket_id)
+        if attempt_kind == "initial":
+            return None
+        wants_check = attempt_kind in ("tier1-repair", "integration-reconcile")
+        wants_critic = attempt_kind == "critic-revision"
+        failure_note: str | None = None
+        critic_reason: str | None = None
+        check_output: str | None = None
+        _failing = (CheckOutcome.FAIL.value, CheckOutcome.ERROR.value)
+        for ev in reversed(self._record_plane.read_events()):
+            if ev.get("ticket") != ticket_id:
+                continue
+            etype = ev.get("event_type")
+            if failure_note is None and etype == EventType.DISPOSITION.value:
+                reason = ev.get("reason")
+                if isinstance(reason, str) and reason:
+                    failure_note = reason
+            elif wants_critic and critic_reason is None and etype == EventType.GATE.value:
+                reason = ev.get("reason")
+                if isinstance(reason, str) and reason:
+                    critic_reason = reason
+            elif wants_check and check_output is None and etype == EventType.CHECK.value:
+                if ev.get("outcome") in _failing:
+                    out = ev.get("output")
+                    if isinstance(out, str) and out:
+                        check_output = out
+            if (
+                failure_note is not None
+                and (critic_reason is not None or not wants_critic)
+                and (check_output is not None or not wants_check)
+            ):
+                break
+        return PriorEvidence(
+            attempt_kind=attempt_kind,
+            check_output=check_output,
+            critic_reason=critic_reason,
+            failure_note=failure_note,
+        )
 
     # -- weave ------------------------------------------------------------------
 

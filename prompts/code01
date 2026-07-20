@@ -42,6 +42,10 @@ $tier1_checks
 </tier1_checks>
 </ticket>
 
+<prior_attempt>
+$prior_evidence
+</prior_attempt>
+
 <workflow>
 1. Read every file under /task/context/.
 2. Explore the code in /work that this ticket touches before changing it.

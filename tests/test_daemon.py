@@ -960,6 +960,39 @@ def test_case8_tier1_check_failure_retries_never_reaches_parked(env: Env) -> Non
 
 
 # ==========================================================================
+# bead .29: retries carry prior failure evidence (reconstructed from records)
+# ==========================================================================
+
+
+def test_29_prior_evidence_reconstructed_from_a_real_tier1_failure(env: Env) -> None:
+    """.29: after a REAL Tier-1 failure writes real CHECK(fail)+DISPOSITION
+    events, _gather_prior_evidence reconstructs the failing check output and
+    the tier1-repair kind for the next (retry) dispatch — retries are no
+    longer blank paper (SPEC §9). Not a stubbed evidence string: the events
+    are produced by an actual failing poll, exactly like case 8."""
+    add_dispatchable_ticket(env, "t-29")
+    spawn_fn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    run_checks_fn = ScriptedChecks([pass_result("lint"), fail_result("pytest")])
+    daemon = make_daemon(env, spawn_fn=spawn_fn, run_checks_fn=run_checks_fn)
+
+    daemon.poll_once()  # fails Tier-1 -> real CHECK(fail,'boom') + DISPOSITION(tier1-repair)
+
+    prior = daemon._gather_prior_evidence("t-29")
+    assert prior is not None
+    assert prior.attempt_kind == "tier1-repair"
+    assert prior.check_output is not None
+    assert "boom" in prior.check_output  # fail_result('pytest') output
+
+
+def test_29_prior_evidence_is_none_on_initial_dispatch(env: Env) -> None:
+    """.29: a ticket with no prior disposition has no prior evidence — the
+    first attempt is blank paper by definition, and must not fabricate any."""
+    add_dispatchable_ticket(env, "t-29b")
+    daemon = make_daemon(env, spawn_fn=ScriptedSpawn([make_result(DispatchStatus.DONE)]))
+    assert daemon._gather_prior_evidence("t-29b") is None
+
+
+# ==========================================================================
 # case 9: FLAKY counts as green (prove-can-fail priority)
 # ==========================================================================
 
