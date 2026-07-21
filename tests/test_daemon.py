@@ -1722,6 +1722,131 @@ def test_case20_spend_exhaustion_blocks_claims_but_allows_final_weave(env: Env) 
 
 
 # ==========================================================================
+# Real gate-call USD leash wiring: record_gate is called for weave results
+# with real token usage on both MET and UNMET paths
+# ==========================================================================
+
+
+class SpySpendLeashWithGateTracking(SpendLeash):
+    """Extends SpySpendLeash to track record_gate calls with their model and tokens."""
+
+    def __init__(self, budgets: Budgets, registry: Any) -> None:
+        super().__init__(budgets, registry)
+        self.gate_calls: list[dict[str, Any]] = []
+
+    def record_gate(self, model: str, tokens: dict[str, int]) -> float:
+        self.gate_calls.append({"model": model, "tokens": tokens})
+        return super().record_gate(model, tokens)
+
+
+def test_weave_result_record_gate_called_on_landed(env: Env) -> None:
+    """Verify that daemon calls spend_leash.record_gate with real token usage
+    when processing a weave result with a MET (landing) verdict."""
+    bundle = make_bundle(
+        env.tmp_path, env.staging_repo, name="t-gate-landed", files={"f.txt": "x\n"}
+    )
+    add_parked_ticket_for_weave(env, "t-gate-landed", work_product=bundle)
+
+    # Create a critic that returns usage tokens
+    usage_tokens = {"in": 200, "out": 100, "cached": 0, "reasoning": 0}
+    response = {
+        "outcome": "met",
+        "tier": 1,
+        "reason": "looks good",
+        "severity": "none",
+        "usage": usage_tokens,
+    }
+    from stigmergy.critic import Critic
+    class TrackingCriticClient:
+        def __init__(self, response):
+            self._response = response
+            self.calls = []
+
+        def __call__(self, prompt, *, model, **kwargs):
+            self.calls.append({"prompt": prompt, "model": model, "kwargs": kwargs})
+            return self._response
+
+    client = TrackingCriticClient(response)
+    critic = Critic(
+        client=client,
+        model="opus",
+        decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+
+    weaver = make_real_weaver(
+        env, run_checks_fn=ScriptedChecks([pass_result()]), critic=critic
+    )
+
+    budgets = Budgets(dispatches=100, usd=1000.0, gate_calls=100, reserve_usd=10.0)
+    spy_leash = SpySpendLeashWithGateTracking(budgets, env.registry)
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver, spend_leash=spy_leash)
+
+    summary = daemon.poll_once()
+
+    assert summary.weave_ran is True
+    assert summary.weave_results == ("t-gate-landed",)
+    assert env.store.get_ticket("t-gate-landed")["state"] == LANDED
+
+    # Verify record_gate was called exactly once with the real model and tokens
+    assert len(spy_leash.gate_calls) == 1
+    assert spy_leash.gate_calls[0]["model"] == "opus"
+    assert spy_leash.gate_calls[0]["tokens"] == usage_tokens
+
+
+def test_weave_result_record_gate_called_on_rejected(env: Env) -> None:
+    """Verify that daemon calls spend_leash.record_gate with real token usage
+    when processing a weave result with an UNMET (rejected) verdict."""
+    bundle = make_bundle(
+        env.tmp_path, env.staging_repo, name="t-gate-rejected", files={"f.txt": "x\n"}
+    )
+    add_parked_ticket_for_weave(env, "t-gate-rejected", work_product=bundle)
+
+    # Create a critic that returns UNMET verdict with usage tokens
+    usage_tokens = {"in": 150, "out": 75, "cached": 5, "reasoning": 0}
+    response = {
+        "outcome": "unmet",
+        "tier": 2,
+        "reason": "missing tests",
+        "severity": "high",
+        "usage": usage_tokens,
+    }
+    from stigmergy.critic import Critic
+    class TrackingCriticClient:
+        def __init__(self, response):
+            self._response = response
+
+        def __call__(self, prompt, *, model, **kwargs):
+            return self._response
+
+    client = TrackingCriticClient(response)
+    critic = Critic(
+        client=client,
+        model="sonnet",
+        decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+
+    weaver = make_real_weaver(
+        env, run_checks_fn=ScriptedChecks([pass_result()]), critic=critic
+    )
+
+    budgets = Budgets(dispatches=100, usd=1000.0, gate_calls=100, reserve_usd=10.0)
+    spy_leash = SpySpendLeashWithGateTracking(budgets, env.registry)
+    daemon = make_daemon(env, spawn_fn=RaisingSpawn(), weaver=weaver, spend_leash=spy_leash)
+
+    summary = daemon.poll_once()
+
+    assert summary.weave_ran is True
+    assert summary.weave_results == ("t-gate-rejected",)
+
+    # Verify record_gate was called exactly once even though verdict was rejected
+    assert len(spy_leash.gate_calls) == 1
+    assert spy_leash.gate_calls[0]["model"] == "sonnet"
+    assert spy_leash.gate_calls[0]["tokens"] == usage_tokens
+
+
+# ==========================================================================
 # D14: worker ticket-filing harvest hook (bead workspace-e2uh.38, AC14 case 2
 # end-to-end + fail-closed isolation). The harvest runs host-side AFTER the
 # container is killed (i.e. after spawn_fn returns), reading the UNCOMMITTED

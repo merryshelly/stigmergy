@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import time
 from pathlib import Path
 from typing import Any
 
@@ -264,6 +265,27 @@ def _extract_filed_tickets(response: Any) -> list[dict[str, Any]]:
     return ft
 
 
+def _extract_usage(response: Any) -> dict[str, int] | None:
+    """Tolerantly extract the optional `usage` channel from a critic client
+    response. Returns a dict with token counts (in, out, cached, reasoning)
+    if present and well-formed, else None. The response may carry usage even
+    when the verdict passes — always attempt to extract it.
+
+    - non-dict ``response`` -> ``None`` (defense in depth; by the time
+      this runs, `_parse_verdict` has already raised on non-dict, so
+      unreachable in practice).
+    - ``response["usage"]`` absent or not a dict -> ``None``.
+    - a well-formed dict is returned VERBATIM, keys unvalidated (the
+      spend module accepts sparse token dicts).
+    """
+    if not isinstance(response, dict):
+        return None
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return usage
+
+
 class Critic:
     """One-shot, no-tools structured-output critic caller (SPEC §3/§7:
     "Direct one-shot structured-output API call. Direct call, no tool loop").
@@ -329,10 +351,12 @@ class Critic:
 
         ``gate_fields`` carries the gate-event provenance SPEC §8 requires
         for every `gate` event: the pinned decoding params (verbatim, as
-        passed to the client), the critic01 template hash, and the
-        resolved model name. Filings are NEVER folded into `gate_fields`
-        (`gate_fields` is event-provenance metadata; filings are a
-        separate, additive channel the weaver files itself).
+        passed to the client), the critic01 template hash, the resolved
+        model name, real token usage extracted from the client response,
+        and a real timestamp/duration captured around the client call.
+        Filings are NEVER folded into `gate_fields` (`gate_fields` is
+        event-provenance metadata; filings are a separate, additive channel
+        the weaver files itself).
 
         ``filed_tickets`` (D14, bead `.39`) is the critic's optional,
         tolerant, out-of-rubric follow-up proposals — extracted via
@@ -353,7 +377,10 @@ class Critic:
             rubric_items, artifact, template=self.template, check_evidence=check_evidence
         )
 
+        t_start = time.time()
         response = self._call_client(prompt)
+        t_end = time.time()
+        duration = t_end - t_start
 
         # Verdict parsed FIRST and STRICTLY — a malformed verdict fails the
         # whole call before any filing is ever considered (D14, bead .39).
@@ -371,7 +398,10 @@ class Critic:
         try:
             verdict = _parse_verdict(response)
         except CriticInfraError:
+            t_start = time.time()
             response = self._call_client(_build_repair_prompt(prompt))
+            t_end = time.time()
+            duration = t_end - t_start
             try:
                 verdict = _parse_verdict(response)
             except CriticInfraError as repair_exc:
@@ -380,10 +410,15 @@ class Critic:
                 ) from repair_exc
 
         filed_tickets = _extract_filed_tickets(response)
+        usage = _extract_usage(response)
 
         gate_fields = {
             "decoding_params": self.decoding_params,
             "prompt_artifact_hash": self.prompt_artifact_hash,
             "model": self.model,
+            "ts": t_end,
+            "wall_time_seconds": duration,
         }
+        if usage is not None:
+            gate_fields["tokens"] = usage
         return verdict, gate_fields, filed_tickets

@@ -1563,3 +1563,99 @@ def test_weaver_passes_check_results_as_evidence_to_critic(tmp_path, store, plan
     # The evidence should contain information about the check results.
     assert "Tier-1 Check Results" in spy.received_evidence
     assert "PASS" in spy.received_evidence
+
+
+def test_weave_result_carries_real_gate_tokens_and_duration(tmp_path, store, plane):
+    """Verify that WeaveResult carries real token usage, model, and wall-time
+    duration extracted from the critic client response."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-tokens", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-tokens", work_product=bundle)
+
+    # Create a critic that returns usage tokens in the response
+    usage_tokens = {"in": 150, "out": 75, "cached": 10, "reasoning": 0}
+    response = {
+        "outcome": "met",
+        "tier": 1,
+        "reason": "looks good",
+        "severity": "none",
+        "usage": usage_tokens,
+    }
+    from stigmergy.critic import Critic
+    client = StubCriticClient(response=response)
+    critic = Critic(
+        client=client,
+        model="test-model-v1",
+        decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=critic,
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    # Verify the WeaveResult carries the real gate tokens, model, and duration
+    assert result.gate_model == "test-model-v1"
+    assert result.gate_tokens == usage_tokens
+    assert result.gate_duration is not None
+    assert result.gate_duration > 0
+
+    # Verify the GATE event carries the real tokens and wall_time
+    gate_events_list = gate_events(plane, "t-tokens")
+    assert len(gate_events_list) == 1
+    gate_event = gate_events_list[0]
+    assert gate_event["tokens"] == usage_tokens
+    assert gate_event["wall_time_seconds"] > 0
+
+
+def test_weave_result_carries_gate_data_on_rejected_verdict(tmp_path, store, plane):
+    """Verify that WeaveResult carries gate_model/tokens/duration even for
+    rejected verdicts (UNMET path), not just for landed verdicts."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-rejected-tokens", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-rejected-tokens", work_product=bundle)
+
+    # Create a critic that returns UNMET verdict with usage tokens
+    usage_tokens = {"in": 100, "out": 50, "cached": 0, "reasoning": 0}
+    response = {
+        "outcome": "unmet",
+        "tier": 2,
+        "reason": "missing tests",
+        "severity": "high",
+        "usage": usage_tokens,
+    }
+    from stigmergy.critic import Critic
+    client = StubCriticClient(response=response)
+    critic = Critic(
+        client=client,
+        model="test-unmet-model",
+        decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=critic,
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    # Verify the rejected WeaveResult still carries the real gate data
+    assert result.outcome == "rejected"
+    assert result.gate_model == "test-unmet-model"
+    assert result.gate_tokens == usage_tokens
+    assert result.gate_duration is not None
+
+    # Verify the GATE event was written and carries the tokens
+    gate_events_list = gate_events(plane, "t-rejected-tokens")
+    assert len(gate_events_list) == 1
+    assert gate_events_list[0]["tokens"] == usage_tokens

@@ -124,14 +124,6 @@ here, not silently papered over; see the sub report for the full list):**
    synthesized `"ticket-tests"` check assumes the checker image has
    `pytest` available — noted here as an IMAGE REQUIREMENT, not silently
    assumed to always hold.
-9. **`spend_leash.record_gate` is never called anywhere in this module.**
-   `weaver.py`'s `WeaveResult` carries no token-usage/cost data for its
-   critic call (`critic.judge`'s `gate_fields` also carries no usage), so
-   there is no accessible data for `.22` to feed `record_gate` with. This
-   mirrors the fact that nothing else in the shipped codebase calls
-   `record_gate` either — gate-call USD accounting is architecturally
-   unwired as of this bead; flagged as a residual, not fixed here (no new
-   `weaver.py`/`critic.py` surface invented to carry it).
 
 **Egress (v0 pre-.25).** `egress_setup_fn` defaults to `None` (no egress
 wiring yet, per the frozen interface's own comment). When an
@@ -1017,6 +1009,12 @@ class Daemon:
         this batch."""
         any_infra = False
         for result in results:
+            # Record real gate-call usage on both MET and UNMET paths, before
+            # any outcome branching. This mirrors record_dispatch's placement
+            # before the outcome branch and ensures exactly one record_gate
+            # per GATE event (no double-count against event-derived status).
+            if result.gate_model is not None and result.gate_tokens is not None:
+                self._spend_leash.record_gate(result.gate_model, result.gate_tokens)
             ticket_id = result.ticket
             if result.outcome == "landed":
                 # bead .89: the ticket already RESTS at LANDED (weaver's own

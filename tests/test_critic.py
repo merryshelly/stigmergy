@@ -361,7 +361,34 @@ def test_judge_returns_filed_tickets_verbatim_when_present():
     assert verdict.outcome is Outcome.MET
     assert filed_tickets == _FILINGS  # verbatim; file_proposals judges item shape
     # filings are NOT smuggled into gate_fields (event-provenance metadata only).
-    assert set(gate_fields) == {"decoding_params", "prompt_artifact_hash", "model"}
+    # gate_fields always carries ts, wall_time_seconds, plus optional tokens if usage
+    # is present.
+    assert set(gate_fields) == {
+        "decoding_params",
+        "prompt_artifact_hash",
+        "model",
+        "ts",
+        "wall_time_seconds",
+    }
+
+
+def test_judge_extracts_usage_tokens_when_present():
+    # judge extracts optional usage channel and includes tokens in gate_fields.
+    usage = {"in": 100, "out": 50, "cached": 0, "reasoning": 0}
+    resp = {**_ok_response(), "usage": usage}
+    _, gate_fields, _ = _critic(StubClient(response=resp)).judge(
+        BENIGN_ARTIFACT, RUBRIC
+    )
+    assert "tokens" in gate_fields
+    assert gate_fields["tokens"] == usage
+    assert set(gate_fields) == {
+        "decoding_params",
+        "prompt_artifact_hash",
+        "model",
+        "ts",
+        "wall_time_seconds",
+        "tokens",
+    }
 
 
 def test_judge_absent_filed_tickets_is_empty_list():

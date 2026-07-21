@@ -158,6 +158,12 @@ class WeaveResult:
     `parked` to retry, never recorded as a rejection) are the closest
     fit; ``detail`` distinguishes it from a genuine critic-infra failure
     in the human-readable trail.
+
+    ``gate_model``, ``gate_tokens``, ``gate_duration`` carry the real
+    critic call's token usage and wall-clock duration, extracted from
+    the gate_fields returned by critic.judge(). These are None when no
+    gate call was made (e.g., gate-infra, checks-red, conflict outcomes
+    that failed before reaching the critic).
     """
 
     ticket: str
@@ -169,6 +175,9 @@ class WeaveResult:
     flagged_for_human: bool
     detail: str
     reason: str | None = None
+    gate_model: str | None = None
+    gate_tokens: dict[str, int] | None = None
+    gate_duration: float | None = None
 
 
 class Weaver:
@@ -487,6 +496,7 @@ class Weaver:
                     touched=touched,
                     detail="critic verdict was UNMET",
                     now=now,
+                    gate_fields=gate_fields,
                 )
 
             # -- CAS land (SPEC §9/§10 AC8) --------------------------------
@@ -540,8 +550,10 @@ class Weaver:
                 )
 
             transition(self.store, ticket_id, LANDED, expected_from=GATED)
+            gate_completion_ts = gate_fields.get("ts", now)
             self._append_integration_event(
-                ctx, phase="land", pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+                ctx, phase="land", pinned_oid=pinned_oid, candidate_oid=candidate_oid,
+                now=gate_completion_ts
             )
             reason = self._combine_reason(None, touched, stripped=stripped)
             record_disposition(
@@ -570,6 +582,9 @@ class Weaver:
                 flagged_for_human=flagged,
                 detail="critic MET; CAS land succeeded",
                 reason=None,
+                gate_model=gate_fields.get("model"),
+                gate_tokens=gate_fields.get("tokens"),
+                gate_duration=gate_fields.get("wall_time_seconds"),
             )
         finally:
             self._cleanup_candidate(candidate_dir)
@@ -594,6 +609,7 @@ class Weaver:
         now: float,
         touched: list[str] | None = None,
         error: str | None = None,
+        gate_fields: dict[str, Any] | None = None,
     ) -> WeaveResult:
         """Shared tail for every non-landing outcome: journal the phase,
         transition to the resting state, write the DISPOSITION event (plus
@@ -665,6 +681,9 @@ class Weaver:
             flagged_for_human=flagged,
             detail=detail,
             reason=reason,
+            gate_model=gate_fields.get("model") if gate_fields is not None else None,
+            gate_tokens=gate_fields.get("tokens") if gate_fields is not None else None,
+            gate_duration=gate_fields.get("wall_time_seconds") if gate_fields is not None else None,
         )
 
     @staticmethod
@@ -1000,7 +1019,13 @@ class Weaver:
         fields["tier"] = verdict.tier
         fields["reason"] = verdict.reason
         fields["severity"] = verdict.severity.value
-        fields["ts"] = now
+        # Use real completion timestamp from gate_fields, falling back to weave-cycle-start now
+        fields["ts"] = gate_fields.get("ts", now)
+        # Populate tokens and wall_time_seconds from real gate-call metadata
+        if "tokens" in gate_fields:
+            fields["tokens"] = gate_fields["tokens"]
+        if "wall_time_seconds" in gate_fields:
+            fields["wall_time_seconds"] = gate_fields["wall_time_seconds"]
         event = make_event(EventType.GATE, **fields)
         self.record_plane.append(event)
 
