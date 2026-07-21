@@ -447,3 +447,91 @@ def test_red_at_birth_ok_flaky_and_error_are_not_vacuous() -> None:
     # to "admit" rather than silently rejecting on an ambiguous signal.
     assert red_at_birth_ok(CheckOutcome.FLAKY) is True
     assert red_at_birth_ok(CheckOutcome.ERROR) is True
+
+
+# --- Concurrency: deterministic race test for concurrent claims ---------------
+
+
+def test_concurrent_claim_on_same_ticket_exactly_one_wins(tmp_path: Path) -> None:
+    """Deterministic race test: K>=3 threads released simultaneously via a
+    barrier, all calling claim() on the SAME ticket. Exactly one thread's
+    claim() must return a snapshot; every other must raise LeaseError. The
+    ticket's final persisted lease_owner/lease_dispatch_id/state must
+    match ONLY the single winner (never a mix, never left unclaimed).
+
+    This test is constructed to force real read/write overlap (barrier),
+    so it fails against a naive check-then-set implementation without
+    atomicity. Test repeats N>=20 iterations (fresh ticket state each
+    iteration) for determinism.
+    """
+    import threading
+
+    k_threads = 5
+    n_iterations = 20
+
+    for iteration in range(n_iterations):
+        # Fresh store and ticket each iteration.
+        store = RigStore.create(tmp_path / f"test_concurrent_{iteration}.db")
+        ticket_id = f"t-race-{iteration}"
+        store.add_ticket(id=ticket_id, title="Race me", state="pool")
+        steering = base_steering()
+        execute = base_execution()
+        approve(store, ticket_id, steering=steering)
+
+        barrier = threading.Barrier(k_threads)
+        results: dict[int, Exception | dict[str, Any]] = {}
+
+        def claim_in_thread(
+            thread_idx: int,
+            barrier: threading.Barrier = barrier,
+            store: RigStore = store,
+            ticket_id: str = ticket_id,
+            steering: dict[str, Any] = steering,
+            execute: dict[str, Any] = execute,
+            results: dict[int, Exception | dict[str, Any]] = results,
+        ) -> None:
+            # Synchronize all threads to release simultaneously.
+            barrier.wait()
+            try:
+                snapshot = claim(
+                    store,
+                    ticket_id,
+                    owner=f"worker-{thread_idx}",
+                    dispatch_id=f"dispatch-{thread_idx}",
+                    ttl_seconds=3600,
+                    now=1000.0 + thread_idx,  # slight variation, doesn't matter
+                    steering=steering,
+                    execution=execute,
+                )
+                results[thread_idx] = snapshot
+            except LeaseError as e:
+                results[thread_idx] = e
+
+        threads = [threading.Thread(target=claim_in_thread, args=(i,)) for i in range(k_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly one thread should have won (returned a snapshot).
+        winners = [i for i in range(k_threads) if isinstance(results[i], dict)]
+        losers = [i for i in range(k_threads) if isinstance(results[i], LeaseError)]
+
+        assert len(winners) == 1, f"Iteration {iteration}: expected 1 winner, got {len(winners)}"
+        assert len(losers) == k_threads - 1, (
+            f"Iteration {iteration}: expected {k_threads - 1} losers, got {len(losers)}"
+        )
+
+        winner_idx = winners[0]
+
+        # Verify the ticket's final persisted state matches ONLY the winner.
+        final_row = store.get_ticket(ticket_id)
+        assert final_row["lease_owner"] == f"worker-{winner_idx}"
+        assert final_row["lease_dispatch_id"] == f"dispatch-{winner_idx}"
+        assert final_row["state"] == "claimed"
+        # Every other thread's owner/dispatch_id must NOT appear.
+        for loser_idx in losers:
+            assert final_row["lease_owner"] != f"worker-{loser_idx}"
+            assert final_row["lease_dispatch_id"] != f"dispatch-{loser_idx}"
+
+        store.close()

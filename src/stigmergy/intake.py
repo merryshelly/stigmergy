@@ -117,27 +117,26 @@ def claim(
     steering: dict[str, Any],
     execution: dict[str, Any],
 ) -> dict[str, Any]:
-    """Claim ``ticket_id`` under a fresh lease (check-then-set within one
-    call, one process — SPEC §5 loader-enforces `workers = 1` in v0, and
-    "claim atomicity under concurrency remains untested" per SPEC §10; this
-    is not a claim of cross-process/cross-thread atomicity, e.g. no
-    conditional `UPDATE ... WHERE` + rowcount guard is used here).
+    """Claim ``ticket_id`` under a fresh lease (ATOMIC conditional UPDATE
+    with rowcount-based winner detection — SPEC §5 + ticket .TBD).
 
     Re-verifies eligibility itself against the *given* ``steering`` (never
     trusts that a caller's earlier `eligible()` call is still valid — the
     two can race across a poll interval): approved + hash-valid, all
-    predecessors landed, claimable state, and no live lease already held.
-    Any failure raises :class:`LeaseError`. Within one process (the v0
-    `workers=1` model this loop runs under), no double-claim can slip
-    through by calling `claim()` twice on the same ticket, since the row's
-    `state` flips to `claimed` inside the same call that checks it.
+    predecessors landed. Then attempts an ATOMIC conditional claim via
+    ``store.atomic_claim_ticket()`` — a single SQL UPDATE statement that
+    sets the lease fields and state ONLY if the ticket is currently
+    unclaimed (lease_owner IS NULL) and in a claimable state. Winner is
+    determined purely by the UPDATE's rowcount (==1 means this thread won).
 
-    On success: sets ``lease_owner``, ``lease_dispatch_id``,
+    Any failure (eligibility or atomic claim loss) raises :class:`LeaseError`.
+
+    On success: ``lease_owner``, ``lease_dispatch_id``,
     ``lease_expires_at = now + ttl_seconds``, ``lease_heartbeat_at = now``,
-    ``state = 'claimed'``. Returns the FROZEN claim snapshot — a fresh
-    dict holding deep copies of ``steering``/``execution`` plus their
-    hashes. This snapshot, not the live row, is the authority for the
-    dispatch: subsequent mutation of the ticket row (re-approval, steering
+    ``state = 'claimed'`` have all been persisted. Returns the FROZEN claim
+    snapshot — a fresh dict holding deep copies of ``steering``/``execution``
+    plus their hashes. This snapshot, not the live row, is the authority for
+    the dispatch: subsequent mutation of the ticket row (re-approval, steering
     edit, execution drift) cannot reach back and change what was already
     returned here.
     """
@@ -151,22 +150,21 @@ def claim(
         )
     if not _deps_landed(store, ticket_id):
         raise LeaseError(f"ticket {ticket_id!r} is not eligible: predecessor(s) not landed")
-    if _lease_is_live(row, now):
-        raise LeaseError(f"ticket {ticket_id!r} is already under a live lease")
-    if row.get("state") not in _CLAIMABLE_STATES:
-        raise LeaseError(
-            f"ticket {ticket_id!r} is not in a claimable state (got {row.get('state')!r})"
-        )
 
     lease_expires_at = now + ttl_seconds
-    store.update_ticket(
+    won = store.atomic_claim_ticket(
         ticket_id,
-        lease_owner=owner,
-        lease_dispatch_id=dispatch_id,
+        owner=owner,
+        dispatch_id=dispatch_id,
         lease_expires_at=lease_expires_at,
         lease_heartbeat_at=now,
-        state="claimed",
     )
+
+    if not won:
+        raise LeaseError(
+            f"ticket {ticket_id!r} claim failed: "
+            "already claimed by another thread, or not in a claimable state"
+        )
 
     return {
         "ticket_id": ticket_id,

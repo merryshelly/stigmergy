@@ -28,6 +28,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -165,8 +166,17 @@ class RigStore:
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self.db_path = Path(db_path)
-        self._conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False allows multiple threads to safely access the
+        # same connection, but all DB operations are serialized via _db_lock
+        # (see docstring). Keep the single-connection model (no per-thread
+        # connection restructuring).
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # _db_lock serializes all DB access (read and write) across threads.
+        # A threading.RLock permits the same thread to acquire it multiple
+        # times (re-entrant); the lock protects the single shared _conn from
+        # concurrent reads/writes from other threads.
+        self._db_lock = threading.RLock()
         # `ticket_deps` declares no explicit FOREIGN KEY constraint in the v0
         # schema, so this pragma enforces nothing yet — it's set now so
         # later tickets that add real FK constraints get enforcement for
@@ -332,27 +342,30 @@ class RigStore:
 
         col_sql = ", ".join(columns)
         placeholders = ", ".join("?" for _ in columns)
-        self._conn.execute(
-            f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
-            values,
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+                values,
+            )
+            self._conn.commit()
 
     def get_ticket(self, ticket_id: str) -> dict[str, Any] | None:
         """Fetch one ticket by id, or ``None`` if absent. JSON fields decode to lists/dicts."""
-        row = self._conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        with self._db_lock:
+            row = self._conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if row is None:
             return None
         return self._row_to_ticket(row)
 
     def list_tickets(self, *, state: str | None = None) -> list[dict[str, Any]]:
         """List tickets, optionally filtered by ``state``, ordered by creation time."""
-        if state is None:
-            rows = self._conn.execute("SELECT * FROM tickets ORDER BY created_at").fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM tickets WHERE state = ? ORDER BY created_at", (state,)
-            ).fetchall()
+        with self._db_lock:
+            if state is None:
+                rows = self._conn.execute("SELECT * FROM tickets ORDER BY created_at").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM tickets WHERE state = ? ORDER BY created_at", (state,)
+                ).fetchall()
         return [self._row_to_ticket(row) for row in rows]
 
     def update_ticket(self, ticket_id: str, **fields: Any) -> None:
@@ -386,28 +399,79 @@ class RigStore:
 
         set_sql = ", ".join(f"{col} = ?" for col in columns)
         values.append(ticket_id)
-        cursor = self._conn.execute(
-            f"UPDATE tickets SET {set_sql} WHERE id = ?",  # noqa: S608
-            values,
-        )
-        if cursor.rowcount == 0:
-            self._conn.rollback()
-            raise ValueError(f"no such ticket: {ticket_id!r}")
-        self._conn.commit()
+        with self._db_lock:
+            cursor = self._conn.execute(
+                f"UPDATE tickets SET {set_sql} WHERE id = ?",  # noqa: S608
+                values,
+            )
+            if cursor.rowcount == 0:
+                self._conn.rollback()
+                raise ValueError(f"no such ticket: {ticket_id!r}")
+            self._conn.commit()
+
+    def atomic_claim_ticket(
+        self,
+        ticket_id: str,
+        *,
+        owner: str,
+        dispatch_id: str,
+        lease_expires_at: float,
+        lease_heartbeat_at: float,
+    ) -> bool:
+        """Atomically claim a ticket with an ACID conditional UPDATE.
+
+        Performs a single SQL UPDATE statement:
+        ```
+        UPDATE tickets SET lease_owner=?, lease_dispatch_id=?,
+        lease_expires_at=?, lease_heartbeat_at=?, state='claimed',
+        updated_at=?
+        WHERE id=? AND lease_owner IS NULL
+        AND state IN ('pool','eligible')
+        ```
+
+        Returns ``True`` if exactly one row was updated (claim won),
+        ``False`` otherwise (already leased or not in claimable state).
+
+        This is the ATOMIC conditional claim for concurrent dispatch:
+        two concurrent threads cannot both return True for the same
+        ticket. The winner is determined purely by the UPDATE's rowcount
+        (==1 means one and only one matching row was modified).
+
+        Serialized by the same _db_lock that protects all other DB access,
+        but the atomicity of the claim is guaranteed by the single
+        conditional UPDATE statement + rowcount check, not by holding the
+        lock across a check-then-set pair.
+        """
+        now = time.time()
+        with self._db_lock:
+            cursor = self._conn.execute(
+                "UPDATE tickets "
+                "SET lease_owner=?, lease_dispatch_id=?, "
+                "    lease_expires_at=?, lease_heartbeat_at=?, "
+                "    state='claimed', updated_at=? "
+                "WHERE id=? AND lease_owner IS NULL "
+                "AND state IN ('pool','eligible')",
+                (owner, dispatch_id, lease_expires_at, lease_heartbeat_at, now, ticket_id),
+            )
+            won = cursor.rowcount == 1
+            self._conn.commit()
+        return won
 
     def add_dep(self, ticket_id: str, blocks_ticket_id: str) -> None:
         """Record that ``ticket_id`` is blocked-by (must land after) ``blocks_ticket_id``."""
-        self._conn.execute(
-            "INSERT INTO ticket_deps (ticket_id, blocks_ticket_id) VALUES (?, ?)",
-            (ticket_id, blocks_ticket_id),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO ticket_deps (ticket_id, blocks_ticket_id) VALUES (?, ?)",
+                (ticket_id, blocks_ticket_id),
+            )
+            self._conn.commit()
 
     def deps_of(self, ticket_id: str) -> list[str]:
         """Return the predecessor ticket ids that block ``ticket_id``."""
-        rows = self._conn.execute(
-            "SELECT blocks_ticket_id FROM ticket_deps WHERE ticket_id = ?", (ticket_id,)
-        ).fetchall()
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT blocks_ticket_id FROM ticket_deps WHERE ticket_id = ?", (ticket_id,)
+            ).fetchall()
         return [row["blocks_ticket_id"] for row in rows]
 
     def insert_worker_name(self, name: str) -> None:
@@ -420,35 +484,39 @@ class RigStore:
         collision here must never leave a dangling uncommitted write
         behind).
         """
-        try:
-            self._conn.execute(
-                "INSERT INTO worker_names (name, created_at) VALUES (?, ?)",
-                (name, time.time()),
-            )
-        except sqlite3.IntegrityError:
-            self._conn.rollback()
-            raise
-        self._conn.commit()
+        with self._db_lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO worker_names (name, created_at) VALUES (?, ?)",
+                    (name, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
 
     def worker_name_exists(self, name: str) -> bool:
         """True iff ``name`` has already been reserved in `worker_names`."""
-        row = self._conn.execute(
-            "SELECT 1 FROM worker_names WHERE name = ?", (name,)
-        ).fetchone()
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM worker_names WHERE name = ?", (name,)
+            ).fetchone()
         return row is not None
 
     def set_meta(self, key: str, value: str) -> None:
         """Set (or overwrite) a `rig_meta` key/value pair."""
-        self._conn.execute(
-            "INSERT INTO rig_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO rig_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
 
     def get_meta(self, key: str) -> str | None:
         """Fetch a `rig_meta` value by key, or ``None`` if absent."""
-        row = self._conn.execute("SELECT value FROM rig_meta WHERE key = ?", (key,)).fetchone()
+        with self._db_lock:
+            row = self._conn.execute("SELECT value FROM rig_meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
     def add_filed_ticket(
@@ -475,27 +543,28 @@ class RigStore:
         out of scope here.
         """
         now = time.time()
-        self._conn.execute(
-            "INSERT INTO filed_tickets ("
-            "  id, title, description, evidence, origin_role, origin_worker,"
-            "  origin_dispatch_id, origin_parent_ticket, discovered_from,"
-            "  proposal_hash, created_at, triaged"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-            (
-                id,
-                title,
-                description,
-                evidence,
-                origin_role,
-                origin_worker,
-                origin_dispatch_id,
-                origin_parent_ticket,
-                discovered_from,
-                proposal_hash,
-                now,
-            ),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO filed_tickets ("
+                "  id, title, description, evidence, origin_role, origin_worker,"
+                "  origin_dispatch_id, origin_parent_ticket, discovered_from,"
+                "  proposal_hash, created_at, triaged"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    id,
+                    title,
+                    description,
+                    evidence,
+                    origin_role,
+                    origin_worker,
+                    origin_dispatch_id,
+                    origin_parent_ticket,
+                    discovered_from,
+                    proposal_hash,
+                    now,
+                ),
+            )
+            self._conn.commit()
 
     def list_filed_tickets(self, *, triaged: bool | None = None) -> list[dict[str, Any]]:
         """List `filed_tickets` rows as dicts, ordered by `created_at`.
@@ -504,22 +573,24 @@ class RigStore:
         `triaged=True` -> only triaged rows (`WHERE triaged = 1`);
         `triaged=None` (default) -> all rows, no filter.
         """
-        if triaged is None:
-            rows = self._conn.execute(
-                "SELECT * FROM filed_tickets ORDER BY created_at"
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM filed_tickets WHERE triaged = ? ORDER BY created_at",
-                (1 if triaged else 0,),
-            ).fetchall()
+        with self._db_lock:
+            if triaged is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM filed_tickets ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM filed_tickets WHERE triaged = ? ORDER BY created_at",
+                    (1 if triaged else 0,),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def count_untriaged_filings(self) -> int:
         """Count `filed_tickets` rows with `triaged = 0` (status.py D14 field)."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM filed_tickets WHERE triaged = 0"
-        ).fetchone()
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM filed_tickets WHERE triaged = 0"
+            ).fetchone()
         return int(row["n"])
 
     def mark_filed_ticket_triaged(
@@ -537,20 +608,21 @@ class RigStore:
         absent, or if it is already triaged (``triaged == 1``) — a filed
         row can only be triaged once.
         """
-        row = self._conn.execute(
-            "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"no such filed ticket: {filed_id!r}")
-        if row["triaged"]:
-            raise ValueError(f"filed ticket already triaged: {filed_id!r}")
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no such filed ticket: {filed_id!r}")
+            if row["triaged"]:
+                raise ValueError(f"filed ticket already triaged: {filed_id!r}")
 
-        self._conn.execute(
-            "UPDATE filed_tickets SET triaged = 1, triage_outcome = ?, "
-            "resulting_ticket_id = ? WHERE id = ?",
-            (outcome, resulting_ticket_id, filed_id),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "UPDATE filed_tickets SET triaged = 1, triage_outcome = ?, "
+                "resulting_ticket_id = ? WHERE id = ?",
+                (outcome, resulting_ticket_id, filed_id),
+            )
+            self._conn.commit()
 
     def promote_filed_ticket(
         self, *, filed_id: str, ticket_id: str, title: str, **ticket_fields: Any
@@ -587,45 +659,46 @@ class RigStore:
                 "— a promoted ticket always lands UNAPPROVED"
             )
 
-        try:
-            row = self._conn.execute(
-                "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"no such filed ticket: {filed_id!r}")
-            if row["triaged"]:
-                raise ValueError(f"filed ticket already triaged: {filed_id!r}")
+        with self._db_lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT triaged FROM filed_tickets WHERE id = ?", (filed_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"no such filed ticket: {filed_id!r}")
+                if row["triaged"]:
+                    raise ValueError(f"filed ticket already triaged: {filed_id!r}")
 
-            existing = self._conn.execute(
-                "SELECT 1 FROM tickets WHERE id = ?", (ticket_id,)
-            ).fetchone()
-            if existing is not None:
-                raise ValueError(f"ticket id already exists: {ticket_id!r}")
+                existing = self._conn.execute(
+                    "SELECT 1 FROM tickets WHERE id = ?", (ticket_id,)
+                ).fetchone()
+                if existing is not None:
+                    raise ValueError(f"ticket id already exists: {ticket_id!r}")
 
-            now = time.time()
-            columns = ["id", "title", "created_at", "updated_at", "approved"]
-            values: list[Any] = [ticket_id, title, now, now, 0]
-            extra_columns, extra_values = self._encode_ticket_fields(ticket_fields)
-            columns.extend(extra_columns)
-            values.extend(extra_values)
+                now = time.time()
+                columns = ["id", "title", "created_at", "updated_at", "approved"]
+                values: list[Any] = [ticket_id, title, now, now, 0]
+                extra_columns, extra_values = self._encode_ticket_fields(ticket_fields)
+                columns.extend(extra_columns)
+                values.extend(extra_values)
 
-            col_sql = ", ".join(columns)
-            placeholders = ", ".join("?" for _ in columns)
-            self._conn.execute(
-                f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
-                values,
-            )
+                col_sql = ", ".join(columns)
+                placeholders = ", ".join("?" for _ in columns)
+                self._conn.execute(
+                    f"INSERT INTO tickets ({col_sql}) VALUES ({placeholders})",  # noqa: S608
+                    values,
+                )
 
-            self._conn.execute(
-                "UPDATE filed_tickets SET triaged = 1, triage_outcome = 'promoted', "
-                "resulting_ticket_id = ? WHERE id = ?",
-                (ticket_id, filed_id),
-            )
-        except Exception:
-            self._conn.rollback()
-            raise
-        else:
-            self._conn.commit()
+                self._conn.execute(
+                    "UPDATE filed_tickets SET triaged = 1, triage_outcome = 'promoted', "
+                    "resulting_ticket_id = ? WHERE id = ?",
+                    (ticket_id, filed_id),
+                )
+            except Exception:
+                self._conn.rollback()
+                raise
+            else:
+                self._conn.commit()
 
     def close(self) -> None:
         """Checkpoint the WAL into the main file and close the connection.

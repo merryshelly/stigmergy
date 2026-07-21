@@ -1938,3 +1938,50 @@ def test_recover_on_start_raises_when_dispatch_base_branch_absent(
     daemon = make_daemon(env, spawn_fn=RaisingSpawn())
     with pytest.raises(DaemonError):
         daemon.recover_on_start()
+
+
+# ==========================================================================
+# Concurrency: deterministic race test for infra-trip counter
+# ==========================================================================
+
+
+def test_concurrent_infra_trip_counter_no_lost_updates(env: Env) -> None:
+    """Deterministic race test for infra-trip counter: K>=3 threads
+    released simultaneously via a barrier, all call _bump_infra_trip_counter()
+    N>=20 times. Assert the final value equals exactly K*N bumps (no lost
+    updates). This test verifies the lock-protected read-modify-write of
+    the infra-trip counter is correct under concurrent access.
+    """
+    import threading
+
+    k_threads = 5
+    n_bumps_per_thread = 10
+
+    daemon = make_daemon(env, spawn_fn=ScriptedSpawn([]))
+
+    barrier = threading.Barrier(k_threads)
+    errors: list[Exception] = []
+
+    def bump_in_thread(thread_idx: int) -> None:
+        try:
+            # Synchronize all threads to release simultaneously.
+            barrier.wait()
+            for _ in range(n_bumps_per_thread):
+                daemon._bump_infra_trip_counter()
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=bump_in_thread, args=(i,)) for i in range(k_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Verify no exceptions were raised in threads.
+    assert len(errors) == 0, f"Exceptions in bump threads: {errors}"
+
+    # Verify the final counter value equals exactly K*N bumps (no lost updates).
+    expected = k_threads * n_bumps_per_thread
+    assert daemon._consecutive_infra_trips == expected, (
+        f"Expected {expected} bumps, got {daemon._consecutive_infra_trips}"
+    )

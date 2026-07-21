@@ -137,11 +137,13 @@ actually exercises it live.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import secrets
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -250,16 +252,36 @@ def _default_relay_teardown(handle: RelayHandle) -> None:
 @dataclass(frozen=True)
 class PollSummary:
     """Everything one `poll_once()` call did, for tests to assert against
-    and for `run_forever()` to act on (bead .22 build spec §4)."""
+    and for `run_forever()` to act on (bead .22 build spec §4).
 
-    dispatched_ticket: str | None
-    dispatch_status: str | None
+    **Concurrency note (ticket .TBD):** `dispatched_tickets` is now a set
+    of ticket ids (up to `workers` in one poll cycle). The legacy
+    `dispatched_ticket` field is kept for backward compatibility but is
+    DEPRECATED — use `dispatched_tickets` instead. Similarly,
+    `dispatch_status` is DEPRECATED (it only made sense when at most one
+    dispatch happened per poll).
+    """
+
+    dispatched_tickets: frozenset[str]
+    dispatch_statuses: frozenset[str]
     weave_ran: bool
     weave_results: tuple[str, ...]
     infra_trip: bool
     consecutive_infra_trips: int
     should_halt: bool
     backoff_seconds: float
+
+    # Backward compatibility aliases (DEPRECATED).
+    @property
+    def dispatched_ticket(self) -> str | None:
+        """DEPRECATED: returns the first dispatched ticket (for tests still
+        expecting the old single-dispatch-per-poll contract), or None."""
+        return next(iter(self.dispatched_tickets), None) if self.dispatched_tickets else None
+
+    @property
+    def dispatch_status(self) -> str | None:
+        """DEPRECATED: returns the first dispatch status, or None."""
+        return next(iter(self.dispatch_statuses), None) if self.dispatch_statuses else None
 
 
 class Daemon:
@@ -355,8 +377,27 @@ class Daemon:
         self._lease_ttl_seconds = charter.raw["loop"]["timers"]["lease_ttl_seconds"]
         self._poll_seconds = charter.raw["loop"]["timers"]["poll_seconds"]
 
+        # Infra-trip counter protection (ticket .TBD): RLock allows the same
+        # thread to acquire it multiple times (re-entrant). Protects every
+        # increment (_bump_infra_trip_counter), reset (_reset_infra_trip_counter),
+        # and the read that decides should_halt against lost updates from
+        # concurrent dispatch threads. The lock is held only for the brief
+        # read-modify-write; dispatch threads release it immediately after,
+        # so the weaver's own calls to the bump/reset methods (on the main
+        # thread) never contend.
+        self._infra_trip_lock = threading.RLock()
         self._consecutive_infra_trips = 0
+
         self._prior_parked: dict[str, float] = {}
+
+        # Bounded thread pool for concurrent dispatch (ticket .TBD): up to
+        # `workers` in-flight dispatches at once. Each dispatch's body
+        # (prepare, spawn, Tier-1 checks, state transition, event emission,
+        # teardown) runs on a pool thread; the claim step (atomic) and
+        # running on the pool are the only changes from the single-dispatch
+        # world. The weaver stays on the main thread.
+        workers = charter.raw.get("loop", {}).get("concurrency", {}).get("workers", 1)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
 
     # -- recover_on_start ----------------------------------------------------
 
@@ -394,30 +435,35 @@ class Daemon:
 
     def poll_once(self) -> PollSummary:
         """One full poll cycle (bead .22 build spec §4): heartbeat,
-        spend-gated claim+dispatch+checks (at most one ticket, workers=1),
-        weave-trigger evaluation + weave if triggered, notification
-        delivery. Never sleeps. See the module docstring + build spec §1-§3
-        for the exact decision logic."""
+        spend-gated claim+dispatch+checks (up to `workers` tickets, concurrently
+        via a bounded thread pool), weave-trigger evaluation + weave if
+        triggered (main thread, not pooled), notification delivery.
+
+        Never sleeps. See the module docstring + build spec §1-§3 for the
+        exact decision logic. The weaver stays single-threaded on the main
+        thread; only dispatch is parallelized.
+        """
         now = self._now_fn()
         self._store.set_meta("daemon_heartbeat_at", str(now))
 
-        dispatched_ticket: str | None = None
-        dispatch_status_value: str | None = None
-        dispatch_infra_trip = False
+        dispatched_tickets: set[str] = set()
+        dispatch_statuses: set[str] = set()
+        any_dispatch_infra_trip = False
 
         if self._spend_leash.can_dispatch():
-            claimed = self._claim_and_prepare(now)
-            if claimed is not None:
-                ticket_id, plan, egress_handle, relay_handle = claimed
-                dispatched_ticket = ticket_id
-                dispatch_status_value, dispatch_infra_trip = self._run_dispatch_cycle(
-                    ticket_id, plan, egress_handle, relay_handle
-                )
+            # Claim and dispatch up to `workers` tickets concurrently.
+            dispatched_tickets, dispatch_statuses, any_dispatch_infra_trip = (
+                self._dispatch_bounded_pool(now)
+            )
 
         weave_ran, weave_result_tickets, weave_infra_trip = self._maybe_weave(now)
 
-        infra_trip = dispatch_infra_trip or weave_infra_trip
-        consecutive = self._consecutive_infra_trips
+        infra_trip = any_dispatch_infra_trip or weave_infra_trip
+
+        # Read the infra-trip counter with the lock held, to protect against
+        # concurrent updates from dispatch threads.
+        with self._infra_trip_lock:
+            consecutive = self._consecutive_infra_trips
         should_halt = consecutive >= _CIRCUIT_BREAKER_THRESHOLD
         backoff_seconds = self._compute_backoff(consecutive) if infra_trip else 0.0
 
@@ -443,8 +489,8 @@ class Daemon:
         self._notifier.deliver_pending(self._notification_store, now=now)
 
         return PollSummary(
-            dispatched_ticket=dispatched_ticket,
-            dispatch_status=dispatch_status_value,
+            dispatched_tickets=frozenset(dispatched_tickets),
+            dispatch_statuses=frozenset(dispatch_statuses),
             weave_ran=weave_ran,
             weave_results=weave_result_tickets,
             infra_trip=infra_trip,
@@ -470,21 +516,116 @@ class Daemon:
             )
             sleep_fn(sleep_seconds)
 
-    # -- claim + prepare ------------------------------------------------------
+    # -- concurrent dispatch (via bounded thread pool) --
 
-    def _claim_and_prepare(
+    def _dispatch_bounded_pool(
         self, now: float
-    ) -> tuple[str, DispatchPlan, EgressHandle | None, RelayHandle | None] | None:
-        """Find one eligible ticket, claim it, and prepare its dispatch.
-        Returns `None` if nothing is eligible, or if a race makes the
-        claim itself fail (never a bug — `LeaseError` is an ordinary
-        "try again next poll" signal)."""
+    ) -> tuple[set[str], set[str], bool]:
+        """Claim and dispatch up to `workers` tickets concurrently via the
+        bounded thread pool. Returns (dispatched_tickets, dispatch_statuses,
+        any_infra_trip) where:
+        - dispatched_tickets: the set of ticket ids that were dispatched
+        - dispatch_statuses: the set of status strings from dispatch results
+        - any_infra_trip: True iff any dispatch was an infra trip
+
+        The claim step is atomic (via store.atomic_claim_ticket); the dispatch
+        cycle runs on a pool thread. Each dispatch's failure handling
+        (infra-trip counter bumps, state transitions, etc.) is per-dispatch,
+        with the infra counter bumps protected by _infra_trip_lock.
+
+        Only up to `workers` tasks are submitted to the pool in one poll cycle,
+        matching the charter's `loop.concurrency.workers` limit.
+
+        If any dispatch thread raises an exception, it is re-raised from here
+        (propagates to poll_once, which may propagate it further). This ensures
+        test cases that expect exceptions from spawn_fn to propagate (e.g.,
+        case 16, case 29b) still see the exception at the poll_once level.
+        """
         eligible_ids = intake_module.eligible(
             self._store, now=now, steering_of=self._steering_of
         )
         if not eligible_ids:
-            return None
-        ticket_id = eligible_ids[0]
+            return set(), set(), False
+
+        dispatched: set[str] = set()
+        statuses: set[str] = set()
+        any_infra = False
+        first_exception: Exception | None = None
+
+        # Get the workers limit from the charter (same value used for max_workers
+        # in the ThreadPoolExecutor, so we never submit more than max_workers tasks).
+        workers = self._charter.raw.get("loop", {}).get("concurrency", {}).get("workers", 1)
+
+        # Submit up to `workers` tasks to the pool: claim_and_dispatch each ticket.
+        futures_to_ticket: dict[concurrent.futures.Future, str] = {}
+        for ticket_id in eligible_ids[:workers]:
+            future = self._executor.submit(self._claim_and_dispatch_one, ticket_id, now)
+            futures_to_ticket[future] = ticket_id
+
+        # Collect results from completed tasks (they may not finish in order).
+        for future in concurrent.futures.as_completed(futures_to_ticket):
+            ticket_id = futures_to_ticket[future]
+            try:
+                status, was_infra = future.result()
+                if status is not None:
+                    dispatched.add(ticket_id)
+                    statuses.add(status)
+                    any_infra = any_infra or was_infra
+            except Exception as e:
+                # A dispatch thread raised an exception. Save the first one to
+                # re-raise later, but continue collecting results from other
+                # dispatch threads so they can complete cleanly (e.g., running
+                # their finally blocks for cleanup).
+                if first_exception is None:
+                    first_exception = e
+                _logger.warning(
+                    "exception in dispatch thread for ticket %s",
+                    ticket_id,
+                    exc_info=True,
+                )
+
+        # If any dispatch thread raised, re-raise the first exception now.
+        if first_exception is not None:
+            raise first_exception
+
+        return dispatched, statuses, any_infra
+
+    def _claim_and_dispatch_one(self, ticket_id: str, now: float) -> tuple[str | None, bool]:
+        """Claim and dispatch one ticket; returns (status, was_infra_trip).
+        If the claim fails (LeaseError), returns (None, False). If the dispatch
+        cycle raises an exception, it propagates to the caller (which will
+        handle it and re-raise from _dispatch_bounded_pool).
+
+        This method runs on a thread pool thread."""
+        claimed = self._claim_and_prepare(now, ticket_id)
+        if claimed is None:
+            return None, False
+        ticket_id_claimed, plan, egress_handle, relay_handle = claimed
+        status, infra_trip = self._run_dispatch_cycle(
+            ticket_id_claimed, plan, egress_handle, relay_handle
+        )
+        return status, infra_trip
+
+    # -- claim + prepare ------------------------------------------------------
+
+    def _claim_and_prepare(
+        self, now: float, ticket_id_override: str | None = None
+    ) -> tuple[str, DispatchPlan, EgressHandle | None, RelayHandle | None] | None:
+        """Claim and prepare the dispatch for one ticket. If
+        ``ticket_id_override`` is provided (by _claim_and_dispatch_one on a
+        pool thread), claim that specific ticket. Otherwise, find one eligible
+        ticket from the eligible list. Returns `None` if nothing is eligible,
+        or if a race makes the claim itself fail (never a bug — `LeaseError`
+        is an ordinary "try again next poll" signal)."""
+        if ticket_id_override is not None:
+            ticket_id = ticket_id_override
+        else:
+            eligible_ids = intake_module.eligible(
+                self._store, now=now, steering_of=self._steering_of
+            )
+            if not eligible_ids:
+                return None
+            ticket_id = eligible_ids[0]
         ticket_row = self._store.get_ticket(ticket_id)
         steering = self._steering_of(ticket_id)
         # bead .25 audit (codex HIGH): resolve the OPERATIONAL lane with the
@@ -1123,10 +1264,18 @@ class Daemon:
     # -- circuit breaker (SPEC §9, bead .22 build spec §3) -----------------------
 
     def _bump_infra_trip_counter(self) -> None:
-        self._consecutive_infra_trips += 1
+        # Protected by lock: allows concurrent dispatch threads to safely increment
+        # the counter without lost updates. The lock is held only for the brief
+        # read-modify-write.
+        with self._infra_trip_lock:
+            self._consecutive_infra_trips += 1
 
     def _reset_infra_trip_counter(self) -> None:
-        self._consecutive_infra_trips = 0
+        # Protected by lock: same reasoning as _bump_infra_trip_counter. The weaver
+        # (main thread) and dispatch threads (pool) both call this; the lock
+        # prevents lost updates when they race.
+        with self._infra_trip_lock:
+            self._consecutive_infra_trips = 0
 
     @staticmethod
     def _compute_backoff(consecutive_trips: int) -> float:
