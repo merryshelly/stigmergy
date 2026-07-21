@@ -500,15 +500,19 @@ def test_dispatch_id_none_leaves_argv_unchanged(tmp_path):
     # pre-.34 argv — the same regression-guard discipline egress_socket=None
     # and env=None already get. Two separate assertions: (a) explicit
     # dispatch_id=None matches the param-omitted call, AND (b) neither
-    # contains any --label= token at all — (a) alone cannot catch a bug
-    # that corrupts both call sites identically (e.g. always emitting the
-    # label regardless of dispatch_id), so (b) is the real byte-identity
-    # claim against the pre-.34 baseline.
+    # contains any --label=, --name=, or --replace token at all — (a) alone
+    # cannot catch a bug that corrupts both call sites identically (e.g.
+    # always emitting the label/name/replace regardless of dispatch_id), so
+    # (b) is the real byte-identity claim against the pre-.34 baseline.
     with_none = _argv(tmp_path, dispatch_id=None)
     without_param = _argv(tmp_path)
     assert with_none == without_param
     assert not any(a.startswith("--label=") for a in with_none)
     assert not any(a.startswith("--label=") for a in without_param)
+    assert "--name=" not in " ".join(with_none)
+    assert "--name=" not in " ".join(without_param)
+    assert "--replace" not in with_none
+    assert "--replace" not in without_param
 
 
 def test_dispatch_id_valid_adds_label_at_frozen_position(tmp_path):
@@ -566,7 +570,7 @@ def test_dispatch_id_combined_with_egress_socket_and_env_no_interference(tmp_pat
         env=env,
     )
     label_token = f"--label={DISPATCH_ID_LABEL_KEY}=crimson-otter-basalt"
-    egress_token = f"--volume={sock}:/run/egress.sock:rw"
+    egress_token = f"--volume={sock}:/run/egress.sock:ro"
     env_token_1 = "--env=ANTHROPIC_API_KEY=tok"
     env_token_2 = "--env=ANTHROPIC_BASE_URL=http://x"
 
@@ -586,6 +590,31 @@ def test_dispatch_id_combined_with_egress_socket_and_env_no_interference(tmp_pat
     assert first_volume_index == network_index + 2
 
 
+def test_dispatch_id_adds_name_and_replace_tokens(tmp_path):
+    # dispatch_id emits --name=<dispatch_id> and --replace after --rm and
+    # before --cap-drop=ALL. These tokens give podman cleanup semantics for
+    # name collisions when a retried dispatch reuses the same dispatch_id.
+    dispatch_id_val = "crimson-otter-basalt"
+    argv = _argv(tmp_path, dispatch_id=dispatch_id_val)
+    name_token = f"--name={dispatch_id_val}"
+    replace_token = "--replace"
+
+    assert name_token in argv
+    assert replace_token in argv
+
+    # Both tokens present, in order: --name then --replace.
+    name_index = argv.index(name_token)
+    replace_index = argv.index(replace_token)
+    assert replace_index == name_index + 1
+
+    # Frozen position: immediately after --rm and before --cap-drop=ALL.
+    rm_index = argv.index("--rm")
+    cap_drop_index = argv.index("--cap-drop=ALL")
+    assert name_index == rm_index + 1
+    assert replace_index == rm_index + 2
+    assert cap_drop_index == rm_index + 3
+
+
 # --------------------------------------------------------------------------
 # Bead .63: build_run_argv(relay_socket=) — mirrors egress_socket= exactly.
 # The credential-relay unix socket, mounted at /run/relay.sock, is the second
@@ -596,10 +625,10 @@ def test_dispatch_id_combined_with_egress_socket_and_env_no_interference(tmp_pat
 def test_relay_socket_appends_exactly_one_relay_volume(tmp_path):
     sock = tmp_path / "relay.sock"
     argv = _argv(tmp_path, relay_socket=sock)
-    relay_token = f"--volume={sock}:/run/relay.sock:rw"
+    relay_token = f"--volume={sock}:/run/relay.sock:ro"
     assert argv.count(relay_token) == 1
     # No egress mount unless egress_socket is also given.
-    assert not any(a.endswith(":/run/egress.sock:rw") for a in argv)
+    assert not any(a.endswith(":/run/egress.sock:ro") for a in argv)
 
 
 def test_relay_socket_none_is_byte_identical(tmp_path):
@@ -618,13 +647,27 @@ def test_relay_socket_combined_with_egress_socket_ordered(tmp_path):
     relay = tmp_path / "relay.sock"
     env = {"ANTHROPIC_API_KEY": "tok"}
     argv = _argv(tmp_path, egress_socket=egress, relay_socket=relay, env=env)
-    egress_token = f"--volume={egress}:/run/egress.sock:rw"
-    relay_token = f"--volume={relay}:/run/relay.sock:rw"
+    egress_token = f"--volume={egress}:/run/egress.sock:ro"
+    relay_token = f"--volume={relay}:/run/relay.sock:ro"
     env_token = "--env=ANTHROPIC_API_KEY=tok"
     assert egress_token in argv and relay_token in argv and env_token in argv
     assert argv.index(egress_token) < argv.index(relay_token) < argv.index(env_token)
     # relay volume immediately follows the egress volume.
     assert argv.index(relay_token) == argv.index(egress_token) + 1
+
+
+def test_socket_mounts_are_read_only(tmp_path):
+    # Both egress and relay socket mounts must be read-only (ro), not rw.
+    # A worker only needs to connect() over these sockets, which does not
+    # require write access to the mounted socket node. Read-only removes an
+    # unnecessary in-cage tampering vector.
+    egress = tmp_path / "egress.sock"
+    relay = tmp_path / "relay.sock"
+    argv = _argv(tmp_path, egress_socket=egress, relay_socket=relay)
+    egress_token = f"--volume={egress}:/run/egress.sock:ro"
+    relay_token = f"--volume={relay}:/run/relay.sock:ro"
+    assert egress_token in argv
+    assert relay_token in argv
 
 
 # --------------------------------------------------------------------------

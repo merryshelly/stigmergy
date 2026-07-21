@@ -223,7 +223,7 @@ def test_build_run_argv_env_and_egress_socket_together(tmp_path):
     argv = build_run_argv(profile, command=["true"], egress_socket=sock, env=env)
     volumes = [a for a in argv if a.startswith("--volume=")]
     assert len([v for v in volumes if "egress.sock" in v]) == 1
-    assert f"--volume={sock}:/run/egress.sock:rw" in argv
+    assert f"--volume={sock}:/run/egress.sock:ro" in argv
     assert "--env=ANTHROPIC_API_KEY=cap-tok" in argv
     assert "--env=ANTHROPIC_BASE_URL=http://x" in argv
 
@@ -262,7 +262,7 @@ def test_spawn_with_relay_socket_mounts_it_and_drops_base_url(tmp_path):
     cap = _capability()
     spawn(pack, work, _model_cfg(relay_socket=sock), cap, _budgets(), run_one=runner)
     argv, _env, _timeout = runner.calls[0]
-    assert f"--volume={sock}:/run/relay.sock:rw" in argv
+    assert f"--volume={sock}:/run/relay.sock:ro" in argv
     assert f"--env=ANTHROPIC_API_KEY={cap.token}" in argv
     assert not any(a.startswith("--env=ANTHROPIC_BASE_URL=") for a in argv)
 
@@ -277,7 +277,7 @@ def test_spawn_without_relay_socket_is_backward_compatible(tmp_path):
     spawn(pack, work, _model_cfg(relay_base_url="http://relay.local:9191"),
           cap, _budgets(), run_one=runner)
     argv, _env, _timeout = runner.calls[0]
-    assert not any(":/run/relay.sock:rw" in a for a in argv)
+    assert not any(":/run/relay.sock:ro" in a for a in argv)
     assert f"--env=ANTHROPIC_API_KEY={cap.token}" in argv
     assert "--env=ANTHROPIC_BASE_URL=http://relay.local:9191" in argv
 

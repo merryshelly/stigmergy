@@ -160,7 +160,13 @@ from stigmergy.charter import (
     resolve_check_resources,
 )
 from stigmergy.checks import CheckOutcome, CheckResult
-from stigmergy.dispatch import DispatchPlan, PriorEvidence, prepare_dispatch, select_lane
+from stigmergy.dispatch import (
+    DispatchPlan,
+    PriorEvidence,
+    generate_worker_name,
+    prepare_dispatch,
+    select_lane,
+)
 from stigmergy.drivers import claude_code
 from stigmergy.drivers.claude_code import DispatchResult, DispatchStatus
 from stigmergy.egress import EgressHandle
@@ -657,17 +663,22 @@ class Daemon:
 
         transition(self._store, ticket_id, IN_FLIGHT, expected_from=CLAIMED)
 
-        egress_handle = self._setup_egress(ticket_id, lane, now)
+        # Generate the REAL dispatch id BEFORE setting up relay/egress (ticket requirement).
+        # This is the same id that prepare_dispatch would mint, minted early so both
+        # relay and egress can log it from the very first request.
+        real_dispatch_id = generate_worker_name(self._store, "worker", lane.model, lane.prompt)
+
+        egress_handle = self._setup_egress(ticket_id, lane, now, real_dispatch_id)
         egress_socket = egress_handle.socket_path if egress_handle is not None else None
 
         # bead .25: the credential relay mirrors egress — set up BEFORE
-        # prepare_dispatch with a provisional id, read the served socket path
+        # prepare_dispatch with the real dispatch id, read the served socket path
         # back from the handle, thread it into the dispatch so spawn mounts
         # /run/relay.sock. The relay authorizes by capability TOKEN against the
         # shared CapabilityStore (not by dispatch_id), so it is safe to stand
         # up before the capability is minted inside prepare_dispatch — the
         # worker only issues a request once it is running, well after mint.
-        relay_handle = self._setup_relay(ticket_id, now)
+        relay_handle = self._setup_relay(ticket_id, now, real_dispatch_id)
         relay_socket = relay_handle.socket_path if relay_handle is not None else None
 
         fresh_row = self._store.get_ticket(ticket_id)
@@ -685,6 +696,7 @@ class Daemon:
             egress_socket=egress_socket,
             relay_socket=relay_socket,
             prior_evidence=self._gather_prior_evidence(ticket_id),
+            dispatch_id=real_dispatch_id,
         )
         # Reconcile the ticket's lease_dispatch_id to the REAL dispatch
         # identity now that prepare_dispatch has generated it — see module
@@ -719,19 +731,20 @@ class Daemon:
             return None
         return result.stdout.strip()
 
-    def _setup_egress(self, ticket_id: str, lane: Any, now: float) -> EgressHandle | None:
+    def _setup_egress(
+        self, ticket_id: str, lane: Any, now: float, dispatch_id: str
+    ) -> EgressHandle | None:
         """`None` unless `egress_setup_fn` is injected (wired for real by
         `cli._build_daemon` at `.25`)."""
         if self._egress_setup_fn is None:
             return None
         policy = egress.policy_for_lane(self._charter.raw, lane.name)
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_egress_runtime"
-        provisional_id = f"egress-{ticket_id}-{int(now * 1000)}"
-        return self._egress_setup_fn(provisional_id, policy, runtime_dir)
+        return self._egress_setup_fn(dispatch_id, policy, runtime_dir)
 
-    def _setup_relay(self, ticket_id: str, now: float) -> RelayHandle | None:
+    def _setup_relay(self, ticket_id: str, now: float, dispatch_id: str) -> RelayHandle | None:
         """bead .25: `None` unless `relay_setup_fn` is injected (wired for real
-        by `cli._build_daemon`). Mirrors `_setup_egress`: a provisional id + a
+        by `cli._build_daemon`). Mirrors `_setup_egress`: the real dispatch id + a
         per-rig runtime dir; the injected fn constructs a `CredentialRelay`
         (sharing this daemon's `CapabilityStore`) and `start_relay`s it,
         returning a `RelayHandle` whose `socket_path` the caller threads into
@@ -740,8 +753,7 @@ class Daemon:
         if self._relay_setup_fn is None:
             return None
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_relay_runtime"
-        provisional_id = f"relay-{ticket_id}-{int(now * 1000)}"
-        return self._relay_setup_fn(provisional_id, runtime_dir)
+        return self._relay_setup_fn(dispatch_id, runtime_dir)
 
     # -- dispatch cycle ---------------------------------------------------------
 

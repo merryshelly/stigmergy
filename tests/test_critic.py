@@ -264,7 +264,8 @@ def test_judge_repair_retry_is_bounded_to_one_then_infra():
     with pytest.raises(CriticInfraError) as excinfo:
         critic.judge(BENIGN_ARTIFACT, RUBRIC)
     assert len(client.calls) == 2
-    assert "after one repair-retry" in str(excinfo.value)
+    assert "first attempt" in str(excinfo.value)
+    assert "repair-retry" in str(excinfo.value)
 
 
 def test_judge_transport_failure_is_not_repair_retried():
@@ -275,6 +276,59 @@ def test_judge_transport_failure_is_not_repair_retried():
     with pytest.raises(CriticInfraError):
         critic.judge(BENIGN_ARTIFACT, RUBRIC)
     assert len(client.calls) == 1
+
+
+def test_judge_clean_first_pass_has_zero_repair_attempts():
+    # A valid verdict on the first call sets repair_attempts = 0
+    # and includes repair_instruction_hash unconditionally.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    _, gate_fields, _ = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+    assert gate_fields["repair_attempts"] == 0
+    assert "repair_instruction_hash" in gate_fields
+    assert isinstance(gate_fields["repair_instruction_hash"], str)
+    assert len(gate_fields["repair_instruction_hash"]) == 64  # sha256 hex
+
+
+def test_judge_repair_retry_has_one_repair_attempt():
+    # A verdict that only succeeds via repair-retry has repair_attempts = 1,
+    # and the repair_instruction_hash is the same as in clean cases
+    # (it's a hash of the constant, not per-attempt content).
+    client = SequenceClient([_incomplete_response(), _ok_response(reason="repaired")])
+    critic = _critic(client)
+    _, gate_fields_repaired, _ = critic.judge(BENIGN_ARTIFACT, RUBRIC)
+
+    # Repaired case: repair_attempts == 1
+    assert gate_fields_repaired["repair_attempts"] == 1
+    assert "repair_instruction_hash" in gate_fields_repaired
+
+    # Compare with clean case to verify hash is identical
+    client_clean = StubClient(response=_ok_response())
+    _, gate_fields_clean, _ = _critic(client_clean).judge(BENIGN_ARTIFACT, RUBRIC)
+    assert gate_fields_clean["repair_attempts"] == 0
+    clean_hash = gate_fields_clean["repair_instruction_hash"]
+    assert gate_fields_repaired["repair_instruction_hash"] == clean_hash
+
+
+def test_judge_double_failure_includes_both_exception_messages():
+    # When both first parse attempt and repair attempt fail, the terminal
+    # CriticInfraError's message includes information from both stages.
+    first_incomplete = {"outcome": "unmet", "tier": 2}  # missing reason/severity
+    repair_incomplete = {"outcome": "met"}  # missing tier, reason, severity
+    client = SequenceClient([first_incomplete, repair_incomplete])
+    critic = _critic(client)
+
+    with pytest.raises(CriticInfraError) as excinfo:
+        critic.judge(BENIGN_ARTIFACT, RUBRIC)
+
+    error_msg = str(excinfo.value)
+    # Should mention both stages
+    assert "first attempt" in error_msg
+    assert "repair-retry" in error_msg
+    # Should contain exception type information for both
+    assert "CriticInfraError" in error_msg
+    # Each stage should be bounded to 512 chars
+    assert len(error_msg) <= 512 + 512 + 200  # generous upper bound with context
 
 
 def test_judge_valid_first_response_does_not_repair_retry():
@@ -362,13 +416,15 @@ def test_judge_returns_filed_tickets_verbatim_when_present():
     assert filed_tickets == _FILINGS  # verbatim; file_proposals judges item shape
     # filings are NOT smuggled into gate_fields (event-provenance metadata only).
     # gate_fields always carries ts, wall_time_seconds, plus optional tokens if usage
-    # is present.
+    # is present, and always carries repair_attempts/repair_instruction_hash.
     assert set(gate_fields) == {
         "decoding_params",
         "prompt_artifact_hash",
         "model",
         "ts",
         "wall_time_seconds",
+        "repair_attempts",
+        "repair_instruction_hash",
     }
 
 
@@ -388,6 +444,8 @@ def test_judge_extracts_usage_tokens_when_present():
         "ts",
         "wall_time_seconds",
         "tokens",
+        "repair_attempts",
+        "repair_instruction_hash",
     }
 
 

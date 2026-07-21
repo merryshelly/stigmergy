@@ -137,7 +137,13 @@ class SpendLeash:
     auto-renewal" invariant.
     """
 
-    def __init__(self, budgets: Budgets, registry: Registry) -> None:
+    def __init__(
+        self,
+        budgets: Budgets,
+        registry: Registry,
+        *,
+        events: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._budgets = budgets
         self._registry = registry
 
@@ -150,6 +156,29 @@ class SpendLeash:
         self._final_weave_consumed = False
         self._was_exhausted = False
         self._notification_log: list[dict[str, Any]] = []
+
+        # Seed initial state from prior events if provided
+        if events:
+            self._seed_from_events(events)
+
+    def _seed_from_events(self, events: list[dict[str, Any]]) -> None:
+        """Seed the leash's initial state from prior events, using the same
+        counting rules as status.reconstruct_spend."""
+        for ev in events:
+            usd = ev.get("computed_usd")
+            if isinstance(usd, str):
+                # "unbudgetable" contributes nothing to the USD total
+                pass
+            elif isinstance(usd, (int, float)) and not isinstance(usd, bool):
+                # Numeric (non-bool) values contribute to metered spend
+                self._metered_spent += float(usd)
+
+            # Count dispatch/gate events by event_type
+            event_type = ev.get("event_type")
+            if event_type == "dispatch":
+                self._dispatch_count += 1
+            elif event_type == "gate":
+                self._gate_count += 1
 
     # -- refuse-to-start -------------------------------------------------
 

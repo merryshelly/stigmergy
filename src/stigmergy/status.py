@@ -19,8 +19,12 @@ writes to any of them.
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from stigmergy import statemachine
@@ -28,6 +32,9 @@ from stigmergy import statemachine
 # Cap on how many recent DISPOSITION events `gather_status` surfaces in
 # `last_verdicts` (SPEC §2 frozen interface: "last N (=5)").
 _LAST_VERDICTS_LIMIT = 5
+
+# Default tail length for render_event_tail.
+_DEFAULT_EVENT_TAIL_LIMIT = 25
 
 # The pool/eligible states that count toward queue age (a ticket waiting
 # to be worked, not one already claimed/in-flight/parked/terminal).
@@ -279,3 +286,85 @@ def render_ticket_detail(store: Any, ticket_id: str) -> str:
     for key in sorted(ticket):
         lines.append(f"{key}: {ticket[key]}")
     return "\n".join(lines)
+
+
+def render_event_tail(events: list[dict[str, Any]], n: int) -> str:
+    """Render the last `n` events from a list, one line per event (chronological
+    order in file = one-line-per-event, bounded to last n).
+
+    Each line shows: human-readable timestamp, event_type, ticket, and
+    outcome/disposition field (whichever is present).
+
+    If events is empty, return a clear placeholder line.
+    Never filter events based on content — every event in the trailing window
+    is shown.
+    """
+    if not events:
+        return "(no events)"
+
+    trailing_events = list(reversed(events))[:n]
+    trailing_events.reverse()
+
+    lines: list[str] = []
+    for ev in trailing_events:
+        ts = ev.get("ts")
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+
+        event_type = ev.get("event_type", "unknown")
+        ticket = ev.get("ticket", "-")
+
+        outcome = ev.get("outcome")
+        disposition = ev.get("disposition")
+        result_part = ""
+        if outcome is not None:
+            result_part = f" outcome={outcome}"
+        elif disposition is not None:
+            result_part = f" disposition={disposition}"
+
+        lines.append(f"{ts_str}  {event_type}  {ticket}{result_part}")
+
+    return "\n".join(lines)
+
+
+def render_daemon_liveness(rig_root: Path, *, ps_runner=subprocess.run) -> str:
+    """Check daemon liveness from pidfile at <rig_root>/daemon.pid.
+
+    Returns a human-readable status line covering:
+    - Pidfile missing
+    - Pidfile content unparseable
+    - Process not running (daemon exited)
+    - Process running (with elapsed runtime from ps if available)
+
+    ps_runner is an injectable subprocess-runner parameter (defaults to
+    subprocess.run) for testing.
+    """
+    pidfile_path = Path(rig_root) / "daemon.pid"
+
+    if not pidfile_path.exists():
+        return "daemon: pidfile not found"
+
+    try:
+        pid_str = pidfile_path.read_text(encoding="utf-8").strip()
+        pid = int(pid_str)
+    except (ValueError, OSError):
+        return "daemon: pidfile content is invalid"
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return f"daemon: DAEMON EXITED (pid {pid})"
+    except PermissionError:
+        return f"daemon: alive (pid {pid}, etime unavailable)"
+
+    result = ps_runner(
+        ["ps", "-p", str(pid), "-o", "etime="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode == 0:
+        etime = result.stdout.strip() if result.stdout else "unavailable"
+        return f"daemon: alive (pid {pid}, etime {etime})"
+    else:
+        return f"daemon: alive (pid {pid}, etime unavailable)"

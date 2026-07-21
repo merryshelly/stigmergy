@@ -453,3 +453,123 @@ def test_untriaged_filings_zero_when_none_filed(store, plane, notification_store
         now=1000.0,
     )
     assert status.untriaged_filings == 0
+
+
+# --- monitor command tests ---------------------------------------------------
+
+
+def test_render_event_tail_empty_list() -> None:
+    from stigmergy.status import render_event_tail
+
+    result = render_event_tail([], 25)
+    assert result == "(no events)"
+
+
+def test_render_event_tail_bounded_to_n() -> None:
+    from stigmergy.status import render_event_tail
+
+    events = [
+        {
+            "event_type": "dispatch",
+            "ticket": "t-1",
+            "ts": 1000.0,
+            "outcome": "succeeded",
+        },
+        {
+            "event_type": "gate",
+            "ticket": "t-2",
+            "ts": 2000.0,
+            "disposition": "approved",
+        },
+        {
+            "event_type": "dispatch",
+            "ticket": "t-3",
+            "ts": 3000.0,
+            "outcome": "failed",
+        },
+    ]
+
+    result = render_event_tail(events, 2)
+    lines = result.split("\n")
+    assert len(lines) == 2
+    assert "t-2" in lines[0]
+    assert "t-3" in lines[1]
+
+
+def test_render_event_tail_includes_warning_content() -> None:
+    from stigmergy.status import render_event_tail
+
+    events = [
+        {
+            "event_type": "disposition",
+            "ticket": "t-warning",
+            "ts": 1000.0,
+            "outcome": "warning-level-issue",
+        },
+    ]
+
+    result = render_event_tail(events, 25)
+    assert "warning" in result
+    assert "t-warning" in result
+
+
+def test_render_daemon_liveness_no_pidfile(tmp_path: Path) -> None:
+    from stigmergy.status import render_daemon_liveness
+
+    rig_root = tmp_path / "rig"
+    rig_root.mkdir()
+    result = render_daemon_liveness(rig_root)
+    assert "pidfile not found" in result
+
+
+def test_render_daemon_liveness_invalid_pidfile_content(tmp_path: Path) -> None:
+    from stigmergy.status import render_daemon_liveness
+
+    rig_root = tmp_path / "rig"
+    rig_root.mkdir()
+    pidfile = rig_root / "daemon.pid"
+    pidfile.write_text("not-a-number")
+
+    result = render_daemon_liveness(rig_root)
+    assert "invalid" in result
+
+
+def test_render_daemon_liveness_alive_process(tmp_path: Path) -> None:
+    import os
+
+    from stigmergy.status import render_daemon_liveness
+
+    rig_root = tmp_path / "rig"
+    rig_root.mkdir()
+    pidfile = rig_root / "daemon.pid"
+    pidfile.write_text(str(os.getpid()))
+
+    ps_responses = []
+
+    def stub_ps_runner(cmd, **kwargs):
+        class FakeResult:
+            returncode = 0
+            stdout = "1:23:45\n"
+
+        ps_responses.append(cmd)
+        return FakeResult()
+
+    result = render_daemon_liveness(rig_root, ps_runner=stub_ps_runner)
+    assert "alive" in result
+    assert str(os.getpid()) in result
+    assert "etime" in result
+    assert len(ps_responses) == 1
+
+
+def test_render_daemon_liveness_dead_process(tmp_path: Path) -> None:
+    from stigmergy.status import render_daemon_liveness
+
+    rig_root = tmp_path / "rig"
+    rig_root.mkdir()
+    pidfile = rig_root / "daemon.pid"
+    fake_pid = 999999
+    pidfile.write_text(str(fake_pid))
+
+    result = render_daemon_liveness(rig_root)
+    assert "DAEMON EXITED" in result
+    assert str(fake_pid) in result

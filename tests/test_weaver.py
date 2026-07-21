@@ -1659,3 +1659,52 @@ def test_weave_result_carries_gate_data_on_rejected_verdict(tmp_path, store, pla
     gate_events_list = gate_events(plane, "t-rejected-tokens")
     assert len(gate_events_list) == 1
     assert gate_events_list[0]["tokens"] == usage_tokens
+
+
+def test_gate_event_carries_repair_attempts_and_hash(tmp_path, store, plane):
+    """Verify that _append_gate_event passes through repair_attempts and
+    repair_instruction_hash from gate_fields to the GATE event payload."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(
+        tmp_path, staging_repo, name="t-repair-fields", files={"f.txt": "x\n"}
+    )
+    add_parked_ticket(store, "t-repair-fields", work_product=bundle)
+
+    # Create a critic with a clean response (no repair needed)
+    response = {
+        "outcome": "met",
+        "tier": 1,
+        "reason": "looks good",
+        "severity": "none",
+    }
+    from stigmergy.critic import Critic
+
+    client = StubCriticClient(response=response)
+    critic = Critic(
+        client=client,
+        model="test-model",
+        decoding_params={"temperature": 0.0},
+        template="Judge the artifact.",
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=critic,
+    )
+    weaver.weave(now=1000.0)
+
+    # Verify the GATE event was written and carries repair fields
+    gate_events_list = gate_events(plane, "t-repair-fields")
+    assert len(gate_events_list) == 1
+    gate_event = gate_events_list[0]
+
+    # repair_attempts should be 0 (clean first pass)
+    assert gate_event["repair_attempts"] == 0
+    # repair_instruction_hash should be present and be a 64-char hex string (sha256)
+    assert "repair_instruction_hash" in gate_event
+    assert isinstance(gate_event["repair_instruction_hash"], str)
+    assert len(gate_event["repair_instruction_hash"]) == 64

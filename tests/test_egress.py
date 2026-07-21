@@ -30,7 +30,7 @@ Case numbering below matches the build spec's §3 list exactly:
     13. zero direct egress from a --network=none container (skip if no podman)
 
   build_run_argv integration:
-    14. egress_socket=<path> appends exactly one --volume=...:/run/egress.sock:rw
+    14. egress_socket=<path> appends exactly one --volume=...:/run/egress.sock:ro
     15. egress_socket=None -> byte-identical to pre-.11 argv (regression guard)
 """
 
@@ -573,12 +573,12 @@ def test_build_run_argv_adds_egress_socket_mount_when_set(tmp_path):
     profile = _profile(tmp_path, network="none")
     sock = tmp_path / "egress.sock"
     argv = build_run_argv(profile, command=["true"], egress_socket=sock)
-    assert f"--volume={sock}:/run/egress.sock:rw" in argv
+    assert f"--volume={sock}:/run/egress.sock:ro" in argv
     assert "--network=none" in argv
 
     baseline = build_run_argv(profile, command=["true"])
     extra = [a for a in argv if a not in baseline]
-    assert extra == [f"--volume={sock}:/run/egress.sock:rw"]
+    assert extra == [f"--volume={sock}:/run/egress.sock:ro"]
 
 
 def test_build_run_argv_unchanged_when_egress_socket_none(tmp_path):

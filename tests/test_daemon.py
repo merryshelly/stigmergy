@@ -1594,6 +1594,56 @@ def test_relay_r6_teardown_order_revoke_then_relay_then_egress(env: Env) -> None
     assert order == ["revoke", "relay", "egress"]
 
 
+def test_relay_egress_setup_receives_real_dispatch_id(env: Env) -> None:
+    """Relay and egress setup functions receive the real dispatch_id (the same
+    as the dispatch's worker_name), not a provisional format. Both setup and
+    teardown see the same id."""
+    add_dispatchable_ticket(env, "t-real-id")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    egress_setup = FakeSetup("egress")
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup,
+                         egress_setup_fn=egress_setup)
+
+    daemon.poll_once()
+
+    # Get the real dispatch_id from the DISPATCH event
+    dispatch_ev = dispatch_events(env)[0]
+    real_dispatch_id = dispatch_ev["dispatch_id"]
+
+    # Verify relay setup received the real dispatch_id
+    assert len(relay_setup.calls) == 1
+    assert relay_setup.calls[0][0] == real_dispatch_id
+
+    # Verify egress setup received the real dispatch_id
+    assert len(egress_setup.calls) == 1
+    assert egress_setup.calls[0][0] == real_dispatch_id
+
+
+def test_relay_egress_dispatch_id_consistent_across_logs(env: Env) -> None:
+    """The dispatch_id passed to relay/egress setup is the real dispatch_id
+    that ends up on the DISPATCH event. This ensures relay-served and
+    egress-served logs carry the same dispatch_id as the dispatch record."""
+    add_dispatchable_ticket(env, "t-consistent-id")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    egress_setup = FakeSetup("egress")
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup,
+                         egress_setup_fn=egress_setup)
+
+    daemon.poll_once()
+
+    # Get the real dispatch_id from the DISPATCH event
+    dispatch_ev = dispatch_events(env)[0]
+    real_dispatch_id = dispatch_ev["dispatch_id"]
+
+    # Verify relay setup was called with the real dispatch_id (not a provisional format)
+    assert relay_setup.calls[0][0] == real_dispatch_id
+
+    # Verify egress setup was called with the real dispatch_id (not a provisional format)
+    assert egress_setup.calls[0][0] == real_dispatch_id
+
+
 # ==========================================================================
 # case 17: transcript sealed with the capability token redacted
 # (prove-can-fail priority)

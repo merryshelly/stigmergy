@@ -732,6 +732,38 @@ def test_case20_prepare_dispatch_mints_capability_exactly_once(tmp_path: Path) -
         store.close()
 
 
+def test_prepare_dispatch_reuses_supplied_dispatch_id(tmp_path: Path) -> None:
+    """When prepare_dispatch is given a dispatch_id parameter, it reuses
+    that id verbatim as the dispatch's worker_name instead of calling
+    generate_worker_name to mint a fresh one."""
+    supplied_id = "supplied-dispatch-id-for-testing"
+    _charter, plan, store, _cap = _prepare_test_dispatch(
+        tmp_path, dispatch_id=supplied_id
+    )
+    try:
+        # Verify the supplied id is used as the dispatch_id
+        assert plan.dispatch_id == supplied_id
+        assert plan.worker_name == supplied_id
+    finally:
+        store.close()
+
+
+def test_prepare_dispatch_mints_fresh_id_when_none_supplied(tmp_path: Path) -> None:
+    """When prepare_dispatch is called without a dispatch_id parameter
+    (the default), it calls generate_worker_name to mint a fresh id
+    as before, preserving backward compatibility."""
+    _charter, plan, store, _cap = _prepare_test_dispatch(tmp_path)
+    try:
+        # Verify the id was generated (not supplied)
+        # Should be in the format "worker-model-prompt-NONCE"
+        assert plan.dispatch_id == plan.worker_name
+        assert plan.dispatch_id.startswith("worker-")
+        # Should have been inserted into the store's worker_names table
+        assert store.worker_name_exists(plan.dispatch_id)
+    finally:
+        store.close()
+
+
 # ==========================================================================
 # Explicit rung override (bead .28) — select_lane / prepare_dispatch must be
 # able to dispatch a stepped-up (entry=false) rung named by current_rung,

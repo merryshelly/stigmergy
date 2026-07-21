@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 import stigmergy.cli as cli
+from stigmergy import approval
 from stigmergy.cli import (
     _DEFAULT_PROTECTED_PATHS,
     _build_daemon,
@@ -195,6 +196,105 @@ def test_build_daemon_wiring(tmp_path: Path) -> None:
         assert daemon._relay_teardown_fn is not None
     finally:
         daemon._store.close()
+
+
+# --- case 16b: _build_daemon seeds spend leash from prior events -----------
+
+
+def test_build_daemon_seeds_spend_leash_from_events(tmp_path: Path) -> None:
+    """_build_daemon passes record_plane.read_events() to SpendLeash,
+    seeding its initial state from any prior events already on disk."""
+    from stigmergy.records import EventType, make_event
+
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+    try:
+        # Seed the record plane with some prior dispatch/gate events
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+
+        event1 = make_event(
+            EventType.DISPATCH,
+            rig="shipyard",
+            ticket="t-1",
+            dispatch_id="d-1",
+            attempt=0,
+            attempt_kind="initial",
+            rung=1,
+            worker="worker-1",
+            charter_hash="charter-hash",
+            approval_hash="approval-hash",
+            image_digest="image-digest",
+            model="haiku",
+            model_version=None,
+            price_table_version="v1",
+            tokens={"in": 1_000_000, "cached": 0, "out": 0, "reasoning": 0},
+            computed_usd=0.8,
+            prompt_artifact_hash="code01-hash-1",
+            wall_time_seconds=1.0,
+        )
+        record_plane.append(event1)
+
+        event2 = make_event(
+            EventType.DISPATCH,
+            rig="shipyard",
+            ticket="t-1",
+            dispatch_id="d-2",
+            attempt=0,
+            attempt_kind="initial",
+            rung=1,
+            worker="worker-1",
+            charter_hash="charter-hash",
+            approval_hash="approval-hash",
+            image_digest="image-digest",
+            model="haiku",
+            model_version=None,
+            price_table_version="v1",
+            tokens={"in": 1_000_000, "cached": 0, "out": 0, "reasoning": 0},
+            computed_usd=0.8,
+            prompt_artifact_hash="code01-hash-2",
+            wall_time_seconds=1.0,
+        )
+        record_plane.append(event2)
+
+        event3 = make_event(
+            EventType.GATE,
+            rig="shipyard",
+            ticket=None,
+            dispatch_id=None,
+            attempt=0,
+            attempt_kind="initial",
+            rung=None,
+            worker=None,
+            charter_hash="charter-hash",
+            approval_hash=None,
+            image_digest=None,
+            model="haiku",
+            model_version=None,
+            price_table_version="v1",
+            tokens={"in": 500_000, "cached": 0, "out": 0, "reasoning": 0},
+            computed_usd=0.4,
+            prompt_artifact_hash="critic01-hash",
+            decoding_params={},
+            wall_time_seconds=1.0,
+        )
+        record_plane.append(event3)
+
+        # Now build the daemon — it should seed from these events
+        daemon = _build_daemon(resolved)
+        try:
+            report = daemon._spend_leash.run_report()
+            # Should reflect seeded state: 2 dispatches, 1 gate, $2.0 total
+            assert report["dispatches_used"] == 2
+            assert report["gate_calls_used"] == 1
+            assert report["metered_spent"] == pytest.approx(2.0)
+        finally:
+            daemon._store.close()
+    finally:
+        # resolved.store may already be closed by _build_daemon, but try anyway
+        try:
+            resolved.store.close()
+        except Exception:
+            pass
 
 
 # --- bead .25: _build_daemon credential-relay wiring ------------------------
@@ -724,7 +824,7 @@ def test_D5c_range_report_critic_unbudgetable_model(tmp_path: Path, monkeypatch,
 
 @pytest.mark.parametrize(
     "token",
-    ["approve", "unapprove", "reject", "promote", "status", "tickets", "range-report"],
+    ["approve", "unapprove", "reject", "promote", "status", "monitor", "tickets", "range-report"],
 )
 def test_D6c_usage_mentions_new_subcommands(token: str, capsys) -> None:
     main([])
@@ -753,6 +853,42 @@ def test_D7c_status_closes_store(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "resolve_rig", spy)
     rc = main(["status", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert closed == [True]
+
+
+# --- D8c: monitor command ---------------------------------------------------
+
+
+def test_D8c_monitor(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    rc = main(["monitor", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ticket states" in out
+    assert "recent events" in out
+
+
+def test_D8d_monitor_closes_store(tmp_path: Path, monkeypatch) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+    closed: list[bool] = []
+    real_resolve = cli.resolve_rig
+
+    def spy(name, *, rigs_root=None):
+        resolved = real_resolve(name, rigs_root=rigs_root)
+        orig_close = resolved.store.close
+
+        def tracked() -> None:
+            closed.append(True)
+            orig_close()
+
+        monkeypatch.setattr(resolved.store, "close", tracked)
+        return resolved
+
+    monkeypatch.setattr(cli, "resolve_rig", spy)
+    rc = main(["monitor", "--rig", RIG, "--rigs-root", str(rigs_root)])
     assert rc == 0
     assert closed == [True]
 
@@ -991,3 +1127,414 @@ def test_filed_with_empty_pool(tmp_path: Path, capsys) -> None:
     assert rc == 0
     out = capsys.readouterr().out
     assert "(no filed proposals)" in out
+
+
+# --- ticket new subcommand tests -------------------------------------------------
+
+
+def test_ticket_new_from_file(tmp_path: Path, capsys) -> None:
+    """Test ticket new creates an unapproved ticket from a file spec."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    spec = {
+        "id": "t-new-1",
+        "title": "New ticket from file",
+        "functional_summary": "Operator-facing: new ticket created via ticket new.",
+        "acceptance_criteria": ["works perfectly"],
+        "target_scope": ["src/new.py"],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "t-new-1" in out
+
+    ticket = _ticket(rigs_root, "t-new-1")
+    assert ticket is not None
+    assert ticket["title"] == "New ticket from file"
+    assert ticket["approved"] == 0  # unapproved
+    assert ticket["functional_summary"] == "Operator-facing: new ticket created via ticket new."
+
+    # Verify it can be approved without error
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        steering = derive_steering(ticket, resolved.charter, resolved.rig_paths["prompts_dir"])
+        assert steering is not None
+        approval.approve(resolved.store, "t-new-1", steering=steering)
+        approved_ticket = resolved.store.get_ticket("t-new-1")
+        assert approved_ticket is not None
+        assert approved_ticket["approved"] == 1
+    finally:
+        resolved.store.close()
+
+
+def test_ticket_new_from_stdin(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Test ticket new reads from stdin when spec is '-'."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    spec = {
+        "id": "t-new-stdin",
+        "title": "New ticket from stdin",
+        "functional_summary": "Operator-facing: created from stdin.",
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+    }
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(spec)))
+    rc = main(["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", "-"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "t-new-stdin" in out
+
+    ticket = _ticket(rigs_root, "t-new-stdin")
+    assert ticket is not None
+    assert ticket["approved"] == 0
+
+
+def test_ticket_new_with_optional_fields(tmp_path: Path, capsys) -> None:
+    """Test ticket new forwards optional fields correctly."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    spec = {
+        "id": "t-new-optional",
+        "title": "New ticket with optional fields",
+        "functional_summary": "Operator-facing: optional fields forwarded.",
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+        "goal": "Ship the feature",
+        "required_reading": ["docs/design.md"],
+        "difficulty": "medium",
+        "lane_hint": "normal",
+        "rubric_only": False,
+        "work_product": "pull request",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 0
+
+    ticket = _ticket(rigs_root, "t-new-optional")
+    assert ticket is not None
+    assert ticket["goal"] == "Ship the feature"
+    assert ticket["difficulty"] == "medium"
+
+
+def test_ticket_new_missing_required_field(tmp_path: Path, capsys) -> None:
+    """Test ticket new rejects incomplete specs."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    # Missing 'functional_summary'
+    spec = {
+        "id": "t-new-incomplete",
+        "title": "Incomplete ticket",
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "stigmergy ticket new:" in err
+    assert "missing required key" in err
+
+    # Verify nothing was created
+    assert _ticket(rigs_root, "t-new-incomplete") is None
+
+
+def test_ticket_new_empty_functional_summary(tmp_path: Path, capsys) -> None:
+    """Test ticket new rejects empty functional_summary."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    spec = {
+        "id": "t-new-empty-summary",
+        "title": "Empty summary",
+        "functional_summary": "   ",  # whitespace-only
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "stigmergy ticket new:" in err
+    assert "must be a non-empty string" in err
+
+    assert _ticket(rigs_root, "t-new-empty-summary") is None
+
+
+def test_ticket_new_duplicate_id(tmp_path: Path, capsys) -> None:
+    """Test ticket new rejects duplicate ticket ids."""
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-existing")
+
+    spec = {
+        "id": "t-existing",
+        "title": "Duplicate id",
+        "functional_summary": "Operator-facing: duplicate.",
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "stigmergy ticket new:" in err
+    assert "ticket id already exists" in err
+
+
+def test_ticket_new_blocks_key_rejected(tmp_path: Path, capsys) -> None:
+    """Test ticket new rejects specs with blocks key."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    spec = {
+        "id": "t-new-with-blocks",
+        "title": "Has blocks key",
+        "functional_summary": "Operator-facing: has blocks key.",
+        "acceptance_criteria": ["done"],
+        "target_scope": ["src/"],
+        "blocks": ["t-predecessor"],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    rc = main(
+        ["ticket", "new", "--rig", RIG, "--rigs-root", str(rigs_root), "--spec", str(spec_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "stigmergy ticket new:" in err
+    assert "blocks" in err and "not allowed" in err
+
+
+# --- intake subcommand tests ---------------------------------------------------
+
+
+def test_intake_creates_multiple_tickets(tmp_path: Path, capsys) -> None:
+    """Test intake creates multiple tickets from a manifest."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-intake-1",
+            "title": "Intake ticket 1",
+            "functional_summary": "Operator-facing: first intake ticket.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+        {
+            "id": "t-intake-2",
+            "title": "Intake ticket 2",
+            "functional_summary": "Operator-facing: second intake ticket.",
+            "acceptance_criteria": ["works"],
+            "target_scope": ["src/"],
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "t-intake-1" in out
+    assert "t-intake-2" in out
+
+    # Verify both tickets were created
+    t1 = _ticket(rigs_root, "t-intake-1")
+    t2 = _ticket(rigs_root, "t-intake-2")
+    assert t1 is not None
+    assert t2 is not None
+    assert t1["approved"] == 0
+    assert t2["approved"] == 0
+
+
+def test_intake_with_blocks_dependency(tmp_path: Path, capsys) -> None:
+    """Test intake wires blocks dependencies correctly."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-predecessor",
+            "title": "Predecessor",
+            "functional_summary": "Operator-facing: predecessor ticket.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+        {
+            "id": "t-dependent",
+            "title": "Dependent",
+            "functional_summary": "Operator-facing: dependent ticket.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+            "blocks": ["t-predecessor"],
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 0
+
+    # Verify the dependency was wired
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        deps = resolved.store.deps_of("t-dependent")
+        assert "t-predecessor" in deps
+    finally:
+        resolved.store.close()
+
+
+def test_intake_with_predecessor_defined_later_in_manifest(tmp_path: Path, capsys) -> None:
+    """Test intake allows blocks reference to entries defined later in manifest."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-later",
+            "title": "Later entry",
+            "functional_summary": "Defined later but referenced earlier.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+            "blocks": ["t-earlier"],
+        },
+        {
+            "id": "t-earlier",
+            "title": "Earlier entry",
+            "functional_summary": "Defined later in manifest.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 0
+
+    # Verify both tickets exist and dependency is wired
+    t1 = _ticket(rigs_root, "t-later")
+    t2 = _ticket(rigs_root, "t-earlier")
+    assert t1 is not None
+    assert t2 is not None
+
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        deps = resolved.store.deps_of("t-later")
+        assert "t-earlier" in deps
+    finally:
+        resolved.store.close()
+
+
+def test_intake_one_invalid_entry_fails_whole_manifest(tmp_path: Path, capsys) -> None:
+    """Test intake validates all entries before inserting anything."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-valid-1",
+            "title": "Valid ticket 1",
+            "functional_summary": "Operator-facing: first valid.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+        {
+            "id": "t-invalid",
+            "title": "Invalid ticket",
+            # Missing 'functional_summary'
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+        {
+            "id": "t-valid-2",
+            "title": "Valid ticket 2",
+            "functional_summary": "Operator-facing: second valid.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "stigmergy intake:" in err
+    assert "missing required key" in err
+
+    # Verify NONE of the tickets were created
+    assert _ticket(rigs_root, "t-valid-1") is None
+    assert _ticket(rigs_root, "t-invalid") is None
+    assert _ticket(rigs_root, "t-valid-2") is None
+
+
+def test_intake_duplicate_id_in_manifest(tmp_path: Path, capsys) -> None:
+    """Test intake rejects duplicate ids within the manifest."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-duplicate",
+            "title": "First",
+            "functional_summary": "Operator-facing: first.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+        {
+            "id": "t-duplicate",  # duplicate id
+            "title": "Second",
+            "functional_summary": "Operator-facing: second.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "duplicate id" in err
+
+    # Verify nothing was created
+    assert _ticket(rigs_root, "t-duplicate") is None
+
+
+def test_ticket_detail_still_works_unchanged(tmp_path: Path, capsys) -> None:
+    """Regression test: ticket <id> show-detail subcommand still works."""
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-1")
+
+    rc = main(["ticket", "t-1", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "t-1" in out
+    assert "functional_summary" in out

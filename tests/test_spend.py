@@ -425,3 +425,172 @@ def test_notification_intent_is_persisted_data_structure(registry: Registry) -> 
     assert isinstance(intent, dict)
     assert intent["exhausted"] is True
     assert "dispatches" in intent["reasons"]
+
+
+# --- 10. rehydration from prior events -----------------------------------
+
+
+def test_rehydrate_with_dispatch_and_gate_events(registry: Registry) -> None:
+    """Constructing a leash with a list of prior dispatch/gate events seeds
+    the initial state before any record_* call is made."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=100, reserve_usd=1.0)
+
+    # Build prior events: 2 dispatch events with $4.00 each, 1 gate with $3.00
+    prior_events = [
+        {
+            "event_type": "dispatch",
+            "computed_usd": 4.0,
+        },
+        {
+            "event_type": "dispatch",
+            "computed_usd": 4.0,
+        },
+        {
+            "event_type": "gate",
+            "computed_usd": 3.0,
+        },
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    # Report immediately: should reflect seeded state WITHOUT any record_* calls
+    report = leash.run_report()
+    assert report["dispatches_used"] == 2
+    assert report["gate_calls_used"] == 1
+    assert report["metered_spent"] == pytest.approx(11.0)  # 4 + 4 + 3
+
+
+def test_rehydrate_with_unbudgetable_events(registry: Registry) -> None:
+    """An event with computed_usd='unbudgetable' counts toward dispatch/gate
+    counts but contributes nothing to the USD total."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=100, reserve_usd=1.0)
+
+    prior_events = [
+        {
+            "event_type": "dispatch",
+            "computed_usd": "unbudgetable",
+        },
+        {
+            "event_type": "dispatch",
+            "computed_usd": 2.5,
+        },
+        {
+            "event_type": "gate",
+            "computed_usd": "unbudgetable",
+        },
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    report = leash.run_report()
+    assert report["dispatches_used"] == 2
+    assert report["gate_calls_used"] == 1
+    assert report["metered_spent"] == pytest.approx(2.5)  # only the 2.5
+
+
+def test_rehydrate_omitted_produces_all_zeros(registry: Registry) -> None:
+    """Omitting the events parameter (or passing None) produces all-zero
+    starting state, unchanged from the original behavior."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=100, reserve_usd=1.0)
+
+    leash1 = SpendLeash(budgets, registry)
+    leash2 = SpendLeash(budgets, registry, events=None)
+    leash3 = SpendLeash(budgets, registry, events=[])
+
+    for leash in [leash1, leash2, leash3]:
+        report = leash.run_report()
+        assert report["dispatches_used"] == 0
+        assert report["gate_calls_used"] == 0
+        assert report["metered_spent"] == 0.0
+
+
+def test_rehydrate_seeded_past_dispatch_cap_exhausts_immediately(registry: Registry) -> None:
+    """A leash seeded at or past a budget cap correctly reports exhaustion
+    and denies can_dispatch()/can_gate() without any further record_* calls."""
+    budgets = Budgets(dispatches=2, usd=1_000.0, gate_calls=2, reserve_usd=1.0)
+
+    prior_events = [
+        {"event_type": "dispatch", "computed_usd": 1.0},
+        {"event_type": "dispatch", "computed_usd": 1.0},
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    # Immediately exhausted on dispatch count
+    assert leash.exhausted() is True
+    assert leash.can_dispatch() is False
+    assert leash.can_gate() is True  # gate count is not exhausted
+
+
+def test_rehydrate_seeded_past_gate_cap_exhausts_immediately(registry: Registry) -> None:
+    """A leash seeded with gate calls past the cap correctly reports
+    exhaustion."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=1, reserve_usd=1.0)
+
+    prior_events = [
+        {"event_type": "gate", "computed_usd": 1.0},
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    assert leash.exhausted() is True
+    assert leash.can_gate() is False
+    assert leash.can_dispatch() is True  # dispatch count is not exhausted
+
+
+def test_rehydrate_seeded_past_usd_cap_exhausts_immediately(registry: Registry) -> None:
+    """A leash seeded with USD spend past the non-reserved cap correctly
+    reports exhaustion."""
+    budgets = Budgets(dispatches=100, usd=10.0, gate_calls=100, reserve_usd=2.0)
+
+    prior_events = [
+        {"event_type": "dispatch", "computed_usd": 8.0},
+        {"event_type": "dispatch", "computed_usd": 1.0},
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    # $9.00 spent, non-reserved cap = $8.00 -> exhausted
+    assert leash.exhausted() is True
+    assert leash.can_dispatch() is False
+    assert leash.can_gate() is False
+
+
+def test_rehydrate_ignores_non_dispatch_gate_event_types(registry: Registry) -> None:
+    """Events with event_type other than 'dispatch' or 'gate' (e.g. 'check',
+    'integration', 'disposition', 'notify', 'report', etc.) contribute their
+    USD cost but do NOT increment dispatch or gate counts."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=100, reserve_usd=1.0)
+
+    prior_events = [
+        {"event_type": "dispatch", "computed_usd": 1.0},
+        {"event_type": "check", "computed_usd": 2.0},
+        {"event_type": "integration", "computed_usd": 3.0},
+        {"event_type": "notification", "computed_usd": 4.0},
+        {"event_type": "gate", "computed_usd": 5.0},
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    report = leash.run_report()
+    assert report["dispatches_used"] == 1  # only dispatch event
+    assert report["gate_calls_used"] == 1  # only gate event
+    assert report["metered_spent"] == pytest.approx(15.0)  # all events
+
+
+def test_rehydrate_bool_not_treated_as_numeric(registry: Registry) -> None:
+    """A computed_usd that is a bool (since bool is an int subclass in Python)
+    is NOT treated as numeric and contributes nothing to the USD total."""
+    budgets = Budgets(dispatches=100, usd=1_000.0, gate_calls=100, reserve_usd=1.0)
+
+    prior_events = [
+        {"event_type": "dispatch", "computed_usd": True},
+        {"event_type": "dispatch", "computed_usd": False},
+        {"event_type": "dispatch", "computed_usd": 5.0},
+    ]
+
+    leash = SpendLeash(budgets, registry, events=prior_events)
+
+    report = leash.run_report()
+    assert report["dispatches_used"] == 3
+    assert report["metered_spent"] == pytest.approx(5.0)  # only the 5.0, not the bools

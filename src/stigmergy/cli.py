@@ -12,6 +12,7 @@ Top-level argparse dispatcher. v0 subcommand tree:
         --operator-session <s> [--reason <text>]
     stigmergy promote   <filed-id>  --rig <name> [--rigs-root <path>] --spec <path|->
     stigmergy status       --rig <name> [--rigs-root <path>]
+    stigmergy monitor      --rig <name> [--rigs-root <path>] [--tail N]
     stigmergy tickets      --rig <name> [--rigs-root <path>]
     stigmergy filed        --rig <name> [--rigs-root <path>]
     stigmergy ticket <id>  --rig <name> [--rigs-root <path>]
@@ -60,6 +61,8 @@ from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_r
 from stigmergy.spend import Budgets, SpendLeash
 from stigmergy.status import (
     gather_status,
+    render_daemon_liveness,
+    render_event_tail,
     render_status,
     render_ticket_detail,
     render_ticket_list,
@@ -78,7 +81,10 @@ _USAGE = (
     "  reject <filed-id> --rig <name> [--rigs-root <path>] --agent <a>"
     " --operator-session <s> [--reason <text>]\n"
     "  promote <filed-id> --rig <name> [--rigs-root <path>] --spec <path|->\n"
+    "  ticket new --rig <name> [--rigs-root <path>] --spec <path|->\n"
+    "  intake --rig <name> [--rigs-root <path>] --manifest <path>\n"
     "  status --rig <name> [--rigs-root <path>]\n"
+    "  monitor --rig <name> [--rigs-root <path>] [--tail N]\n"
     "  tickets --rig <name> [--rigs-root <path>]\n"
     "  filed --rig <name> [--rigs-root <path>]\n"
     "  ticket <id> --rig <name> [--rigs-root <path>]\n"
@@ -167,6 +173,12 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Print the AC12 status snapshot.")
     add_rig_args(status_parser)
 
+    monitor_parser = subparsers.add_parser("monitor", help="Print status and recent events.")
+    add_rig_args(monitor_parser)
+    monitor_parser.add_argument(
+        "--tail", type=int, default=25, help="Number of recent events to display (default: 25)."
+    )
+
     tickets_parser = subparsers.add_parser("tickets", help="List all tickets.")
     add_rig_args(tickets_parser)
 
@@ -176,6 +188,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ticket_parser = subparsers.add_parser("ticket", help="Show one ticket's full detail.")
     ticket_parser.add_argument("ticket_id", help="Ticket id to show.")
     add_rig_args(ticket_parser)
+
+    intake_parser = subparsers.add_parser("intake", help="Create multiple tickets from a manifest.")
+    add_rig_args(intake_parser)
+    intake_parser.add_argument(
+        "--manifest", required=True, help="Path to a JSON array manifest file."
+    )
 
     range_report_parser = subparsers.add_parser(
         "range-report", help="Compute the deterministic range diff artifact."
@@ -271,6 +289,7 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
             reserve_usd=0.0,  # v0 default -- charter has no reserve_usd knob (§3.4)
         ),
         registry,
+        events=record_plane.read_events(),
     )
 
     # bead .79: use the per-rig built image (base + provision deps) when
@@ -567,6 +586,241 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
+def _build_ticket_new_parser() -> argparse.ArgumentParser:
+    """Build a dedicated argparse for `ticket new` (argv pre-dispatch helper)."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--rig", required=True, help="Name of the rig.")
+    parser.add_argument(
+        "--rigs-root",
+        default=None,
+        help="Base directory the rig lives under (default: ~/rigs).",
+    )
+    parser.add_argument(
+        "--spec", required=True, help="Path to a JSON ticket spec, or '-' for stdin."
+    )
+    return parser
+
+
+def _cmd_ticket_new(args: argparse.Namespace) -> int:
+    """Create a single new ticket from a JSON spec."""
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            raw = sys.stdin.read() if args.spec == "-" else Path(args.spec).read_text(
+                encoding="utf-8"
+            )
+            spec = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"stigmergy ticket new: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(spec, dict):
+            print(
+                f"stigmergy ticket new: spec must be a JSON object (got {type(spec).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Validate required fields
+        required_keys = {"id", "title", "functional_summary", "acceptance_criteria", "target_scope"}
+        missing = required_keys - set(spec)
+        if missing:
+            print(
+                f"stigmergy ticket new: spec missing required key(s): {sorted(missing)}",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Validate functional_summary is a non-empty string
+        functional_summary = spec.get("functional_summary")
+        if not isinstance(functional_summary, str) or not functional_summary.strip():
+            print(
+                f"stigmergy ticket new: 'functional_summary' must be a non-empty string "
+                f"(got {functional_summary!r})",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Check for blocks key (not allowed for ticket new)
+        if "blocks" in spec:
+            print(
+                "stigmergy ticket new: 'blocks' key is not allowed "
+                "(use intake for dependency wiring)",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Check if ticket id already exists
+        if resolved.store.get_ticket(spec["id"]) is not None:
+            print(f"stigmergy ticket new: ticket id already exists: {spec['id']}", file=sys.stderr)
+            return 1
+
+        # Build the fields to pass to add_ticket
+        optional_keys = {
+            "goal",
+            "required_reading",
+            "tier1_checks",
+            "difficulty",
+            "lane_hint",
+            "rubric_only",
+            "work_product",
+        }
+        ticket_fields: dict[str, Any] = {}
+        for key in ["functional_summary", "acceptance_criteria", "target_scope"]:
+            ticket_fields[key] = spec[key]
+        for key in optional_keys:
+            if key in spec:
+                ticket_fields[key] = spec[key]
+
+        # Insert the ticket (unapproved)
+        resolved.store.add_ticket(id=spec["id"], title=spec["title"], **ticket_fields)
+
+        print(spec["id"])
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_intake(args: argparse.Namespace) -> int:
+    """Create multiple tickets from a JSON manifest with optional dependency wiring."""
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            manifest_text = Path(args.manifest).read_text(encoding="utf-8")
+            manifest = json.loads(manifest_text)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"stigmergy intake: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(manifest, list):
+            print(
+                f"stigmergy intake: manifest must be a JSON array (got {type(manifest).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Collect all ids from the manifest in a first pass
+        required_keys = {
+            "id",
+            "title",
+            "functional_summary",
+            "acceptance_criteria",
+            "target_scope",
+        }
+        optional_keys = {
+            "goal",
+            "required_reading",
+            "tier1_checks",
+            "difficulty",
+            "lane_hint",
+            "rubric_only",
+            "work_product",
+        }
+        manifest_ids = set()
+
+        for entry in manifest:
+            if isinstance(entry, dict) and "id" in entry:
+                manifest_ids.add(entry["id"])
+
+        # Second pass: validate all entries before inserting anything
+        entries_to_insert: list[dict[str, Any]] = []
+
+        for idx, entry in enumerate(manifest):
+            if not isinstance(entry, dict):
+                print(
+                    f"stigmergy intake: manifest entry {idx} must be a JSON object "
+                    f"(got {type(entry).__name__})",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Check required fields
+            missing = required_keys - set(entry)
+            if missing:
+                entry_id = entry.get("id", f"<index {idx}>")
+                sorted_missing = ", ".join(sorted(missing))
+                print(
+                    f"stigmergy intake: manifest entry {idx} ({entry_id}) "
+                    f"missing required key(s): {sorted_missing}",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Check functional_summary is a non-empty string
+            functional_summary = entry.get("functional_summary")
+            if not isinstance(functional_summary, str) or not functional_summary.strip():
+                entry_id = entry.get("id", f"<index {idx}>")
+                print(
+                    f"stigmergy intake: manifest entry {idx} ({entry_id}) "
+                    f"'functional_summary' must be a non-empty string "
+                    f"(got {functional_summary!r})",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Check for duplicate ids within the manifest (counting in manifest_ids)
+            entry_id = entry["id"]
+            count_in_manifest = sum(
+                1 for e in manifest if isinstance(e, dict) and e.get("id") == entry_id
+            )
+            if count_in_manifest > 1:
+                print(
+                    f"stigmergy intake: manifest entry {idx} ({entry_id}) has duplicate id",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Check if this id already exists in the store
+            if resolved.store.get_ticket(entry_id) is not None:
+                print(
+                    f"stigmergy intake: manifest entry {idx} ({entry_id}) ticket id already exists",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Validate blocks references (all must resolve to either store or manifest entries)
+            blocks = entry.get("blocks", [])
+            for predecessor_id in blocks:
+                store_has_it = resolved.store.get_ticket(predecessor_id) is not None
+                manifest_has_it = predecessor_id in manifest_ids
+                if not store_has_it and not manifest_has_it:
+                    print(
+                        f"stigmergy intake: manifest entry {idx} ({entry_id}) "
+                        f"blocks unresolved predecessor: {predecessor_id}",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+            entries_to_insert.append(entry)
+
+        # Second pass: insert all tickets
+        for entry in entries_to_insert:
+            ticket_fields: dict[str, Any] = {}
+            for key in ["functional_summary", "acceptance_criteria", "target_scope"]:
+                ticket_fields[key] = entry[key]
+            for key in optional_keys:
+                if key in entry:
+                    ticket_fields[key] = entry[key]
+
+            resolved.store.add_ticket(id=entry["id"], title=entry["title"], **ticket_fields)
+
+        # Third pass: wire all dependencies
+        for entry in entries_to_insert:
+            blocks = entry.get("blocks", [])
+            for predecessor_id in blocks:
+                resolved.store.add_dep(entry["id"], predecessor_id)
+
+        # Print one result line per entry
+        for entry in entries_to_insert:
+            print(f"{entry['id']}")
+
+        return 0
+    finally:
+        resolved.store.close()
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     resolved, rc = _resolve_rig_or_none(args)
     if resolved is None:
@@ -583,6 +837,38 @@ def _cmd_status(args: argparse.Namespace) -> int:
             now=time.time(),
         )
         print(render_status(status))
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        records_dir = resolved.rig_paths["records_dir"]
+        record_plane = RecordPlane(records_dir)
+
+        status = gather_status(
+            store=resolved.store,
+            record_plane=record_plane,
+            notification_store=NotificationStore(records_dir / "notifications.jsonl"),
+            charter_resolved=resolved.charter.raw,
+            disk_path=str(resolved.rig_root),
+            min_disk_bytes=None,
+            now=time.time(),
+        )
+
+        print("=== daemon liveness ===")
+        print(render_daemon_liveness(resolved.rig_root))
+        print()
+        print(render_status(status))
+        print()
+        print("=== recent events ===")
+        events = record_plane.read_events()
+        print(render_event_tail(events, args.tail))
+
         return 0
     finally:
         resolved.store.close()
@@ -860,6 +1146,13 @@ def main(argv: list[str] | None = None) -> int:
         print(_USAGE)
         return 0
 
+    # argv pre-dispatch for 'ticket new' (special case to avoid colliding with
+    # the existing 'ticket <id>' subparser that takes a positional ticket_id)
+    if len(argv) >= 2 and argv[0] == "ticket" and argv[1] == "new":
+        ticket_new_parser = _build_ticket_new_parser()
+        ticket_new_args = ticket_new_parser.parse_args(argv[2:])
+        return _cmd_ticket_new(ticket_new_args)
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -885,12 +1178,16 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_promote(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "monitor":
+        return _cmd_monitor(args)
     if args.command == "tickets":
         return _cmd_tickets(args)
     if args.command == "filed":
         return _cmd_filed(args)
     if args.command == "ticket":
         return _cmd_ticket(args)
+    if args.command == "intake":
+        return _cmd_intake(args)
     if args.command == "range-report":
         return _cmd_range_report(args)
 

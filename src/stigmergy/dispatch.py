@@ -552,6 +552,7 @@ def prepare_dispatch(
     egress_socket: Path | str | None = None,
     relay_socket: Path | str | None = None,
     prior_evidence: PriorEvidence | None = None,
+    dispatch_id: str | None = None,
 ) -> DispatchPlan:
     """The one entry point `.22` calls (bead .21 build spec §1). Composes
     :func:`select_lane` + :func:`generate_worker_name` +
@@ -573,11 +574,19 @@ def prepare_dispatch(
     the window during which a minted-but-unused capability could exist if
     this function itself were interrupted partway through (see module
     docstring §0.1 on `.22`'s prepare->spawn->revoke `finally` contract).
+
+    If ``dispatch_id`` is provided, it is reused verbatim as the dispatch's
+    id (the worker name) instead of calling :func:`generate_worker_name`.
+    When not provided (None), :func:`generate_worker_name` is called to
+    mint a fresh id as before.
     """
     lane = select_lane(charter, ticket_row, rung=ticket_row.get("current_rung"))
 
-    worker_name = generate_worker_name(store, "worker", lane.model, lane.prompt)
-    dispatch_id = worker_name
+    if dispatch_id is None:
+        worker_name = generate_worker_name(store, "worker", lane.model, lane.prompt)
+        dispatch_id = worker_name
+    else:
+        worker_name = dispatch_id
 
     dispatch_dir = clones_root / dispatch_id
     work_clone = dispatch_dir / "work"

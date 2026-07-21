@@ -1026,6 +1026,11 @@ class Weaver:
             fields["tokens"] = gate_fields["tokens"]
         if "wall_time_seconds" in gate_fields:
             fields["wall_time_seconds"] = gate_fields["wall_time_seconds"]
+        # Populate repair metadata from gate_fields
+        if "repair_attempts" in gate_fields:
+            fields["repair_attempts"] = gate_fields["repair_attempts"]
+        if "repair_instruction_hash" in gate_fields:
+            fields["repair_instruction_hash"] = gate_fields["repair_instruction_hash"]
         event = make_event(EventType.GATE, **fields)
         self.record_plane.append(event)
 

@@ -277,17 +277,22 @@ def build_run_argv(
 
     ``egress_socket`` (bead .11) is the ONE additional mount this function
     can ever add: when given, exactly one more `--volume=` bind is appended
-    — ``--volume=<egress_socket>:/run/egress.sock:rw`` — the dispatch's
+    — ``--volume=<egress_socket>:/run/egress.sock:ro`` — the dispatch's
     egress-proxy unix socket, the worker's sole path out of its
-    `--network=none` cage. Nothing else about the argv changes. Left at its
-    default ``None``, the returned argv is byte-identical to the pre-.11
-    argv (regression guard: existing callers/tests are unaffected).
+    `--network=none` cage. The socket is mounted read-only (ro) because a
+    worker only needs to connect() over the socket, which does not require
+    write access to the mounted socket node; read-only removes an
+    unnecessary in-cage tampering vector. Nothing else about the argv
+    changes. Left at its default ``None``, the returned argv is
+    byte-identical to the pre-.11 argv (regression guard: existing
+    callers/tests are unaffected).
 
     ``relay_socket`` (bead .63) mirrors ``egress_socket`` exactly: when
     given, exactly one more `--volume=` bind is appended —
-    ``--volume=<relay_socket>:/run/relay.sock:rw`` — the dispatch's
+    ``--volume=<relay_socket>:/run/relay.sock:ro`` — the dispatch's
     credential-relay unix socket, the SECOND (and last) socket the
-    in-container shim bridges (``ANTHROPIC_BASE_URL`` -> relay). It is
+    in-container shim bridges (``ANTHROPIC_BASE_URL`` -> relay). The socket
+    is mounted read-only (ro) for the same reason as egress_socket. It is
     emitted immediately AFTER the ``egress_socket`` volume (frozen,
     deterministic order) and before any ``env`` tokens. Left at its default
     ``None``, the returned argv is byte-identical to the pre-.63 argv (the
@@ -308,21 +313,26 @@ def build_run_argv(
     the pre-.13 argv (regression guard, exactly the discipline
     ``egress_socket=None`` already gets).
 
-    ``dispatch_id`` (bead .34 build spec, Part A) tags the container so a
-    real :class:`ContainerReaper` (:class:`PodmanContainerReaper`, this
-    module) can map a running podman container back to the dispatch that
-    spawned it (SPEC §9 crash recovery). When given, exactly one more argv
-    token is emitted — ``f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}"``
-    — inserted immediately after the `--network=...` token and immediately
-    before the first `--volume=...` token (frozen position — every other
-    additive token, `egress_socket`'s volume and `env`'s `--env=` tokens,
-    stays in its own already-documented slot, unaffected). ``dispatch_id``
-    is validated (non-empty, no `=`, no whitespace, no `,`) — see
-    :func:`_require_valid_dispatch_id` — raising :class:`ContainerError`
-    before any token is appended. Left at its default ``None``, the
-    returned argv is byte-identical to the pre-.34 argv (regression guard,
-    exactly the discipline ``egress_socket=None``/``env=None`` already
-    get).
+    ``dispatch_id`` (bead .34 build spec, Part A) tags the container with a
+    name and labels so a real :class:`ContainerReaper`
+    (:class:`PodmanContainerReaper`, this module) can map a running podman
+    container back to the dispatch that spawned it (SPEC §9 crash recovery).
+    When given, exactly two more argv tokens are emitted — ``--name=<dispatch_id>``
+    and ``--replace`` — inserted immediately after the `--rm` token and
+    immediately before the `--cap-drop=ALL` token (frozen position for early
+    localization); additionally, exactly one label token is emitted —
+    ``f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}"`` — inserted
+    immediately after the `--network=...` token and immediately before the
+    first `--volume=...` token (frozen position, unaffected by the
+    `--name`/`--replace` tokens which precede all other flags). The
+    `--replace` flag exists to give podman cleanup semantics for name
+    collisions when a retried dispatch reuses the same dispatch_id/container
+    name. ``dispatch_id`` is validated (non-empty, no `=`, no whitespace,
+    no `,`) — see :func:`_require_valid_dispatch_id` — raising
+    :class:`ContainerError` before any token is appended. Left at its
+    default ``None``, the returned argv is byte-identical to the pre-.34
+    argv (regression guard, exactly the discipline ``egress_socket=None``/
+    ``env=None`` already get).
 
     ``entrypoint_override`` (bead .87) is the ONLY thing that can displace
     the image's own ENTRYPOINT. When given, exactly one
@@ -357,6 +367,11 @@ def build_run_argv(
         "podman",
         "run",
         "--rm",
+    ]
+    if dispatch_id is not None:
+        argv.append(f"--name={dispatch_id}")
+        argv.append("--replace")
+    argv.extend([
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
         "--read-only",
@@ -365,16 +380,16 @@ def build_run_argv(
         f"--cpus={profile.cpus}",
         f"--timeout={profile.timeout_seconds}",
         f"--network={profile.network}",
-    ]
+    ])
     if dispatch_id is not None:
         argv.append(f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}")
     argv.append(f"--volume={work}:/work:rw")
     argv.append(f"--volume={task}:/task:ro")
     argv.append(f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev")
     if egress_socket is not None:
-        argv.append(f"--volume={egress_socket}:/run/egress.sock:rw")
+        argv.append(f"--volume={egress_socket}:/run/egress.sock:ro")
     if relay_socket is not None:
-        argv.append(f"--volume={relay_socket}:/run/relay.sock:rw")
+        argv.append(f"--volume={relay_socket}:/run/relay.sock:ro")
     if env is not None:
         for key in sorted(env):
             argv.append(f"--env={key}={env[key]}")
