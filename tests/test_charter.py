@@ -494,6 +494,87 @@ def test_unknown_dispatch_limits_key_still_rejected(tmp_path: Path) -> None:
         load_charter(make_charter(tmp_path, content), env={})
 
 
+# --- D14: dispatch_limits value validation (must be positive ints) -----------
+
+
+def test_dispatch_limits_output_tokens_string_rejected(tmp_path: Path) -> None:
+    content = mutate("output_tokens = 200000", 'output_tokens = "200000"')
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_output_tokens_bool_rejected(tmp_path: Path) -> None:
+    content = mutate("output_tokens = 200000", "output_tokens = true")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_output_tokens_zero_rejected(tmp_path: Path) -> None:
+    content = mutate("output_tokens = 200000", "output_tokens = 0")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_output_tokens_negative_rejected(tmp_path: Path) -> None:
+    content = mutate("output_tokens = 200000", "output_tokens = -1")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_driver_turns_string_rejected(tmp_path: Path) -> None:
+    content = mutate("driver_turns = 100", 'driver_turns = "100"')
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_driver_turns_zero_rejected(tmp_path: Path) -> None:
+    content = mutate("driver_turns = 100", "driver_turns = 0")
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_filed_tickets_bool_rejected(tmp_path: Path) -> None:
+    content = mutate(
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n"
+        "filed_tickets = true\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_filed_ticket_bytes_negative_rejected(tmp_path: Path) -> None:
+    content = mutate(
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n"
+        "filed_ticket_bytes = -1\n",
+    )
+    charter_path = make_charter(tmp_path, content)
+    with pytest.raises(CharterError):
+        load_charter(charter_path, env={})
+
+
+def test_dispatch_limits_valid_positive_ints_load(tmp_path: Path) -> None:
+    content = mutate(
+        "[loop.dispatch_limits]\noutput_tokens = 200000\ndriver_turns = 100\n",
+        "[loop.dispatch_limits]\noutput_tokens = 300000\ndriver_turns = 150\n"
+        "filed_tickets = 10\nfiled_ticket_bytes = 32768\n",
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    dl = charter.raw["loop"]["dispatch_limits"]
+    assert dl["output_tokens"] == 300000
+    assert dl["driver_turns"] == 150
+    assert dl["filed_tickets"] == 10
+    assert dl["filed_ticket_bytes"] == 32768
+
+
 # --- .91: charter-configurable checker resource bounds --------------------
 # Bead workspace-e2uh.91. Resolution order (lowest -> highest precedence):
 # DEFAULT_CHECK_RESOURCES (the legacy hardcoded 60s/256m/1cpu/64m/64pids)

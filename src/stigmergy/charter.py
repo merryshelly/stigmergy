@@ -600,6 +600,12 @@ def _validate_loop(loop_cfg: Any) -> None:
 
     dispatch_limits = loop_cfg.get("dispatch_limits", {})
     _validate_keys(dispatch_limits, _KNOWN_DISPATCH_LIMITS_KEYS, "loop.dispatch_limits")
+    _validate_positive_int(dispatch_limits, "output_tokens", "loop.dispatch_limits.output_tokens")
+    _validate_positive_int(dispatch_limits, "driver_turns", "loop.dispatch_limits.driver_turns")
+    _validate_positive_int(dispatch_limits, "filed_tickets", "loop.dispatch_limits.filed_tickets")
+    _validate_positive_int(
+        dispatch_limits, "filed_ticket_bytes", "loop.dispatch_limits.filed_ticket_bytes"
+    )
 
     retries = loop_cfg.get("retries", {})
     _validate_keys(retries, _KNOWN_RETRIES_KEYS, "loop.retries")

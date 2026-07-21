@@ -486,3 +486,54 @@ def test_judge_omits_check_evidence_section_when_not_provided():
     prompt = client.calls[0]["prompt"]
     assert "===TRUSTED-EVIDENCE-BEGIN===" not in prompt
     assert "===TRUSTED-EVIDENCE-END===" not in prompt
+
+
+# --------------------------------------------------------------------------
+# Error message bounding and sanitization (ticket requirement)
+# --------------------------------------------------------------------------
+
+
+def test_client_exception_message_is_bounded_and_sanitized():
+    # When the underlying critic client raises an exception, the error
+    # message should be:
+    # 1. Bounded to ~512 chars
+    # 2. In the form 'ExceptionType: message' (not repr)
+    oversized_message = "X" * 1000  # An oversized message
+    client = StubClient(raises=ValueError(oversized_message))
+    critic = _critic(client)
+
+    with pytest.raises(CriticInfraError) as excinfo:
+        critic.judge(BENIGN_ARTIFACT, RUBRIC)
+
+    error_msg = str(excinfo.value)
+    # The error should be bounded to reasonable length
+    assert len(error_msg) <= 512 + len("critic client call failed: ")
+    # The error should be in 'ExceptionType: message' form
+    assert "ValueError: " in error_msg
+    # Should not contain repr-style wrapping with quotes and parentheses
+    assert "ValueError('" not in error_msg
+
+
+def test_client_exception_with_odd_message_preserves_format():
+    # Verify that various exception messages are formatted correctly
+    # and bounded properly.
+    test_cases = [
+        RuntimeError("simple error"),
+        TypeError("error with 'quotes' and \"double quotes\""),
+        ValueError("multiline\nerror\nmessage"),
+        OSError("x" * 1000),  # very long message
+    ]
+
+    for exc in test_cases:
+        client = StubClient(raises=exc)
+        critic = _critic(client)
+
+        with pytest.raises(CriticInfraError) as excinfo:
+            critic.judge(BENIGN_ARTIFACT, RUBRIC)
+
+        error_msg = str(excinfo.value)
+        # Verify format: "critic client call failed: ExceptionType: message"
+        assert "critic client call failed: " in error_msg
+        assert f"{type(exc).__name__}: " in error_msg
+        # Verify bounded length
+        assert len(error_msg) <= 512 + len("critic client call failed: ")

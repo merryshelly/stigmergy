@@ -174,8 +174,47 @@ class RigStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._ensure_filed_tickets_table()
-        self._ensure_functional_summary_column()
-        self._ensure_critic_infra_failures_column()
+        self._run_schema_migrations()
+
+    def _run_schema_migrations(self) -> None:
+        """Run ordered, versioned migrations to bring schema up to current.
+
+        Each migration is idempotent (safe to rerun) and updates
+        rig_meta.schema_version after success, so reopening an older DB
+        both brings it current and records that in the version tag.
+        Migrations are applied in order based on current schema_version.
+        """
+        # Schema version is only meaningful if tickets table exists
+        # (a fresh store via .create() hasn't built it yet — that happens
+        # after __init__ returns, in .create() itself).
+        table_exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
+        ).fetchone()
+        if table_exists is None:
+            return
+
+        current_version = self.get_meta("schema_version")
+        current_version_int = int(current_version) if current_version else 0
+
+        # Migration to version 4: add functional_summary column (bead .42)
+        if current_version_int < 4:
+            cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
+            if "functional_summary" not in cols:
+                self._conn.execute("ALTER TABLE tickets ADD COLUMN functional_summary TEXT")
+                self._conn.commit()
+            self.set_meta("schema_version", "4")
+            current_version_int = 4
+
+        # Migration to version 5: add critic_infra_failures column (bead .107)
+        if current_version_int < 5:
+            cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
+            if "critic_infra_failures" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE tickets ADD COLUMN critic_infra_failures "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.commit()
+            self.set_meta("schema_version", "5")
 
     def _ensure_critic_infra_failures_column(self) -> None:
         """Self-healing migration (bead .107): add the

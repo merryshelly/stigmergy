@@ -335,7 +335,8 @@ class Critic:
         try:
             return self._client(prompt, model=self.model, **self.decoding_params)
         except Exception as exc:
-            raise CriticInfraError(f"critic client call failed: {exc!r}") from exc
+            error_str = f"{type(exc).__name__}: {exc}"[:512]
+            raise CriticInfraError(f"critic client call failed: {error_str}") from exc
 
     def judge(
         self, artifact: str, rubric_items: list[str], *, check_evidence: str | None = None

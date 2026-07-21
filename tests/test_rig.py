@@ -329,6 +329,60 @@ def test_critic_infra_failures_column_migrated_on_open(tmp_path: Path) -> None:
         reopened2.close()
 
 
+def test_stale_schema_version_migrated_on_open(tmp_path: Path) -> None:
+    """A DB with a stale schema_version (older tag, missing a newer column)
+    gets the missing column AND the schema_version is updated to current
+    when reopened via plain RigStore(path)."""
+    db_path = tmp_path / "tickets.db"
+    store = RigStore.create(db_path)
+    try:
+        # Add a ticket before dropping the column (so we test data preservation)
+        store.add_ticket(id="old-ticket", title="A ticket from the old schema")
+        # Simulate a pre-.107 rig: drop critic_infra_failures and set version to 4
+        store._conn.execute("ALTER TABLE tickets DROP COLUMN critic_infra_failures")
+        store._conn.commit()
+        store.set_meta("schema_version", "4")
+        assert store.get_meta("schema_version") == "4"
+    finally:
+        store.close()
+
+    # Precondition: the column is absent and version is stale
+    conn = sqlite3.connect(db_path)
+    cols = {row[0] for row in conn.execute("PRAGMA table_info(tickets)")}
+    assert "critic_infra_failures" not in cols
+    schema_ver = conn.execute("SELECT value FROM rig_meta WHERE key = 'schema_version'").fetchone()
+    assert schema_ver[0] == "4"
+    conn.close()
+
+    # Open with RigStore — triggers migrations
+    reopened = RigStore(db_path)
+    try:
+        # schema_version is now current
+        assert reopened.get_meta("schema_version") == "5"
+
+        # critic_infra_failures column is present
+        cols = {row["name"] for row in reopened._conn.execute("PRAGMA table_info(tickets)")}
+        assert "critic_infra_failures" in cols
+
+        # Existing row is intact and readable
+        old_ticket = reopened.get_ticket("old-ticket")
+        assert old_ticket is not None
+        assert old_ticket["title"] == "A ticket from the old schema"
+        assert old_ticket["critic_infra_failures"] == 0  # new column, default value
+    finally:
+        reopened.close()
+
+    # Verify persistence: a third open sees the updated version and column
+    reopened2 = RigStore(db_path)
+    try:
+        assert reopened2.get_meta("schema_version") == "5"
+        cols = {row["name"] for row in reopened2._conn.execute("PRAGMA table_info(tickets)")}
+        assert "critic_infra_failures" in cols
+        assert reopened2.get_ticket("old-ticket") is not None
+    finally:
+        reopened2.close()
+
+
 # --- case 7: add_dep / deps_of + list_tickets(state=) filter ------------------
 
 

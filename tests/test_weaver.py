@@ -1495,7 +1495,7 @@ def test_gate_infra_integration_event_carries_error_message(tmp_path, store, pla
 
     events = integration_events(plane, "t-109-error", phase="gate-infra")
     assert len(events) == 1
-    assert events[0]["error"] == "critic client call failed: RuntimeError('provider 503')"
+    assert events[0]["error"] == "critic client call failed: RuntimeError: provider 503"
 
 
 def test_non_gate_infra_integration_event_has_no_error_field(tmp_path, store, plane):
