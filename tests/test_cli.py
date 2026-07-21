@@ -958,3 +958,36 @@ def test_51_subscription_model_absent_usage_stays_declared_zero(tmp_path, monkey
     events = _records_events(rigs_root, "report")
     assert len(events) == 1
     assert events[0]["computed_usd"] == 0.0  # declared subscription $0, not unbudgetable
+
+
+# --- filed: list untriaged filed proposals ---
+
+
+def test_filed_with_populated_untriaged_pool(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-1")
+    _seed_filed(rigs_root, "filed-2")
+
+    rc = main(["filed", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # Check that both filed proposals appear
+    assert "filed-1" in out
+    assert "filed-2" in out
+    assert "proposal" in out  # title field
+
+    # Check that provenance fields are rendered
+    assert "origin_role=worker" in out
+    assert "origin_worker=worker-1" in out
+    assert "origin_dispatch_id=dispatch-1" in out
+    assert "discovered_from=dispatch-1@workspace-e2uh.8" in out
+
+
+def test_filed_with_empty_pool(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+
+    rc = main(["filed", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(no filed proposals)" in out

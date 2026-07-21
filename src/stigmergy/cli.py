@@ -13,6 +13,7 @@ Top-level argparse dispatcher. v0 subcommand tree:
     stigmergy promote   <filed-id>  --rig <name> [--rigs-root <path>] --spec <path|->
     stigmergy status       --rig <name> [--rigs-root <path>]
     stigmergy tickets      --rig <name> [--rigs-root <path>]
+    stigmergy filed        --rig <name> [--rigs-root <path>]
     stigmergy ticket <id>  --rig <name> [--rigs-root <path>]
     stigmergy range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]
 
@@ -79,6 +80,7 @@ _USAGE = (
     "  promote <filed-id> --rig <name> [--rigs-root <path>] --spec <path|->\n"
     "  status --rig <name> [--rigs-root <path>]\n"
     "  tickets --rig <name> [--rigs-root <path>]\n"
+    "  filed --rig <name> [--rigs-root <path>]\n"
     "  ticket <id> --rig <name> [--rigs-root <path>]\n"
     "  range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]"
 )
@@ -167,6 +169,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     tickets_parser = subparsers.add_parser("tickets", help="List all tickets.")
     add_rig_args(tickets_parser)
+
+    filed_parser = subparsers.add_parser("filed", help="List untriaged filed proposals.")
+    add_rig_args(filed_parser)
 
     ticket_parser = subparsers.add_parser("ticket", help="Show one ticket's full detail.")
     ticket_parser.add_argument("ticket_id", help="Ticket id to show.")
@@ -594,6 +599,37 @@ def _cmd_tickets(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
+def _render_filed_list(store: Any) -> str:
+    """One-line-per-proposal rendering of untriaged filed proposals with provenance."""
+    filed = store.list_filed_tickets(triaged=False)
+    if not filed:
+        return "(no filed proposals)"
+
+    lines: list[str] = []
+    for f in filed:
+        origin_role = f.get("origin_role") or "-"
+        origin_worker = f.get("origin_worker") or "-"
+        origin_dispatch_id = f.get("origin_dispatch_id") or "-"
+        discovered_from = f.get("discovered_from") or "-"
+        lines.append(
+            f"{f['id']}  {f['title']}  origin_role={origin_role}  "
+            f"origin_worker={origin_worker}  origin_dispatch_id={origin_dispatch_id}  "
+            f"discovered_from={discovered_from}"
+        )
+    return "\n".join(lines)
+
+
+def _cmd_filed(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        print(_render_filed_list(resolved.store))
+        return 0
+    finally:
+        resolved.store.close()
+
+
 def _cmd_ticket(args: argparse.Namespace) -> int:
     resolved, rc = _resolve_rig_or_none(args)
     if resolved is None:
@@ -851,6 +887,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.command == "tickets":
         return _cmd_tickets(args)
+    if args.command == "filed":
+        return _cmd_filed(args)
     if args.command == "ticket":
         return _cmd_ticket(args)
     if args.command == "range-report":
