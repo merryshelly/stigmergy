@@ -272,6 +272,28 @@ def test_infra_consumes_nothing() -> None:
     assert input_row == input_row_copy
 
 
+# --- 7b. test_spec_failure_consumes_nothing_and_escalates -------------------
+
+
+def test_spec_failure_consumes_nothing_and_escalates() -> None:
+    input_row = row(attempts_used=2, integration_failures=1, current_rung="exquisite")
+    input_row_copy = dict(input_row)
+
+    decision = decide(input_row, FailureClass.SPEC_FAILURE)
+
+    assert decision.attempt_kind == "spec-failure"
+    assert decision.next_state == ESCALATED
+    assert decision.rung == "exquisite"
+    assert decision.current_rung == "exquisite"
+    assert decision.attempts_used == 2
+    assert decision.integration_failures == 1
+    assert decision.escalation_reason == "spec-failure"
+    assert decision.pre_apply_prior is False
+    assert decision.prior_as_reference is False
+    # Pure: the input row must be untouched.
+    assert input_row == input_row_copy
+
+
 # --- 8. test_tier1_fail_same_rung_retry -------------------------------------
 
 
@@ -496,6 +518,7 @@ def test_all_returned_attempt_kinds_are_valid() -> None:
         decide(row(attempts_used=0, current_rung="cheap"), FailureClass.REJECTED),
         decide(row(attempts_used=0, current_rung="cheap"), FailureClass.WEDGE),
         decide(row(attempts_used=0, current_rung="cheap"), FailureClass.DEGENERATE),
+        decide(row(current_rung="cheap"), FailureClass.SPEC_FAILURE),
         # step-up
         decide(row(attempts_used=2, current_rung="cheap"), FailureClass.TIER1_FAIL),
         # ladder-exhausted

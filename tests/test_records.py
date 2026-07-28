@@ -175,6 +175,11 @@ def test_attempt_kinds_matches_spec_enumeration() -> None:
             # dispatch-side 'infra-retry' (SPEC §9 enumeration gains this
             # member too — follow-up note for SB).
             "critic-infra",
+            # spec-failure: a spec-failure escalation (FailureClass.SPEC_FAILURE,
+            # the worker's blocks_ticket:true escape) is a distinct, queryable
+            # outcome from a dispatch-side infra-retry or a ladder-exhausted
+            # escalation (same precedent as 'report' and 'critic-infra').
+            "spec-failure",
         }
     )
 
@@ -321,6 +326,81 @@ def test_rebuild_cv_idempotent_one_row_per_dispatch(plane: RecordPlane) -> None:
     row_b = next(row for row in rows if row["dispatch_id"] == "dispatch-B")
     assert row_b["has_unbudgetable"] is True
     assert row_b["computed_usd_total"] == pytest.approx(0.05)
+
+
+def test_build_cv_row_retains_disposition_and_reason(plane: RecordPlane) -> None:
+    """_build_cv_row extracts disposition and reason from the last DISPOSITION
+    event. A spec-failure escalation (disposition='escalated', reason='spec-failure')
+    is distinguishable from a ladder-exhausted one (reason='ladder-exhausted'),
+    and a dispatch with no DISPOSITION event has both defaulting to None."""
+    # Build a spec-failure dispatch: DISPATCH + DISPOSITION
+    plane.append(make_dispatch_event(dispatch_id="spec-fail-dispatch"))
+    plane.append(
+        make_event(
+            EventType.DISPOSITION,
+            **common_fields(
+                dispatch_id="spec-fail-dispatch",
+                attempt_kind="spec-failure",
+                disposition="escalated",
+                reason="spec-failure",
+            ),
+        )
+    )
+
+    # Build a ladder-exhausted dispatch: DISPATCH + DISPOSITION
+    plane.append(
+        make_dispatch_event(dispatch_id="ladder-exhausted-dispatch", attempt=2)
+    )
+    plane.append(
+        make_event(
+            EventType.DISPOSITION,
+            **common_fields(
+                dispatch_id="ladder-exhausted-dispatch",
+                attempt=2,
+                attempt_kind="tier1-repair",
+                disposition="escalated",
+                reason="ladder-exhausted",
+            ),
+        )
+    )
+
+    # Build a dispatch with no DISPOSITION event
+    plane.append(
+        make_dispatch_event(dispatch_id="no-disposition-dispatch", attempt=3)
+    )
+
+    plane.rebuild_cv()
+    cv_text = plane.cv_path.read_bytes().decode("utf-8")
+    rows = [json.loads(line) for line in cv_text.splitlines() if line]
+
+    # Verify spec-failure row
+    spec_fail_row = next(r for r in rows if r["dispatch_id"] == "spec-fail-dispatch")
+    assert spec_fail_row["disposition"] == "escalated"
+    assert spec_fail_row["reason"] == "spec-failure"
+    assert spec_fail_row["final_outcome"] == "disposition"
+
+    # Verify ladder-exhausted row (different reason, same disposition)
+    ladder_row = next(r for r in rows if r["dispatch_id"] == "ladder-exhausted-dispatch")
+    assert ladder_row["disposition"] == "escalated"
+    assert ladder_row["reason"] == "ladder-exhausted"
+    assert spec_fail_row["reason"] != ladder_row["reason"]  # Distinguishable
+
+    # Verify no-DISPOSITION row defaults to None
+    no_disp_row = next(r for r in rows if r["dispatch_id"] == "no-disposition-dispatch")
+    assert no_disp_row["disposition"] is None
+    assert no_disp_row["reason"] is None
+
+    # Verify existing keys are still present and unchanged
+    for row in rows:
+        assert "dispatch_id" in row
+        assert "ticket" in row
+        assert "rung" in row
+        assert "model" in row
+        assert "event_count" in row
+        assert "tokens" in row
+        assert "computed_usd_total" in row
+        assert "has_unbudgetable" in row
+        assert "final_outcome" in row
 
 
 # --- case 10: seal redaction --------------------------------------------------

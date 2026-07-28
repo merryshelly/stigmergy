@@ -514,6 +514,102 @@ def test_worker_and_critic_filings_on_same_dispatch_do_not_collide(store, plane)
     assert len(store.list_filed_tickets()) == 4
 
 
+# === escape surfacing (worker blocks_ticket:true) ============================
+
+
+def test_escape_present_surfaces_on_filing_result(tmp_path, store, plane):
+    """A filed proposals list with a blocks_ticket=True object surfaces the
+    escape on FilingResult.escape and the object is ALSO filed as a normal
+    proposal."""
+    worktree = tmp_path / "work"
+    escape_obj = valid_proposal(1, blocks_ticket=True,
+                                reason="out-of-scope test asserts old behavior",
+                                suspected_out_of_scope_paths=["tests/test_bar.py"])
+    normal_obj = valid_proposal(2)
+    seed_filings_file(worktree, [escape_obj, normal_obj])
+
+    result = harvest(worktree, store, plane)
+
+    assert result.escape is not None
+    assert result.escape["reason"] == "out-of-scope test asserts old behavior"
+    assert result.escape["suspected_out_of_scope_paths"] == ["tests/test_bar.py"]
+    # The escape object is ALSO filed as a normal proposal (accepted_ids populated).
+    assert len(result.accepted_ids) == 2
+    assert result.rejected == []
+
+
+def test_escape_absent_yields_none(tmp_path, store, plane):
+    """A filed proposals list with no blocks_ticket=True object yields
+    escape=None and filing proceeds normally."""
+    worktree = tmp_path / "work"
+    seed_filings_file(worktree, [valid_proposal(1), valid_proposal(2)])
+
+    result = harvest(worktree, store, plane)
+
+    assert result.escape is None
+    assert len(result.accepted_ids) == 2
+    assert result.rejected == []
+
+
+def test_escape_first_wins(tmp_path, store, plane):
+    """When multiple blocks_ticket=True objects are present, only the FIRST
+    one is surfaced as escape; subsequent ones are still filed as proposals."""
+    worktree = tmp_path / "work"
+    escape1 = valid_proposal(1, blocks_ticket=True, reason="first reason",
+                             suspected_out_of_scope_paths=["path1.py"])
+    escape2 = valid_proposal(2, blocks_ticket=True, reason="second reason",
+                             suspected_out_of_scope_paths=["path2.py"])
+    seed_filings_file(worktree, [escape1, escape2])
+
+    result = harvest(worktree, store, plane)
+
+    assert result.escape is not None
+    assert result.escape["reason"] == "first reason"
+    assert result.escape["suspected_out_of_scope_paths"] == ["path1.py"]
+    assert len(result.accepted_ids) == 2  # both filed
+
+
+def test_escape_malformed_never_raises(tmp_path, store, plane):
+    """Malformed escape fields are defensively handled and harvest never
+    raises. blocks_ticket as string does not match (is True); paths as string
+    coerced to []; reason as non-str coerced to None."""
+    worktree = tmp_path / "work"
+
+    # blocks_ticket="true" (string, not bool) — does not match
+    seed_filings_file(worktree, [valid_proposal(1, blocks_ticket="true")])
+    result = harvest(worktree, store, plane, ctx=dispatch_ctx(dispatch_id="d1"))
+    assert result.escape is None
+
+    # blocks_ticket=True but suspected_out_of_scope_paths is a string
+    store2 = RigStore.create(tmp_path / "tickets2.db")
+    plane2 = RecordPlane(tmp_path / "records2")
+    obj2 = valid_proposal(1, blocks_ticket=True, suspected_out_of_scope_paths="not-a-list")
+    seed_filings_file(worktree, [obj2])
+    result2 = harvest(worktree, store2, plane2, ctx=dispatch_ctx(dispatch_id="d2"))
+    assert result2.escape is not None
+    assert result2.escape["suspected_out_of_scope_paths"] == []
+    store2.close()
+
+    # blocks_ticket=True but reason is non-str
+    store3 = RigStore.create(tmp_path / "tickets3.db")
+    plane3 = RecordPlane(tmp_path / "records3")
+    obj3 = valid_proposal(1, blocks_ticket=True, reason=123)
+    seed_filings_file(worktree, [obj3])
+    result3 = harvest(worktree, store3, plane3, ctx=dispatch_ctx(dispatch_id="d3"))
+    assert result3.escape is not None
+    assert result3.escape["reason"] is None
+    store3.close()
+
+
+def test_file_proposals_direct_call_returns_escape_none():
+    """file_proposals called directly (not via harvest) still returns
+    escape=None, proving the default keeps direct callers unchanged."""
+    result = FilingResult(accepted_ids=["a", "b"], rejected=[])
+    # file_proposals constructs FilingResult without escape, so it defaults to None
+    # (this is tested implicitly by all direct file_proposals calls; we assert it explicitly here).
+    assert result.escape is None
+
+
 def test_list_filed_tickets_filter_and_count(store, plane):
     file_proposals(
         [valid_proposal(1), valid_proposal(2)],

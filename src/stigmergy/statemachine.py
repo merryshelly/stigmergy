@@ -216,9 +216,12 @@ def transition(
 
 
 class FailureClass(enum.Enum):
-    """The seven failure classes a dispatch/gate outcome resolves to
+    """The eight failure classes a dispatch/gate outcome resolves to
     (SPEC §9 "Failure classes"). The class — never the state alone —
-    decides which counter moves and what the next `attempt_kind` is."""
+    decides which counter moves and what the next `attempt_kind` is.
+    SPEC_FAILURE is a scope/spec defect (the worker declared the ticket
+    impossible-as-scoped) that routes to triage, not the ladder — consumes
+    no rung attempt and steps up no rung."""
 
     TIER1_FAIL = "tier1-fail"
     WEDGE = "wedge"
@@ -227,6 +230,7 @@ class FailureClass(enum.Enum):
     INTEGRATION_CONFLICT = "integration-conflict"
     INTEGRATION_REGRESSION = "integration-regression"
     INFRA = "infra"
+    SPEC_FAILURE = "spec-failure"
 
 
 # Classes that burn a rung attempt (SPEC §9: "Only `rejected` burns rung
@@ -316,6 +320,24 @@ def decide_retry(
             pre_apply_prior=False,
             prior_as_reference=False,
             escalation_reason=None,
+            attempts_used=attempts_used,
+            current_rung=current_rung,
+            integration_failures=integration_failures,
+        )
+
+    if failure_class is FailureClass.SPEC_FAILURE:
+        # Spec-failure is the worker's explicit declaration that the ticket
+        # is impossible-as-scoped (the code01 blocks_ticket:true escape); it
+        # is NOT a capability gap, so no rung burns and no step-up — route
+        # directly to the resumable ESCALATED hold (the .102c resume edge
+        # re-enters it after human re-triage).
+        return AttemptDecision(
+            attempt_kind="spec-failure",
+            rung=current_rung,
+            next_state=ESCALATED,
+            pre_apply_prior=False,
+            prior_as_reference=False,
+            escalation_reason="spec-failure",
             attempts_used=attempts_used,
             current_rung=current_rung,
             integration_failures=integration_failures,
@@ -544,6 +566,7 @@ def record_disposition(
     disposition: str,
     attempt_kind: str,
     reason: str | None = None,
+    spec_failure: dict[str, Any] | None = None,
 ) -> None:
     """Journal one MEANINGFUL disposition event (SPEC §8/§9).
 
@@ -563,6 +586,9 @@ def record_disposition(
     ``disposition`` (the to-state, e.g. `"landed"`/`"rejected"`/
     `"escalated"`/`"parked"`/`"pool"`) and the optional ``reason`` are
     carried as extra fields on the event alongside the SPEC §8 common set.
+    The optional ``spec_failure`` extra (a structured dict carrying the
+    worker escape's reason + suspected_out_of_scope_paths) is attached only
+    on a spec-failure disposition.
     """
     fields = {key: ctx.get(key) for key in _DISPOSITION_CTX_FIELDS}
     fields["attempt_kind"] = attempt_kind
@@ -572,6 +598,8 @@ def record_disposition(
     fields["disposition"] = disposition
     if reason is not None:
         fields["reason"] = reason
+    if spec_failure is not None:
+        fields["spec_failure"] = spec_failure
 
     event = make_event(EventType.DISPOSITION, **fields)
     record_plane.append(event)

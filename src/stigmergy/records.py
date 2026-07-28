@@ -122,6 +122,11 @@ _LLM_INVOCATION_TYPES = frozenset({EventType.DISPATCH, EventType.GATE, EventType
 # would be a recorded lie in an audit log (same precedent as `report`
 # above). SPEC §9's enumeration gains this member too — another tracked
 # follow-up note for SB's next review.
+# `spec-failure`: a spec-failure escalation (FailureClass.SPEC_FAILURE, the
+# worker's blocks_ticket:true escape) is a distinct, queryable outcome from
+# a dispatch-side infra-retry or a ladder-exhausted escalation — reusing an
+# existing attempt_kind would be a recorded lie in an audit log (same
+# precedent as `report` and `critic-infra` above).
 ATTEMPT_KINDS: frozenset[str] = frozenset(
     {
         "initial",
@@ -133,6 +138,7 @@ ATTEMPT_KINDS: frozenset[str] = frozenset(
         "clean-restart",
         "report",
         "critic-infra",
+        "spec-failure",
     }
 )
 
@@ -528,6 +534,10 @@ def _build_cv_row(dispatch_id: str, events: list[dict[str, Any]]) -> dict[str, A
     colliding with it, this takes the `event_type` of the last event seen
     for the dispatch (in on-disk order) as a provisional summary signal —
     a CV-projection convenience, not part of the sealed event contract.
+
+    `disposition` and `reason` are taken from the last DISPOSITION event in
+    `events` and distinguish escalation reasons (e.g., a spec-failure
+    escalation vs. a ladder-exhausted one) that `final_outcome` alone cannot.
     """
     tokens_total = {key: 0 for key in _TOKEN_KEYS}
     computed_usd_total = 0.0
@@ -550,6 +560,16 @@ def _build_cv_row(dispatch_id: str, events: list[dict[str, Any]]) -> dict[str, A
 
     first = events[0]
     last = events[-1]
+
+    # Extract disposition and reason from the last DISPOSITION event (if present).
+    disposition: str | None = None
+    reason: str | None = None
+    for ev in reversed(events):
+        if ev.get("event_type") == EventType.DISPOSITION.value:
+            disposition = ev.get("disposition")
+            reason = ev.get("reason")
+            break
+
     return {
         "dispatch_id": dispatch_id,
         "ticket": first.get("ticket"),
@@ -560,4 +580,6 @@ def _build_cv_row(dispatch_id: str, events: list[dict[str, Any]]) -> dict[str, A
         "computed_usd_total": computed_usd_total,
         "has_unbudgetable": has_unbudgetable,
         "final_outcome": last.get("event_type"),
+        "disposition": disposition,
+        "reason": reason,
     }

@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,7 @@ class FilingResult:
 
     accepted_ids: list[str]
     rejected: list[dict[str, Any]]  # each: {"reason": str, "title": str | None}
+    escape: dict[str, Any] | None = None
 
 
 def proposal_hash(proposal: dict[str, Any]) -> str:
@@ -423,7 +424,30 @@ def harvest_worker_filings(
             raw_bytes=raw_bytes,
         )
 
-    return file_proposals(
+    # Scan for the first dict with blocks_ticket=True to surface as escape.
+    # This is purely additive: the escape object is ALSO still filed as a
+    # normal proposal by file_proposals (its title/description persist to
+    # filed_tickets for triage) — we do NOT exclude it from filing.
+    escape_dict: dict[str, Any] | None = None
+    try:
+        for obj in parsed:
+            if isinstance(obj, dict) and obj.get("blocks_ticket") is True:
+                # Found the first escape object. Build the escape dict.
+                reason = obj.get("reason")
+                reason = reason if isinstance(reason, str) else None
+                suspected_paths = obj.get("suspected_out_of_scope_paths")
+                suspected_paths = suspected_paths if isinstance(suspected_paths, list) else []
+                escape_dict = {
+                    "reason": reason,
+                    "suspected_out_of_scope_paths": suspected_paths,
+                }
+                break
+    except Exception:
+        # Malformed escape detection must never break the harvest. Default
+        # to escape=None on any unexpected error.
+        escape_dict = None
+
+    result = file_proposals(
         parsed,
         store=store,
         record_plane=record_plane,
@@ -434,3 +458,6 @@ def harvest_worker_filings(
         max_bytes=max_bytes,
         now=now,
     )
+    if escape_dict is not None:
+        return replace(result, escape=escape_dict)
+    return result

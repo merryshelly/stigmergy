@@ -835,9 +835,10 @@ class Daemon:
             )
             self._record_plane.append(dispatch_event)
 
+            harvest_result = None
             try:
                 limits = self._charter.raw["loop"]["dispatch_limits"]
-                harvest_worker_filings(
+                harvest_result = harvest_worker_filings(
                     plan.work_clone,
                     store=self._store,
                     record_plane=self._record_plane,
@@ -857,7 +858,18 @@ class Daemon:
                     exc_info=True,
                 )
 
-            infra_trip = self._handle_dispatch_outcome(ticket_id, plan, result, ctx, now=t_end)
+            # The worker has explicitly declared the ticket impossible-as-scoped;
+            # honor the declaration and route to the human triage floor REGARDLESS
+            # of the Tier-1 result. The rare green-Tier-1-plus-escape case also
+            # routes to triage — safe; the human resolves the contradiction. Cost
+            # of a wrong escape = one triage glance; the code01 recognition bar +
+            # human gate are the backstops (per the design's functional-first ruling)
+            # — build NO anti-gaming adjudicator.
+            if harvest_result is not None and harvest_result.escape is not None:
+                self._dispatch_spec_failure(ticket_id, ctx, harvest_result.escape, now=t_end)
+                infra_trip = False
+            else:
+                infra_trip = self._handle_dispatch_outcome(ticket_id, plan, result, ctx, now=t_end)
         finally:
             self._capability_store.revoke(plan.dispatch_id)
             if relay_handle is not None:
@@ -936,6 +948,15 @@ class Daemon:
     ) -> None:
         transition(self._store, ticket_id, FAILED, expected_from=IN_FLIGHT)
         self._apply_retry_decision(ticket_id, failure_class, ctx, now=now)
+
+    def _dispatch_spec_failure(
+        self, ticket_id: str, ctx: dict[str, Any], escape: dict[str, Any], *, now: float
+    ) -> None:
+        """Route a worker escape (blocks_ticket:true) to spec-failure escalation."""
+        transition(self._store, ticket_id, FAILED, expected_from=IN_FLIGHT)
+        self._apply_retry_decision(
+            ticket_id, FailureClass.SPEC_FAILURE, ctx, now=now, spec_failure=escape
+        )
 
     # -- Tier-1 checks (§1.2) ---------------------------------------------------
 
@@ -1025,7 +1046,13 @@ class Daemon:
     # -- shared retry-ladder application -----------------------------------------
 
     def _apply_retry_decision(
-        self, ticket_id: str, failure_class: FailureClass, ctx: dict[str, Any], *, now: float
+        self,
+        ticket_id: str,
+        failure_class: FailureClass,
+        ctx: dict[str, Any],
+        *,
+        now: float,
+        spec_failure: dict[str, Any] | None = None,
     ) -> AttemptDecision:
         """`decide_retry` -> `apply_decision` -> disposition -> escalation
         notification (shared tail for both the dispatch-side FAILED/GATED
@@ -1055,6 +1082,7 @@ class Daemon:
             disposition=disposition,
             attempt_kind=decision.attempt_kind,
             reason=decision.escalation_reason,
+            spec_failure=spec_failure,
         )
 
         if decision.next_state == ESCALATED:

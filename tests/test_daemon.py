@@ -1967,6 +1967,132 @@ def test_harvest_failure_is_isolated_from_the_dispatch_outcome(env: Env) -> None
     assert env.store.count_untriaged_filings() == 0
 
 
+# === worker escape (blocks_ticket:true) routing to spec-failure ===============
+
+
+def test_escape_overrides_tier1_fail_and_routes_to_escalated(env: Env) -> None:
+    """A worker escape (blocks_ticket:true) with Tier-1 FAIL routes to
+    ESCALATED with spec-failure disposition. Tier-1 checks do NOT run
+    (NO CHECK events are emitted). Attempts and rung counters are unchanged."""
+    add_dispatchable_ticket(env, "t-1", attempts_used=1, current_rung="cheap")
+    escape_payload = [
+        {"title": "Ticket is impossible", "description": "Can't satisfy requirement",
+         "blocks_ticket": True, "reason": "Requirement contradicts spec",
+         "suspected_out_of_scope_paths": ["spec.md"]}
+    ]
+    spawn_fn = FilingSpawn(escape_payload)
+    # Configure checks to FAIL (so Tier-1 would normally fail too)
+    run_checks_fn = ScriptedChecks([fail_result("pytest")])
+    daemon = make_daemon(env, spawn_fn=spawn_fn, run_checks_fn=run_checks_fn)
+
+    daemon.poll_once()
+
+    ticket = env.store.get_ticket("t-1")
+    assert ticket["state"] == ESCALATED
+    # Counters unchanged (no rung burn, no step-up)
+    assert ticket["attempts_used"] == 1
+    assert ticket["current_rung"] == "cheap"
+
+    # DISPOSITION event with disposition="escalated" and reason="spec-failure"
+    disps = disposition_events(env, "t-1")
+    assert len(disps) == 1
+    assert disps[0]["disposition"] == "escalated"
+    assert disps[0]["reason"] == "spec-failure"
+    assert disps[0]["attempt_kind"] == "spec-failure"
+    # spec_failure extra carries the escape
+    assert disps[0].get("spec_failure") is not None
+    assert disps[0]["spec_failure"]["reason"] == "Requirement contradicts spec"
+    assert disps[0]["spec_failure"]["suspected_out_of_scope_paths"] == ["spec.md"]
+
+    # Tier-1 checks did NOT run (no CHECK events for this ticket)
+    checks = check_events(env)
+    assert len(checks) == 0
+
+    # Escalation notification was persisted
+    ntfy = env.notification_store.all_intents()
+    assert any(n.kind == "escalation" for n in ntfy)
+
+
+def test_escape_overrides_green_tier1_and_routes_to_escalated(env: Env) -> None:
+    """A worker escape even with GREEN Tier-1 results still routes to ESCALATED
+    with spec-failure disposition (rare contradiction case; human resolves it).
+    The ticket does NOT park. Escalation notification is persisted."""
+    add_dispatchable_ticket(env, "t-1", attempts_used=0, current_rung="cheap")
+    escape_payload = [
+        {"title": "Out of scope", "description": "Requirements are contradictory",
+         "blocks_ticket": True}
+    ]
+    spawn_fn = FilingSpawn(escape_payload)
+    # Configure checks to PASS (Tier-1 would normally be green)
+    run_checks_fn = ScriptedChecks([pass_result("pytest"), pass_result("lint")])
+    daemon = make_daemon(env, spawn_fn=spawn_fn, run_checks_fn=run_checks_fn)
+
+    daemon.poll_once()
+
+    ticket = env.store.get_ticket("t-1")
+    # Despite green checks, escape overrides and routes to ESCALATED, NOT PARKED
+    assert ticket["state"] == ESCALATED
+    assert ticket["attempts_used"] == 0
+    assert ticket["current_rung"] == "cheap"
+
+    # spec_failure disposition with escape
+    disps = disposition_events(env, "t-1")
+    assert len(disps) == 1
+    assert disps[0]["reason"] == "spec-failure"
+    assert disps[0].get("spec_failure") is not None
+
+    # Escalation notification
+    ntfy = env.notification_store.all_intents()
+    assert any(n.kind == "escalation" for n in ntfy)
+
+
+def test_no_escape_normal_path_unchanged(env: Env) -> None:
+    """Without an escape, normal dispatch path proceeds: green Tier-1 reaches
+    PARKED, no spec_failure extra, no escalation notification."""
+    add_dispatchable_ticket(env, "t-1", attempts_used=0, current_rung="cheap")
+    # Normal proposals, no blocks_ticket
+    normal_payload = [
+        {"title": "Found an issue", "description": "test_foo is flaky"}
+    ]
+    spawn_fn = FilingSpawn(normal_payload)
+    run_checks_fn = ScriptedChecks([pass_result("pytest"), pass_result("lint")])
+    daemon = make_daemon(env, spawn_fn=spawn_fn, run_checks_fn=run_checks_fn)
+
+    daemon.poll_once()
+
+    ticket = env.store.get_ticket("t-1")
+    assert ticket["state"] == PARKED  # Normal green path
+
+    # DISPOSITION has no spec_failure extra
+    disps = disposition_events(env, "t-1")
+    assert len(disps) == 1
+    assert "spec_failure" not in disps[0]
+
+    # No escalation notification
+    ntfy = env.notification_store.all_intents()
+    assert not any(n.kind == "escalation" for n in ntfy)
+
+
+def test_harvest_failure_with_escape_check_falls_through_to_normal_outcome(
+    env: Env,
+) -> None:
+    """If the harvest fails (malformed JSON), harvest_result is None and the
+    escape check is skipped; the ticket still follows the normal outcome path
+    (green Tier-1 -> PARKED). The harvest failure does not break the dispatch."""
+    add_dispatchable_ticket(env, "t-1", attempts_used=0, current_rung="cheap")
+    # BadFilingSpawn writes malformed JSON
+    daemon = make_daemon(env, spawn_fn=BadFilingSpawn())
+    # Checks pass
+    run_checks_fn = ScriptedChecks([pass_result("pytest")])
+    daemon = make_daemon(env, spawn_fn=BadFilingSpawn(), run_checks_fn=run_checks_fn)
+
+    daemon.poll_once()
+
+    ticket = env.store.get_ticket("t-1")
+    assert ticket["state"] == PARKED  # Normal outcome; harvest failure didn't break it
+    assert env.store.count_untriaged_filings() == 0
+
+
 # ==========================================================================
 # bead .90: recover_on_start fails loudly if the dispatch_base branch is
 # absent from the rig repo (belt-and-suspenders for the scaffold fix)
