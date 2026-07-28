@@ -506,11 +506,12 @@ def _triage_fields(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_D1r_triage_event_types_exist_and_enum_has_eleven_members() -> None:
+def test_D1r_triage_event_types_exist_and_enum_has_twelve_members() -> None:
     assert EventType.APPROVAL.value == "approval"
     assert EventType.UNAPPROVAL.value == "unapproval"
     assert EventType.TRIAGE_REJECTED.value == "triage-rejected"
-    assert len(list(EventType)) == 11
+    assert EventType.RESUME.value == "resume"
+    assert len(list(EventType)) == 12
 
 
 @pytest.mark.parametrize(
@@ -519,6 +520,7 @@ def test_D1r_triage_event_types_exist_and_enum_has_eleven_members() -> None:
         (EventType.APPROVAL, "approved"),
         (EventType.UNAPPROVAL, "unapproved"),
         (EventType.TRIAGE_REJECTED, "rejected"),
+        (EventType.RESUME, "resumed"),
     ],
 )
 def test_D2r_triage_event_validates_without_common_fields(

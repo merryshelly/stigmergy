@@ -8,6 +8,8 @@ Top-level argparse dispatcher. v0 subcommand tree:
         --operator-session <s> [--json]
     stigmergy unapprove <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>
         --operator-session <s>
+    stigmergy resume    <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>
+        --operator-session <s>
     stigmergy reject    <filed-id>  --rig <name> [--rigs-root <path>] --agent <a>
         --operator-session <s> [--reason <text>]
     stigmergy promote   <filed-id>  --rig <name> [--rigs-root <path>] --spec <path|->
@@ -59,6 +61,7 @@ from stigmergy.relay import CapabilityStore, CredentialRelay
 from stigmergy.relay_transport import RelayHandle, make_urllib_forwarder, start_relay
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
+from stigmergy.statemachine import ESCALATED, POOL, transition
 from stigmergy.status import (
     gather_status,
     render_daemon_liveness,
@@ -77,6 +80,8 @@ _USAGE = (
     "  approve <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>"
     " --operator-session <s> [--json]\n"
     "  unapprove <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>"
+    " --operator-session <s>\n"
+    "  resume <ticket-id> --rig <name> [--rigs-root <path>] --agent <a>"
     " --operator-session <s>\n"
     "  reject <filed-id> --rig <name> [--rigs-root <path>] --agent <a>"
     " --operator-session <s> [--reason <text>]\n"
@@ -154,6 +159,11 @@ def _build_parser() -> argparse.ArgumentParser:
     unapprove_parser.add_argument("ticket_id", help="Ticket id to unapprove.")
     add_rig_args(unapprove_parser)
     add_attribution_args(unapprove_parser)
+
+    resume_parser = subparsers.add_parser("resume", help="Resume an escalated ticket.")
+    resume_parser.add_argument("ticket_id", help="Ticket id to resume (must be ESCALATED).")
+    add_rig_args(resume_parser)
+    add_attribution_args(resume_parser)
 
     reject_parser = subparsers.add_parser("reject", help="Reject (tombstone) a filed proposal.")
     reject_parser.add_argument("filed_id", help="Filed proposal id to reject.")
@@ -519,6 +529,45 @@ def _cmd_unapprove(args: argparse.Namespace) -> int:
             approval_hash=previous_hash,
         )
         print(f"unapproved {args.ticket_id}")
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        ticket = resolved.store.get_ticket(args.ticket_id)
+        if ticket is None:
+            print(f"stigmergy resume: no such ticket: {args.ticket_id}", file=sys.stderr)
+            return 1
+
+        if ticket["state"] != ESCALATED:
+            print(
+                f"stigmergy resume: ticket {args.ticket_id} is not escalated "
+                f"(state={ticket['state']!r}); resume only applies to escalated tickets",
+                file=sys.stderr,
+            )
+            return 1
+
+        previous_hash = ticket.get("approval_hash")
+        transition(resolved.store, args.ticket_id, POOL, expected_from=ESCALATED)
+        resolved.store.update_ticket(args.ticket_id, attempts_used=0, current_rung=None)
+
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+        triage.record_triage_event(
+            record_plane,
+            event_type=EventType.RESUME,
+            rig=_rig_name(resolved),
+            subject_id=args.ticket_id,
+            outcome="resumed",
+            acting_agent=args.agent,
+            operator_session=args.operator_session,
+            approval_hash=previous_hash,
+        )
+        print(f"resumed {args.ticket_id}")
         return 0
     finally:
         resolved.store.close()
@@ -1172,6 +1221,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_approve(args)
     if args.command == "unapprove":
         return _cmd_unapprove(args)
+    if args.command == "resume":
+        return _cmd_resume(args)
     if args.command == "reject":
         return _cmd_reject(args)
     if args.command == "promote":

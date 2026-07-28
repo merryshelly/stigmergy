@@ -41,7 +41,8 @@ Bead `.42` (D1/D15) adds three more — `APPROVAL`, `UNAPPROVAL`,
 operator session, agent-asserted in v0). They are the ONE-log audit line
 D1 locates in the event plane, and are **exempt from the dispatch-shaped
 common-field set** (human acts, not dispatches): they validate against
-`_REQUIRED_TRIAGE_FIELDS` only. Eleven members total.
+`_REQUIRED_TRIAGE_FIELDS` only. Bead `.102c` adds `RESUME` — another
+operator-authority triage re-entry act. Twelve members total.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ class RecordError(Exception):
 class EventType(enum.Enum):
     """Event-plane discriminant (SPEC.md §8).
 
-    Eleven members. `dispatch`, `check`, `gate`, `integration`,
+    Twelve members. `dispatch`, `check`, `gate`, `integration`,
     `disposition`, `notify` are SPEC §8's prose list; `report` is added
     per SPEC §4 (prompt-artifact invariant: "every LLM-invoked role... the
     prompt hash is logged in every event that invocation produces") and
@@ -78,9 +79,10 @@ class EventType(enum.Enum):
     docstring for the full justification. `ticket-filed` (D14, bead
     workspace-e2uh.38) is added for the host-side ticket-filing harvest
     (see `filing.py`); it is mechanism-only, not an LLM invocation.
-    `approval`/`unapproval`/`triage-rejected` (bead .42, D1/D15) are the
-    human triage attribution events — exempt from the dispatch-shaped
-    common-field set (see `_REQUIRED_TRIAGE_FIELDS` and `_validate_payload`).
+    `approval`/`unapproval`/`triage-rejected`/`resume` (bead .42, D1/D15,
+    and bead .102c) are the human triage attribution events — exempt from
+    the dispatch-shaped common-field set (see `_REQUIRED_TRIAGE_FIELDS` and
+    `_validate_payload`).
     """
 
     DISPATCH = "dispatch"
@@ -91,17 +93,18 @@ class EventType(enum.Enum):
     NOTIFY = "notify"
     REPORT = "report"
     TICKET_FILED = "ticket-filed"
-    # Triage attribution events (bead .42, D1/D15): human triage acts executed
-    # by an agent at the operator's direction. They are NOT dispatch-adjacent —
-    # no worker, model, dispatch, tokens, or cost — so they are EXEMPT from the
-    # dispatch-shaped common-field set and validate against their own required
-    # set (see `_REQUIRED_TRIAGE_FIELDS`). This deliberately loosens "every
-    # event carries the full common-field set" (§8 prose, written when every
-    # event was dispatch-adjacent), the same way `.38` documented TICKET_FILED's
-    # own exemptions.
+    # Triage attribution events (bead .42, D1/D15, .102c): human triage acts
+    # executed by an agent at the operator's direction. They are NOT dispatch-
+    # adjacent — no worker, model, dispatch, tokens, or cost — so they are
+    # EXEMPT from the dispatch-shaped common-field set and validate against
+    # their own required set (see `_REQUIRED_TRIAGE_FIELDS`). This deliberately
+    # loosens "every event carries the full common-field set" (§8 prose, written
+    # when every event was dispatch-adjacent), the same way `.38` documented
+    # TICKET_FILED's own exemptions.
     APPROVAL = "approval"
     UNAPPROVAL = "unapproval"
     TRIAGE_REJECTED = "triage-rejected"
+    RESUME = "resume"
 
 
 # LLM-invocation events (SPEC §4 prompt-artifact invariant): must carry the
@@ -156,12 +159,12 @@ _REQUIRED_COMMON_FIELDS: tuple[str, ...] = (
 
 _TOKEN_KEYS: tuple[str, ...] = ("in", "cached", "out", "reasoning")
 
-# Triage attribution events (bead .42): the human-triage acts are EXEMPT from
-# `_REQUIRED_COMMON_FIELDS` (no dispatch/worker/model/tokens/cost) and validate
-# against this set instead. Each must be a non-empty str — a forgeable-by-
+# Triage attribution events (bead .42, .102c): the human-triage acts are EXEMPT
+# from `_REQUIRED_COMMON_FIELDS` (no dispatch/worker/model/tokens/cost) and
+# validate against this set instead. Each must be a non-empty str — a forgeable-by-
 # omission audit line (D1's agent-asserted attribution) is not acceptable.
 _TRIAGE_EVENT_TYPES = frozenset(
-    {EventType.APPROVAL, EventType.UNAPPROVAL, EventType.TRIAGE_REJECTED}
+    {EventType.APPROVAL, EventType.UNAPPROVAL, EventType.TRIAGE_REJECTED, EventType.RESUME}
 )
 _REQUIRED_TRIAGE_FIELDS: tuple[str, ...] = (
     "rig",

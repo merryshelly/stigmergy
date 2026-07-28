@@ -20,6 +20,7 @@ import pytest
 
 import stigmergy.cli as cli
 from stigmergy import approval
+from stigmergy.approval import steering_hash
 from stigmergy.cli import (
     _DEFAULT_PROTECTED_PATHS,
     _build_daemon,
@@ -30,6 +31,7 @@ from stigmergy.cli import (
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic, CriticInfraError
 from stigmergy.daemon import Daemon
+from stigmergy.intake import eligible
 from stigmergy.rangereport import RangeCritic
 from stigmergy.records import RecordPlane
 from stigmergy.rig import create_rig, resolve_rig
@@ -645,6 +647,169 @@ def test_C5_reject_tombstones_filed_and_logs_reason(tmp_path: Path) -> None:
     assert events[0]["reason"] == "duplicate of t-12"
 
 
+# --- C8: resume ---------------------------------------------------------------
+
+
+def test_C8_resume_escalated_ticket_success(tmp_path: Path) -> None:
+    """Resume an escalated ticket: state->pool, leases cleared, counters zeroed
+    (except lifetime counters), approval preserved."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    # Create a ticket in ESCALATED with approval and non-trivial lease/counters
+    steering = {
+        "ticket_text": "Test ticket",
+        "checks": {},
+        "rubric": [],
+        "lane": "cheap",
+        "prompt_bytes": "code01-prompt-v1",
+        "context_set": [],
+    }
+    approval_hash_value = steering_hash(steering)
+
+    _seed_ticket(
+        rigs_root,
+        "t-esc",
+        state="escalated",
+        approved=1,
+        approval_hash=approval_hash_value,
+        lease_owner="worker-1",
+        lease_dispatch_id="dispatch-1",
+        lease_expires_at=1000.0,
+        lease_heartbeat_at=999.0,
+        attempts_used=3,
+        current_rung="exquisite",
+        integration_failures=1,
+        target_scope=["src/test.py"],
+        functional_summary="Test the thing",
+    )
+
+    rc = main(["resume", "t-esc", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 0
+
+    # Check ticket state after resume
+    ticket = _ticket(rigs_root, "t-esc")
+    assert ticket["state"] == "pool"
+    # Leases cleared
+    assert ticket["lease_owner"] is None
+    assert ticket["lease_dispatch_id"] is None
+    assert ticket["lease_expires_at"] is None
+    assert ticket["lease_heartbeat_at"] is None
+    # Counters zeroed
+    assert ticket["attempts_used"] == 0
+    assert ticket["current_rung"] is None
+    # Lifetime counters preserved
+    assert ticket["integration_failures"] == 1
+    # Approval preserved
+    assert ticket["approved"] == 1
+    assert ticket["approval_hash"] == approval_hash_value
+    # Steering preserved
+    assert ticket["target_scope"] == ["src/test.py"]
+    assert ticket["functional_summary"] == "Test the thing"
+
+    # Check resume event was logged
+    events = _records_events(rigs_root, "resume")
+    assert len(events) == 1
+    assert events[0]["subject_id"] == "t-esc"
+    assert events[0]["outcome"] == "resumed"
+    assert events[0]["acting_agent"] == "merry"
+    assert events[0]["operator_session"] == "sess-42"
+    assert events[0]["approval_hash"] == approval_hash_value
+
+
+def test_C8b_resume_non_escalated_ticket_returns_error(tmp_path: Path, capsys) -> None:
+    """Resume of a non-escalated ticket returns error without mutation."""
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-pool", state="pool")
+
+    rc = main(["resume", "t-pool", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 1
+
+    # Error message names the actual state
+    err = capsys.readouterr().err
+    assert "not escalated" in err
+    assert "state='pool'" in err
+
+    # Ticket untouched
+    ticket = _ticket(rigs_root, "t-pool")
+    assert ticket["state"] == "pool"
+
+    # No event logged
+    assert _records_events(rigs_root, "resume") == []
+
+
+def test_C8c_resume_missing_ticket_returns_error(tmp_path: Path, capsys) -> None:
+    """Resume of a non-existent ticket returns error without mutation."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    rc = main(["resume", "ghost", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 1
+
+    # Error message names the missing ticket
+    err = capsys.readouterr().err
+    assert "no such ticket" in err
+
+    # No event logged
+    assert _records_events(rigs_root, "resume") == []
+
+
+def test_C8d_resume_missing_attribution_is_argparse_error(tmp_path: Path) -> None:
+    """Resume without attribution flags is an argparse error."""
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-esc", state="escalated")
+
+    # Missing --agent should cause SystemExit(2)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["resume", "t-esc", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert exc_info.value.code == 2
+
+    # Ticket untouched
+    ticket = _ticket(rigs_root, "t-esc")
+    assert ticket["state"] == "escalated"
+
+    # No event logged
+    assert _records_events(rigs_root, "resume") == []
+
+
+def test_C8e_resumed_escalated_ticket_becomes_claimable(tmp_path: Path) -> None:
+    """After resume, an approved+hash-valid ticket is eligible for claiming."""
+    rigs_root = scaffold_rig(tmp_path)
+
+    # Create a ticket in ESCALATED with approval
+    steering = {
+        "ticket_text": "Test ticket for claiming",
+        "checks": {},
+        "rubric": [],
+        "lane": "cheap",
+        "prompt_bytes": "code01-prompt-v1",
+        "context_set": [],
+    }
+    approval_hash_value = steering_hash(steering)
+
+    _seed_ticket(
+        rigs_root,
+        "t-claim",
+        state="escalated",
+        approved=1,
+        approval_hash=approval_hash_value,
+    )
+
+    # Resume the ticket
+    rc = main(["resume", "t-claim", "--rig", RIG, "--rigs-root", str(rigs_root), *_ATTRIB])
+    assert rc == 0
+
+    # Check that the ticket is now eligible
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        # Build a steering_of function that returns the matching steering
+        def steering_of(ticket_id: str) -> dict:
+            return steering if ticket_id == "t-claim" else {}
+
+        eligible_ids = eligible(resolved.store, now=1000.0, steering_of=steering_of)
+        assert "t-claim" in eligible_ids
+    finally:
+        resolved.store.close()
+
+
 # --- C6: promote from stdin JSON ------------------------------------------
 
 
@@ -824,7 +989,18 @@ def test_D5c_range_report_critic_unbudgetable_model(tmp_path: Path, monkeypatch,
 
 @pytest.mark.parametrize(
     "token",
-    ["approve", "unapprove", "reject", "promote", "status", "monitor", "tickets", "range-report"],
+    [
+        "approve",
+        "unapprove",
+        "resume",
+        "reject",
+        "promote",
+        "status",
+        "monitor",
+        "tickets",
+        "range-report",
+        "--operator-session",
+    ],
 )
 def test_D6c_usage_mentions_new_subcommands(token: str, capsys) -> None:
     main([])

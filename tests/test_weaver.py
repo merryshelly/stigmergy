@@ -253,7 +253,12 @@ def plane(tmp_path: Path) -> RecordPlane:
 
 
 def add_parked_ticket(
-    store: RigStore, ticket_id: str, *, work_product: str | Path, tier1_checks: dict | None = None
+    store: RigStore,
+    ticket_id: str,
+    *,
+    work_product: str | Path,
+    tier1_checks: dict | None = None,
+    target_scope: list[str] | None = None,
 ) -> None:
     store.add_ticket(
         id=ticket_id,
@@ -262,6 +267,7 @@ def add_parked_ticket(
         work_product=str(work_product),
         tier1_checks=tier1_checks or {"tests": "true"},
         acceptance_criteria=["does the thing"],
+        target_scope=target_scope,
     )
 
 
@@ -1708,3 +1714,352 @@ def test_gate_event_carries_repair_attempts_and_hash(tmp_path, store, plane):
     assert "repair_instruction_hash" in gate_event
     assert isinstance(gate_event["repair_instruction_hash"], str)
     assert len(gate_event["repair_instruction_hash"]) == 64
+
+
+# ==========================================================================
+# Scope-breach audit (bead .102a)
+# ==========================================================================
+
+
+def test_scope_breach_all_in_scope(tmp_path, store, plane):
+    """Scope-breach audit: bundle whose touched files are ALL inside
+    target_scope -> the apply INTEGRATION event carries scope_breach with
+    empty out_of_scope_paths list, base_oid = pinned OID, and correct stamps."""
+    staging_repo = make_staging_repo(tmp_path)
+    pinned = rev_parse(staging_repo, "refs/heads/staging")
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="all-in-scope",
+        files={
+            "src/feature.py": "def feature(): pass\n",
+            "src/sub/nested.py": "x = 1\n",
+        },
+    )
+    add_parked_ticket(
+        store,
+        "all-in-scope",
+        work_product=bundle,
+        target_scope=["src", "tests"],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    weaver.weave(now=1000.0)
+
+    apply_events = integration_events(plane, "all-in-scope", phase="apply")
+    assert len(apply_events) == 1
+    event = apply_events[0]
+
+    assert "scope_breach" in event
+    scope_breach = event["scope_breach"]
+    assert scope_breach["out_of_scope_paths"] == []
+    assert scope_breach["base_oid"] == pinned
+    assert scope_breach["approval_hash"] == "approvalhash456"  # from stub_ctx_of
+    assert scope_breach["algo_version"] == "102a-v1"
+
+
+def test_scope_breach_mixed_in_and_out(tmp_path, store, plane):
+    """Scope-breach audit: bundle that touches a mix of in-scope and out-of-
+    scope files -> out_of_scope_paths lists exactly the out-of-scope ones,
+    sorted, and the in-scope ones are excluded."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="mixed-scope",
+        files={
+            "src/feature.py": "new feature\n",
+            "docs/README.md": "docs\n",
+            "src/sub/nested.py": "nested\n",
+            "tools/script.sh": "#!/bin/bash\n",
+        },
+    )
+    add_parked_ticket(
+        store,
+        "mixed-scope",
+        work_product=bundle,
+        target_scope=["src"],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    weaver.weave(now=1000.0)
+
+    apply_events = integration_events(plane, "mixed-scope", phase="apply")
+    assert len(apply_events) == 1
+    scope_breach = apply_events[0]["scope_breach"]
+
+    # Only docs and tools should be out of scope
+    assert scope_breach["out_of_scope_paths"] == ["docs/README.md", "tools/script.sh"]
+    # src/feature.py and src/sub/nested.py are in scope, excluded from result
+
+
+def test_scope_breach_directory_prefix_nesting(tmp_path, store, plane):
+    """Scope-breach audit: directory-prefix nesting rule — a scope entry
+    `src/foo` marks `src/foo/a.py` and `src/foo/sub/b.py` in scope, but
+    NOT `src/foobar.py` (the `+ "/"` boundary)."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="nesting-rule",
+        files={
+            "src/foo/a.py": "a\n",
+            "src/foo/sub/b.py": "b\n",
+            "src/foobar.py": "foobar\n",
+            "src/other.py": "other\n",
+        },
+    )
+    add_parked_ticket(
+        store,
+        "nesting-rule",
+        work_product=bundle,
+        target_scope=["src/foo"],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    weaver.weave(now=1000.0)
+
+    apply_events = integration_events(plane, "nesting-rule", phase="apply")
+    scope_breach = apply_events[0]["scope_breach"]
+
+    # src/foo/a.py and src/foo/sub/b.py are in scope
+    # src/foobar.py and src/other.py are out of scope
+    assert scope_breach["out_of_scope_paths"] == ["src/foobar.py", "src/other.py"]
+
+
+def test_scope_breach_empty_target_scope(tmp_path, store, plane):
+    """Scope-breach audit: target_scope is empty/None -> every touched path
+    is recorded as out of scope (honest reading, never silence)."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="empty-scope",
+        files={
+            "src/feature.py": "feature\n",
+            "tests/test_feature.py": "test\n",
+        },
+    )
+    add_parked_ticket(
+        store,
+        "empty-scope",
+        work_product=bundle,
+        target_scope=[],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    weaver.weave(now=1000.0)
+
+    apply_events = integration_events(plane, "empty-scope", phase="apply")
+    scope_breach = apply_events[0]["scope_breach"]
+
+    # All touched paths are out of scope
+    assert scope_breach["out_of_scope_paths"] == [
+        "src/feature.py",
+        "tests/test_feature.py",
+    ]
+
+
+def test_scope_breach_none_target_scope(tmp_path, store, plane):
+    """Scope-breach audit: target_scope is None (not in ticket) -> every
+    touched path is recorded as out of scope, same as empty list."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="none-scope",
+        files={"src/feature.py": "feature\n"},
+    )
+    # Add ticket WITHOUT target_scope (None by default)
+    add_parked_ticket(
+        store,
+        "none-scope",
+        work_product=bundle,
+        target_scope=None,
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    weaver.weave(now=1000.0)
+
+    apply_events = integration_events(plane, "none-scope", phase="apply")
+    scope_breach = apply_events[0]["scope_breach"]
+
+    # All touched paths are out of scope
+    assert scope_breach["out_of_scope_paths"] == ["src/feature.py"]
+
+
+def test_scope_breach_independent_of_rejection_outcome(tmp_path, store, plane):
+    """Scope-breach audit: a bundle that would be REJECTED but reaches outside
+    scope -> the scope_breach field IS STILL on the apply event AND the
+    disposition is still 'rejected' for the SAME reason (proving the breach
+    is recording-only and independent of the gate outcome)."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="out-of-scope-rejected",
+        files={
+            "src/feature.py": "feature\n",
+            "external/bad.py": "bad\n",
+        },
+    )
+    add_parked_ticket(
+        store,
+        "out-of-scope-rejected",
+        work_product=bundle,
+        target_scope=["src"],
+    )
+
+    # Critic will reject the candidate
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="unmet", reason="fails rubric"),
+    )
+    results = weaver.weave(now=1000.0)
+
+    # Verify rejected outcome
+    result = results[0]
+    assert result.outcome == "rejected"
+    assert result.failure_class.value == "rejected"
+
+    # Verify apply event still carries scope_breach
+    apply_events = integration_events(plane, "out-of-scope-rejected", phase="apply")
+    assert len(apply_events) == 1
+    scope_breach = apply_events[0]["scope_breach"]
+    assert scope_breach["out_of_scope_paths"] == ["external/bad.py"]
+
+    # Verify disposition reason hasn't changed (still 'gate-unmet', not mentioning scope)
+    dispositions = disposition_events(plane, "out-of-scope-rejected")
+    assert len(dispositions) == 1
+    assert dispositions[0]["disposition"] == "rejected"
+    # The reason should not include any scope-breach mention in the string
+    # (scope_breach is a separate structured field, not folded into reason)
+
+
+def test_scope_breach_conflict_has_no_apply_event(tmp_path, store, plane):
+    """Scope-breach audit: a bundle that fails to apply (merge conflict) ->
+    there is NO apply INTEGRATION event at all (nothing to audit), and no
+    scope_breach field — this is correct, not a gap."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    # Make a conflicting bundle
+    bundle = make_conflicting_bundle(tmp_path, staging_repo, name="conflict")
+    add_parked_ticket(
+        store,
+        "conflict",
+        work_product=bundle,
+        target_scope=["src"],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+    )
+    results = weaver.weave(now=1000.0)
+
+    result = results[0]
+    assert result.outcome == "integration-conflict"
+
+    # Verify NO apply event for this ticket
+    apply_events = integration_events(plane, "conflict", phase="apply")
+    assert len(apply_events) == 0
+
+
+def test_scope_breach_separate_from_protected_paths(tmp_path, store, plane):
+    """Scope-breach audit: a candidate with out-of-scope touched files but NO
+    protected-path touched files still has flagged_for_human is False and a
+    reason with no 'protected-path-touched:' marker (proving scope_breach is a
+    separate, non-decision-changing channel)."""
+    staging_repo = make_staging_repo(tmp_path)
+
+    bundle = make_bundle(
+        tmp_path,
+        staging_repo,
+        name="scope-but-no-protected",
+        files={
+            "src/feature.py": "feature\n",
+            "docs/README.md": "docs\n",  # out of scope
+        },
+    )
+    add_parked_ticket(
+        store,
+        "scope-but-no-protected",
+        work_product=bundle,
+        target_scope=["src"],
+    )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=make_critic(outcome="met"),
+        protected_paths=["tests/test_acceptance.py"],  # not touched
+    )
+    results = weaver.weave(now=1000.0)
+
+    result = results[0]
+    # flagged_for_human should still be False (no protected paths touched)
+    assert result.flagged_for_human is False
+
+    # The reason string should NOT contain 'protected-path-touched'
+    dispositions = disposition_events(plane, "scope-but-no-protected")
+    assert len(dispositions) == 1
+    reason = dispositions[0].get("reason")
+    assert "protected-path-touched" not in (reason or "")
+
+    # But scope_breach should still be on the apply event
+    apply_events = integration_events(plane, "scope-but-no-protected", phase="apply")
+    assert len(apply_events) == 1
+    assert "scope_breach" in apply_events[0]
+    assert apply_events[0]["scope_breach"]["out_of_scope_paths"] == ["docs/README.md"]

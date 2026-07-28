@@ -67,11 +67,12 @@ STATES: frozenset[str] = frozenset(
 # (bead .89): the spend report counts `state == "landed"` (SPEC §9) AND DAG
 # intake eligibility (`intake._deps_landed`) unblocks a dependent only when
 # every predecessor is `state == "landed"` — so a landed ticket must not move
-# past it. `escalated` is the human-floor loop exit. `done` is a reserved
-# post-land archival state, defined for vocabulary completeness but
-# UNREACHABLE in v0 (nothing transitions into it — the LANDED edge set is
-# empty; see below). All three are terminal (no outgoing edges).
-TERMINAL_STATES: frozenset[str] = frozenset({LANDED, ESCALATED, DONE})
+# past it. `done` is a reserved post-land archival state, defined for
+# vocabulary completeness but UNREACHABLE in v0 (nothing transitions into it
+# — the LANDED edge set is empty; see below). Only LANDED and DONE are
+# terminal (no outgoing edges). ESCALATED is no longer terminal as of bead .102c,
+# which adds the sanctioned operator resume re-entry edge (ESCALATED->POOL via CLI).
+TERMINAL_STATES: frozenset[str] = frozenset({LANDED, DONE})
 
 # The four lease columns (RigStore schema, ticket .15) — cleared together
 # whenever a ticket re-enters `pool` (recover/retry re-entry never leaves a
@@ -133,8 +134,10 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     # silently breaking DAG intake + the spend report (both key on
     # state=="landed"). DONE stays a reserved-but-unreachable archival state.
     LANDED: frozenset(),
-    # Loop exit — terminal in v0 (human floor). No outgoing edges.
-    ESCALATED: frozenset(),
+    # bead .102c: ESCALATED is no longer terminal due to the sanctioned operator
+    # resume re-entry edge (ESCALATED->POOL via CLI verb). An escalated ticket
+    # that a human has triaged/re-approved can re-enter the pool without manual SQL.
+    ESCALATED: frozenset({POOL}),
     # Terminal. No outgoing edges.
     DONE: frozenset(),
 }

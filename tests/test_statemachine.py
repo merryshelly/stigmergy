@@ -122,7 +122,7 @@ _EXPECTED_LEGAL_TRANSITIONS: dict[str, set[str]] = {
     FAILED: {POOL, ESCALATED},
     REJECTED: {POOL, ESCALATED},
     LANDED: set(),
-    ESCALATED: set(),
+    ESCALATED: {POOL},
     DONE: set(),
 }
 
@@ -623,6 +623,42 @@ def test_transition_parked_to_escalated_now_legal(store: RigStore) -> None:
 
     assert result == {"ticket": "t-parked-escalate", "from": PARKED, "to": ESCALATED}
     assert store.get_ticket("t-parked-escalate")["state"] == ESCALATED
+
+
+def test_transition_escalated_to_pool_now_legal(store: RigStore) -> None:
+    """The re-entry edge did not exist before .102c — ESCALATED was terminal.
+    The sanctioned operator resume edge (ESCALATED->POOL) allows an escalated
+    ticket that a human has triaged/re-approved to re-enter the pool without
+    manual SQL. When transitioning to POOL, all four lease fields are cleared,
+    but counters are left alone (the CLI verb separately zeros attempts_used
+    and current_rung, not the transition function itself)."""
+    add_ticket(
+        store,
+        "t-escalated-resume",
+        state=ESCALATED,
+        lease_owner="worker-1",
+        lease_dispatch_id="dispatch-1",
+        lease_expires_at=1000.0,
+        lease_heartbeat_at=999.0,
+        attempts_used=3,
+        current_rung="exquisite",
+        integration_failures=1,
+    )
+
+    result = transition(store, "t-escalated-resume", POOL, expected_from=ESCALATED)
+
+    assert result == {"ticket": "t-escalated-resume", "from": ESCALATED, "to": POOL}
+    row_after = store.get_ticket("t-escalated-resume")
+    assert row_after["state"] == POOL
+    # Leases cleared on transition to POOL
+    assert row_after["lease_owner"] is None
+    assert row_after["lease_dispatch_id"] is None
+    assert row_after["lease_expires_at"] is None
+    assert row_after["lease_heartbeat_at"] is None
+    # Counters untouched by transition (CLI verb handles counter zeroing separately)
+    assert row_after["attempts_used"] == 3
+    assert row_after["current_rung"] == "exquisite"
+    assert row_after["integration_failures"] == 1
 
 
 # --- .107 #1-3: decide_critic_infra -----------------------------------------

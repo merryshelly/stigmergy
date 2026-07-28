@@ -113,6 +113,10 @@ _JOURNAL_MODE = 0o600
 # DISPOSITION) events — a weave bookkeeping event spends nothing.
 _ZERO_TOKENS: dict[str, int] = {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
 
+# Scope-breach audit algorithm version stamp (reproducibility after rebase/
+# policy change). Bumping this identifies when the matching rule evolves.
+_SCOPE_AUDIT_ALGO_VERSION = "102a-v1"
+
 # The ctx_of() contract: every key a caller-supplied ctx dict must carry so
 # GATE/INTEGRATION events (and record_disposition's own ctx fields) can be
 # built without ever silently defaulting an identity field.
@@ -397,15 +401,38 @@ class Weaver:
                 candidate_oid=candidate_oid,
                 ts=now,
             )
+
+            # Compute changed paths once for both protected-path check and
+            # scope-breach audit, so git diff --name-only runs at most once.
+            diff = self._git(
+                candidate_dir, ["diff", "--name-only", pinned_oid, candidate_oid]
+            ).stdout
+            changed = [line.strip() for line in diff.splitlines() if line.strip()]
+
             # Record-plane INTEGRATION "apply" event (SPEC §1.0: "INTEGRATION
             # (apply/land/abort)") — written unconditionally once a
             # candidate exists, independent of what happens at checks/gate
-            # next.
+            # next. Carries the scope_breach audit as a structured field.
+            touched = self._protected_paths_touched(
+                candidate_dir, pinned_oid, candidate_oid, changed=changed
+            )
+            target_scope = ticket_row.get("target_scope")
+            out_of_scope_paths = self._scope_breach(changed, target_scope)
+            scope_breach: dict[str, Any] = {
+                "out_of_scope_paths": out_of_scope_paths,
+                "base_oid": pinned_oid,
+                "approval_hash": ctx.get("approval_hash"),
+                "algo_version": _SCOPE_AUDIT_ALGO_VERSION,
+            }
             self._append_integration_event(
-                ctx, phase="apply", pinned_oid=pinned_oid, candidate_oid=candidate_oid, now=now
+                ctx,
+                phase="apply",
+                pinned_oid=pinned_oid,
+                candidate_oid=candidate_oid,
+                now=now,
+                scope_breach=scope_breach,
             )
 
-            touched = self._protected_paths_touched(candidate_dir, pinned_oid, candidate_oid)
             flagged = bool(touched) or stripped
 
             checks = self._all_checks(ticket_row)
@@ -901,12 +928,17 @@ class Weaver:
         return True, candidate_oid, stripped
 
     def _protected_paths_touched(
-        self, candidate_dir: Path, pinned_oid: str, candidate_oid: str
+        self,
+        candidate_dir: Path,
+        pinned_oid: str,
+        candidate_oid: str,
+        changed: list[str] | None = None,
     ) -> list[str]:
-        diff = self._git(
-            candidate_dir, ["diff", "--name-only", pinned_oid, candidate_oid]
-        ).stdout
-        changed = [line.strip() for line in diff.splitlines() if line.strip()]
+        if changed is None:
+            diff = self._git(
+                candidate_dir, ["diff", "--name-only", pinned_oid, candidate_oid]
+            ).stdout
+            changed = [line.strip() for line in diff.splitlines() if line.strip()]
         return [
             path
             for path in changed
@@ -915,6 +947,43 @@ class Weaver:
                 for pattern in self.protected_paths
             )
         ]
+
+    def _scope_breach(self, changed: list[str], target_scope: list[str] | None) -> list[str]:
+        """Audit the changed paths against the ticket's target_scope.
+
+        Returns the sorted list of changed paths that are OUT OF SCOPE.
+
+        The in-scope matching rule is literal equals-or-nested-under on repo-
+        relative, forward-slash paths (NOT fnmatch globbing, diverging from
+        `_protected_paths_touched`'s fnmatch because target_scope entries are
+        declared literal file/directory paths, not charter globs). A touched
+        path P is in scope iff for some scope entry S, after normalizing S
+        with `S.rstrip("/")`, `P == S_norm` OR `P.startswith(S_norm + "/")`.
+        The mandatory `+ "/"` separator prevents a scope entry `src/foo` from
+        matching `src/foobar.py`.
+
+        Edge cases:
+        - target_scope is None or [] -> EVERY changed path is out of scope
+          (honest reading, mirrors steering.py's `None -> []`).
+        - a changed path covered by zero scope entries is out of scope.
+        - a changed path that exactly equals or is nested under at least one
+          scope entry is in scope and excluded from the result.
+        - non-string scope entries are skipped defensively rather than raising,
+          so the audit never throws and breaks a weave.
+        """
+        if not target_scope:
+            return sorted(changed)
+
+        def in_scope(path: str) -> bool:
+            for scope_entry in target_scope:
+                if not isinstance(scope_entry, str):
+                    continue
+                scope_norm = scope_entry.rstrip("/")
+                if path == scope_norm or path.startswith(scope_norm + "/"):
+                    return True
+            return False
+
+        return sorted([p for p in changed if not in_scope(p)])
 
     def _fetch_candidate_into_staging(self, candidate_dir: Path, ticket_id: str) -> None:
         """Import the candidate's objects into ``staging_repo`` by
@@ -989,6 +1058,7 @@ class Weaver:
         candidate_oid: str | None,
         now: float,
         error: str | None = None,
+        scope_breach: dict[str, Any] | None = None,
     ) -> None:
         fields = {key: ctx.get(key) for key in _CTX_FIELDS}
         fields["ticket"] = ctx["ticket"]
@@ -1004,6 +1074,11 @@ class Weaver:
         # never set to a literal None value on the event itself).
         if error is not None:
             fields["error"] = error
+        # Scope-breach audit (bead .102a): a structured record of out-of-scope
+        # touched paths, only on the "apply" phase event. Attached when not None
+        # following the same optional-field pattern as error above.
+        if scope_breach is not None:
+            fields["scope_breach"] = scope_breach
         event = make_event(EventType.INTEGRATION, **fields)
         self.record_plane.append(event)
 
