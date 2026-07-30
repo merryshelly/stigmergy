@@ -258,21 +258,6 @@ def _run_daemon(daemon: Daemon) -> None:
     daemon.run_forever()
 
 
-def _critic_decoding_params(critic_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Sampling params for the critic/range-critic Messages call (bead .81).
-
-    Current-gen Anthropic models (opus-4-8 / sonnet-5, the 4.7+/5 gen)
-    DEPRECATE sampling params (temperature/top_p/top_k) and return HTTP 400
-    if any is sent. Only forward `temperature` when the charter declares it
-    (older/open models that still accept it); omit entirely otherwise so the
-    critic gate works against the deprecating generation. Robust,
-    capability-aware handling is bead .84.
-    """
-    if "temperature" in critic_cfg:
-        return {"temperature": critic_cfg["temperature"]}
-    return {}
-
-
 def _build_daemon(resolved: ResolvedRig) -> Daemon:
     """Wire every real collaborator a `Daemon` needs from an already-
     resolved rig (bead `.27` build spec §2.1). Egress/relay stay at
@@ -323,7 +308,7 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
             max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
         ),
         model=critic_cfg["model"],
-        decoding_params=_critic_decoding_params(critic_cfg),
+        decoding_params={},
     )
     dispatch_limits = charter.raw["loop"]["dispatch_limits"]
     weaver = Weaver(
@@ -997,7 +982,7 @@ def _build_range_critic(resolved: ResolvedRig) -> RangeCritic:
             key_provider=critic_key_provider, registry=resolved.registry
         ),
         model=critic_cfg["model"],
-        decoding_params=_critic_decoding_params(critic_cfg),
+        decoding_params={},
     )
 
 

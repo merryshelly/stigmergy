@@ -69,7 +69,6 @@ ladder = ["cheap", "default", "exquisite"]
 
 [roles.critic]
 model = "opus"
-temperature = 0.0
 
 [models]
 registry = "models.toml"
