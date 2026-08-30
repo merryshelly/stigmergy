@@ -52,8 +52,9 @@ def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> P
     (repo_dir / "prompts").mkdir(parents=True)
     (repo_dir / "prompts" / "code01").write_text("code01 template: $goal\n")
     (repo_dir / "prompts" / "critic01").write_text("critic01 template\n")
-    # bead .39: production staging-gate critic reads critic02 (the D14 filing bump).
-    (repo_dir / "prompts" / "critic02").write_text("critic02 template\n")
+    # bead .140: production staging-gate critic reads critic03 (moved-file
+    # trusted-evidence bump, rollover of the bead .39 critic02 filing bump).
+    (repo_dir / "prompts" / "critic03").write_text("critic03 template\n")
     # beads .41: production `range-report --critic` reads rangecrit02.
     (repo_dir / "prompts" / "rangecrit02").write_text("rangecrit02 template\n")
     (repo_dir / "README.md").write_text("hello from the fixture repo\n")
@@ -166,9 +167,9 @@ def test_build_daemon_wiring(tmp_path: Path) -> None:
         # bead .39: D14 filing caps flow charter -> weaver.
         assert daemon._weaver.filing_max_filings == 3
         assert daemon._weaver.filing_max_bytes == 9999
-        # bead .39: _build_daemon loads critic02 (filing-mandate bump), NOT critic01.
+        # bead .140: _build_daemon loads critic03 (moved-file bump), NOT critic01/02.
         assert daemon._weaver.critic.template == (
-            resolved.rig_paths["prompts_dir"] / "critic02"
+            resolved.rig_paths["prompts_dir"] / "critic03"
         ).read_text(encoding="utf-8")
         # checker_image == charter [rig].image (v0: one image for worker+checker)
         assert daemon._checker_image == "stigmergy-worker:py312"

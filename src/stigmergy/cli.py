@@ -295,11 +295,13 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # bead .36: the critic client is now real (direct Anthropic Messages call,
     # SPEC §7) -- any client-side/provider failure surfaces as CriticInfraError,
     # never a silent wrong gate verdict (critic.py's own fail-closed discipline).
-    # bead .39: the staging-gate critic now reads critic02 (the D14 filing-
+    # bead .39: the staging-gate critic reads critic02+ (the D14 filing-
     # mandate prompt bump, carrying the optional filed_tickets schema field).
+    # bead .140: critic03 adds the moved-file trusted-evidence exception
+    # (SB-approved 2026-08-30) so rename-only artifacts are verifiable.
     critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
     critic = Critic.from_prompt_file(
-        rig_paths["prompts_dir"] / "critic02",  # hardcoded filename -- see §3.7 note
+        rig_paths["prompts_dir"] / "critic03",  # hardcoded filename -- see §3.7 note
         client=make_critic_client(
             key_provider=critic_key_provider,
             registry=registry,

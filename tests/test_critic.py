@@ -595,3 +595,176 @@ def test_client_exception_with_odd_message_preserves_format():
         assert f"{type(exc).__name__}: " in error_msg
         # Verify bounded length
         assert len(error_msg) <= 512 + len("critic client call failed: ")
+
+
+# --------------------------------------------------------------------------
+# Rename evidence — bead .140: rename-only artifacts get the post-move
+# content of moved files as trusted evidence (harness-extracted, never
+# worker text) so move-only rubric items stay verifiable.
+# --------------------------------------------------------------------------
+
+RENAME_EVIDENCE_TEXT = (
+    "--- Moved-file content (harness-extracted, trusted) ---\n"
+    "The paths below were moved by git rename in the artifact. The diff "
+    "shows only the rename header; the full post-move content of each file "
+    "is provided here by the harness, read from the candidate tree.\n\n"
+    "R100  bot.py -> runtime/bot.py\n"
+    "MATRIXBOT_WIRING = True\n"
+)
+
+
+def test_rename_evidence_rendered_outside_artifact_fence():
+    # With rename_evidence given, the moved-file block appears INSIDE the
+    # ===TRUSTED-EVIDENCE-BEGIN/END=== region, BEFORE the artifact fence,
+    # and the artifact text itself is untouched.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    critic.judge(BENIGN_ARTIFACT, RUBRIC, rename_evidence=RENAME_EVIDENCE_TEXT)
+
+    prompt = client.calls[0]["prompt"]
+    evidence_begin = prompt.find("===TRUSTED-EVIDENCE-BEGIN===")
+    evidence_end = prompt.find("===TRUSTED-EVIDENCE-END===")
+    artifact_begin = prompt.find("===ARTIFACT-BEGIN")
+    artifact_end = prompt.find("===ARTIFACT-END")
+    block_pos = prompt.find("R100  bot.py -> runtime/bot.py")
+    body_pos = prompt.find("MATRIXBOT_WIRING = True")
+
+    assert evidence_begin != -1
+    assert evidence_end != -1
+    assert artifact_begin != -1
+    assert artifact_end != -1
+    # The whole moved-file block sits strictly inside the trusted region...
+    assert evidence_begin < block_pos < body_pos < evidence_end
+    # ...and strictly BEFORE the artifact fence.
+    assert evidence_end < artifact_begin < artifact_end
+    # The artifact text is present verbatim, unmodified.
+    assert BENIGN_ARTIFACT.strip() in prompt
+    # The block's body appears exactly once — it was not hoisted into the
+    # instruction/rubric channel anywhere else.
+    assert prompt.count("MATRIXBOT_WIRING = True") == 1
+
+
+def test_rename_evidence_omitted_when_not_provided():
+    # Default None: the prompt is byte-structurally identical (modulo the
+    # per-call nonce) to the no-evidence build — no trusted section at all.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    critic.judge(BENIGN_ARTIFACT, RUBRIC, rename_evidence=None)
+
+    prompt = client.calls[0]["prompt"]
+    assert "===TRUSTED-EVIDENCE-BEGIN===" not in prompt
+    assert "===TRUSTED-EVIDENCE-END===" not in prompt
+    assert "Moved-file content" not in prompt
+
+
+def test_prompt_identical_when_rename_evidence_absent_vs_default():
+    # Passing rename_evidence explicitly as None must be indistinguishable
+    # from omitting the kwarg entirely (byte-structural parity; the two
+    # builds differ only in their per-call nonce, which sits in the
+    # artifact fence markers and nowhere else).
+    import re
+
+    p_default = build_critic_prompt(RUBRIC, BENIGN_ARTIFACT, template=TEMPLATE)
+    p_none = build_critic_prompt(
+        RUBRIC, BENIGN_ARTIFACT, template=TEMPLATE, rename_evidence=None
+    )
+
+    def _strip_nonce(p: str) -> str:
+        return re.sub(r"===ARTIFACT-(?:BEGIN|END) [0-9a-f]+===", "<FENCE>", p)
+
+    assert _strip_nonce(p_default) == _strip_nonce(p_none)
+    # Sanity: the nonces really are fresh (two distinct builds differ).
+    assert p_default != p_none
+
+
+def test_judge_accepts_rename_evidence_parameter():
+    # Mirrors test_judge_accepts_check_evidence_parameter: judge() forwards
+    # the rename_evidence kwarg into the prompt via the client.
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    verdict, _, _ = critic.judge(BENIGN_ARTIFACT, RUBRIC, rename_evidence=RENAME_EVIDENCE_TEXT)
+    assert isinstance(verdict, Verdict)
+    assert len(client.calls) == 1
+    prompt = client.calls[0]["prompt"]
+    assert "R100  bot.py -> runtime/bot.py" in prompt
+    assert "MATRIXBOT_WIRING = True" in prompt
+
+
+def test_rename_evidence_only_section_keeps_delimiters():
+    # rename_evidence WITHOUT check_evidence still gets the same
+    # ===TRUSTED-EVIDENCE-BEGIN/END=== delimiters (the trusted region is
+    # one channel, not two).
+    client = StubClient(response=_ok_response())
+    critic = _critic(client)
+    critic.judge(BENIGN_ARTIFACT, RUBRIC, rename_evidence=RENAME_EVIDENCE_TEXT)
+    prompt = client.calls[0]["prompt"]
+    assert prompt.count("===TRUSTED-EVIDENCE-BEGIN===") == 1
+    assert prompt.count("===TRUSTED-EVIDENCE-END===") == 1
+    assert "R100  bot.py -> runtime/bot.py" in prompt
+
+
+def _format_rename_rows(rows, overflow=None):
+    from stigmergy.critic import RenameEvidence, format_rename_evidence
+
+    ev = [
+        RenameEvidence(
+            similarity_tag=r[0], old_path=r[1], new_path=r[3], body=r[2]
+        )
+        for r in rows
+    ]
+    return format_rename_evidence(ev, overflow=overflow)
+
+
+def test_format_rename_evidence_renders_all_rows_with_bodies():
+    text = _format_rename_rows(
+        [
+            ("R100", "a.py", "alpha body\n", "b.py"),
+            ("R089", "c.txt", "delta body\n", "sub/c.txt"),
+        ]
+    )
+    assert text.count("--- Moved-file content (harness-extracted, trusted) ---") == 1
+    assert "R100  a.py -> b.py" in text
+    assert "R089  c.txt -> sub/c.txt" in text
+    assert "alpha body" in text
+    assert "delta body" in text
+
+
+def test_format_rename_evidence_truncation_label_includes_byte_counts():
+    # A row whose body already carries the harness elision marker (weaver-
+    # authored) is rendered verbatim — the marker states the omitted byte
+    # count and the budget, and lives inside the trusted block only.
+    elision = (
+        "<<< elided 4096 bytes (budget 32768) — trusted content, "
+        "harness truncation, not worker omission >>>"
+    )
+    text = _format_rename_rows([("R100", "big.py", "HEAD...\n" + elision + "\nTAIL...", "big2.py")])
+    assert elision in text
+    assert "elided 4096 bytes (budget 32768)" in text
+    assert "harness truncation, not worker omission" in text
+    assert "R100  big.py -> big2.py" in text
+
+
+def test_format_rename_evidence_binary_label():
+    from stigmergy.weaver import RENAME_BINARY_LABEL
+
+    text = _format_rename_rows([("R098", "img.bin", RENAME_BINARY_LABEL, "assets/img.bin")])
+    assert "<binary rename, body omitted>" in text
+    assert "R098  img.bin -> assets/img.bin" in text
+
+
+def test_format_rename_evidence_aggregate_overflow_lists_paths_without_bodies():
+    # Beyond the aggregate budget the weaver passes the remaining paths as
+    # `overflow`; they are named in the block but carry NO body.
+    text = _format_rename_rows(
+        [("R100", "kept.py", "kept body\n", "kept2.py")],
+        overflow=["overflow/a.bin", "overflow/b.bin"],
+    )
+    assert "kept body" in text
+    assert "R100  kept.py -> kept2.py" in text
+    assert "overflow/a.bin" in text
+    assert "overflow/b.bin" in text
+    # No body text for the overflow paths.
+    assert "overflow body" not in text
+    # The block states the overflow paths are body-less.
+    assert "listed WITHOUT bodies (overflow)" in text
+    assert "exceeded the aggregate evidence budget" in text

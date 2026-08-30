@@ -59,6 +59,7 @@ answer and mutates nothing.
 from __future__ import annotations
 
 import fnmatch
+import inspect
 import json
 import logging
 import os
@@ -116,6 +117,21 @@ _ZERO_TOKENS: dict[str, int] = {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
 # Scope-breach audit algorithm version stamp (reproducibility after rebase/
 # policy change). Bumping this identifies when the matching rule evolves.
 _SCOPE_AUDIT_ALGO_VERSION = "102a-v1"
+
+# Bead .140: rename-evidence budget (spec §3.3). A rename-only diff carries
+# no hunks for moved files, so the weaver feeds the critic the POST-MOVE
+# content of every rename-touched path as trusted evidence — with a hard
+# per-file budget (head 16 KiB + tail 16 KiB above it) and an aggregate
+# ticket budget so a pathological pure-rename mega-bundle cannot blow the
+# prompt-size discipline.
+RENAME_FILE_BUDGET = 16 * 1024  # head/tail slice size (bytes) when truncating
+RENAME_FILE_CAP = 2 * RENAME_FILE_BUDGET  # 32 KiB per renamed file
+RENAME_AGGREGATE_BUDGET = 64 * 1024  # 64 KiB total across all renames
+RENAME_BINARY_LABEL = "<binary rename, body omitted>"
+RENAME_ELISION_TEMPLATE = (
+    "<<< elided {elided_bytes} bytes (budget {budget}) — trusted content, "
+    "harness truncation, not worker omission >>>"
+)
 
 # The ctx_of() contract: every key a caller-supplied ctx dict must carry so
 # GATE/INTEGRATION events (and record_disposition's own ctx fields) can be
@@ -264,6 +280,23 @@ class Weaver:
         # resource bounds as the daemon attempt gate. None -> all checks use
         # DEFAULT_CHECK_RESOURCES (keeps injected-double tests unchanged).
         self.check_resources_fn = check_resources_fn
+        # Bead .140 stub-contract guard: the gate now passes the
+        # `rename_evidence` kwarg to `critic.judge`. A duck-typed critic
+        # (test stubs/doubles) whose `judge` does not accept it would
+        # raise TypeError MID-WEAVE at the gate — converting what is
+        # actually a wiring bug into an unexplained candidate death.
+        # Fail loudly at wire time instead (WeaverError).
+        try:
+            judge_params = inspect.signature(critic.judge).parameters
+        except (TypeError, ValueError):
+            judge_params = {}
+        if "rename_evidence" not in judge_params:
+            raise WeaverError(
+                "critic stub-contract violation: critic.judge() must accept "
+                "the rename_evidence keyword argument (bead .140) — e.g. "
+                "def judge(self, artifact, rubric_items, *, check_evidence=None, "
+                "rename_evidence=None)"
+            )
 
     # -- WeaveJournalResolver protocol (recover.py) ------------------------
 
@@ -473,8 +506,19 @@ class Weaver:
 
             try:
                 check_evidence = format_check_evidence(check_results)
+                # Bead .140: rename evidence for the trusted-evidence
+                # channel. Its fail-safe (log + None, never infra) lives
+                # INSIDE _rename_evidence — a detection failure degrades
+                # to today's no-evidence behavior, exactly like a diff
+                # with no renames.
+                rename_evidence = self._rename_evidence(
+                    candidate_dir, pinned_oid, candidate_oid
+                )
                 verdict, gate_fields, filed_tickets = self.critic.judge(
-                    artifact, rubric_items, check_evidence=check_evidence
+                    artifact,
+                    rubric_items,
+                    check_evidence=check_evidence,
+                    rename_evidence=rename_evidence,
                 )
             except CriticInfraError as exc:
                 return self._die(
@@ -799,6 +843,93 @@ class Weaver:
         diff = self._git(candidate_dir, ["diff", pinned_oid, candidate_oid]).stdout
         return f"ticket: {ticket_id}\ncandidate: {candidate_oid}\n\n{diff}"
 
+    def _rename_evidence(
+        self, candidate_dir: Path, pinned_oid: str, candidate_oid: str
+    ) -> str | None:
+        """Bead .140: detect renames in the staged diff and return the
+        formatted "Moved-file content" trusted-evidence block, or ``None``
+        when there are no renames — or, fail-safe, when detection or a
+        blob read fails. A rename-detection failure must NEVER become an
+        infra gate failure: it logs and degrades to no evidence, exactly
+        today's behavior (spec §4.2: do not let the new plumbing call
+        regress landability).
+
+        Detection is git's own rename pairing (the same default 50%
+        similarity threshold that suppressed the hunks in the artifact):
+        ``git diff --name-status --diff-filter=R <pinned> <candidate>``
+        yields ``R<score>\\told\\tnew`` rows. For each rename the POST-MOVE
+        blob at ``candidate_oid`` is read via ``git show <candidate>:
+        <new_path>`` (object database — never the worktree file, never the
+        pre-move content), decoded as UTF-8 with replacement (binary
+        content — a NUL byte after decoding — is labeled rather than
+        fed). Budgets: >32 KiB per file truncates to head 16 KiB + tail
+        16 KiB with the harness elision marker; >64 KiB aggregate stops
+        feeding bodies and names the overflow paths instead.
+        """
+        from stigmergy.critic import RenameEvidence, format_rename_evidence
+
+        try:
+            status = self._git(
+                candidate_dir,
+                ["diff", "--name-status", "--diff-filter=R", pinned_oid, candidate_oid],
+            ).stdout
+            renames: list[tuple[str, str, str]] = []  # (tag, old_path, new_path)
+            for line in status.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 3 or not parts[0].startswith("R"):
+                    continue
+                tag, old_path, new_path = parts
+                if not tag[1:].isdigit():
+                    continue
+                renames.append((tag, old_path, new_path))
+            if not renames:
+                return None
+
+            rows: list[RenameEvidence] = []
+            overflow: list[str] = []
+            aggregate_used = 0
+            for tag, old_path, new_path in renames:
+                raw = self._git(
+                    candidate_dir, ["show", f"{candidate_oid}:{new_path}"], errors="replace"
+                ).stdout
+                if "\x00" in raw:
+                    body = RENAME_BINARY_LABEL
+                else:
+                    data = raw.encode("utf-8", errors="replace")
+                    if len(data) > RENAME_FILE_CAP:
+                        head = data[: RENAME_FILE_BUDGET].decode("utf-8", errors="replace")
+                        tail = data[-RENAME_FILE_BUDGET:].decode("utf-8", errors="replace")
+                        body = "\n".join(
+                            [
+                                head,
+                                RENAME_ELISION_TEMPLATE.format(
+                                    elided_bytes=len(data) - 2 * RENAME_FILE_BUDGET,
+                                    budget=2 * RENAME_FILE_BUDGET,
+                                ),
+                                tail,
+                            ]
+                        )
+                    else:
+                        body = raw
+                body_bytes = len(body.encode("utf-8"))
+                if aggregate_used + body_bytes > RENAME_AGGREGATE_BUDGET:
+                    # Aggregate budget exhausted: name the rename pair
+                    # without its body (the critic still knows it was
+                    # moved, and where to).
+                    overflow.append(f"{old_path} -> {new_path}")
+                    continue
+                aggregate_used += body_bytes
+                rows.append(RenameEvidence(tag, old_path, new_path, body))
+            if not rows and not overflow:
+                return None
+            return format_rename_evidence(rows, overflow=overflow or None)
+        except Exception as exc:  # noqa: BLE001 — fail-safe: NEVER infra
+            _logger.warning(
+                "rename evidence detection failed: %s — gating without rename evidence",
+                exc,
+            )
+            return None
+
     # -- git plumbing ---------------------------------------------------------
 
     def _clone_candidate(self, pinned_oid: str) -> Path:
@@ -1008,7 +1139,12 @@ class Weaver:
         return self._git(repo, ["rev-parse", ref]).stdout.strip()
 
     def _git(
-        self, repo: Path | None, args: list[str], *, check: bool = True
+        self,
+        repo: Path | None,
+        args: list[str],
+        *,
+        check: bool = True,
+        errors: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run one loop-side git command, ALWAYS with hooks disabled
         (`-c core.hooksPath=/dev/null`, SPEC §10 AC6 defense in depth).
@@ -1016,6 +1152,12 @@ class Weaver:
         is host-touching plumbing over trusted repos/paths, not a
         container boundary; the untrusted input this module defends
         against is bundle/tree CONTENT, never the daemon's own env.
+
+        ``errors``: optional ``text=True`` decode error handler. Strict
+        by default (every existing call site is unaffected); the
+        rename-evidence blob reads (bead .140) pass ``"replace"`` so a
+        binary blob moved by rename cannot crash the decode — the bytes
+        come back with U+FFFD replacements and are labeled by the caller.
         """
         argv = ["git"]
         if repo is not None:
@@ -1039,6 +1181,7 @@ class Weaver:
             argv,
             capture_output=True,
             text=True,
+            errors=errors,
             check=False,
         )
         if check and result.returncode != 0:

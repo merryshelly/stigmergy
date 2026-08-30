@@ -197,9 +197,21 @@ class SpyCritic:
         self._inner = inner
         self.judge_called = False
 
-    def judge(self, artifact: str, rubric_items: list[str], *, check_evidence: str | None = None):
+    def judge(
+        self,
+        artifact: str,
+        rubric_items: list[str],
+        *,
+        check_evidence: str | None = None,
+        rename_evidence: str | None = None,  # bead .140 stub contract
+    ):
         self.judge_called = True
-        return self._inner.judge(artifact, rubric_items, check_evidence=check_evidence)
+        return self._inner.judge(
+            artifact,
+            rubric_items,
+            check_evidence=check_evidence,
+            rename_evidence=rename_evidence,
+        )
 
 
 def make_critic(
@@ -1550,9 +1562,21 @@ def test_weaver_passes_check_results_as_evidence_to_critic(tmp_path, store, plan
             self._inner = inner
             self.received_evidence = None
 
-        def judge(self, artifact, rubric_items, *, check_evidence=None):
+        def judge(
+            self,
+            artifact,
+            rubric_items,
+            *,
+            check_evidence=None,
+            rename_evidence=None,  # bead .140 stub contract
+        ):
             self.received_evidence = check_evidence
-            return self._inner.judge(artifact, rubric_items, check_evidence=check_evidence)
+            return self._inner.judge(
+                artifact,
+                rubric_items,
+                check_evidence=check_evidence,
+                rename_evidence=rename_evidence,
+            )
 
     inner_critic = make_critic(outcome="met")
     spy = EvidenceSpy(inner_critic)
@@ -2063,3 +2087,614 @@ def test_scope_breach_separate_from_protected_paths(tmp_path, store, plane):
     assert len(apply_events) == 1
     assert "scope_breach" in apply_events[0]
     assert apply_events[0]["scope_breach"]["out_of_scope_paths"] == ["docs/README.md"]
+
+
+# ==========================================================================
+# Rename evidence — bead .140: rename-only artifacts are structurally
+# un-satisfiable for the critic (a 100%-similarity rename header carries
+# zero hunks, so move-only rubric items have no affirmative evidence).
+# The weaver now detects renames in the staged diff and feeds the
+# POST-MOVE content of each moved file to the critic as trusted
+# evidence (harness-extracted, size-capped) via judge's rename_evidence
+# kwarg. Fail-safe: any detection failure degrades to no evidence,
+# NEVER an infra gate outcome.
+# ==========================================================================
+
+RENAME_FILE_BODY = (
+    "class MatrixBot:\n"
+    "    def __init__(self, room_id):\n"
+    "        self.room_id = room_id\n"
+    "        self._restarted = False\n"
+    "\n"
+    "    def start(self):\n"
+    "        # simulate a process restart before serving the room\n"
+    "        self._restarted = True\n"
+    "\n"
+)
+
+
+def _push_to_staging(tmp_path: Path, staging_repo: Path, name: str, write) -> None:
+    """Commit `write(clone_dir)` onto staging (a worker that already
+    landed) so the rename's OLD path exists in the pinned base — git's
+    rename pairing operates on the base..work diff, so a file that is
+    created AND moved inside one bundle has no deletion to pair with."""
+    clone_dir = tmp_path / f"{name}-base"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-B", "base-push", "origin/staging"])
+    write(clone_dir)
+    run_git(clone_dir, ["add", "-A"])
+    run_git(clone_dir, ["commit", "--quiet", "-m", f"base state for {name}"])
+    run_git(clone_dir, ["push", "--quiet", "origin", "HEAD:staging"])
+
+
+def _rename_bundle(tmp_path: Path, staging_repo: Path, name: str) -> Path:
+    """A worker bundle whose commit is exactly the sched-t5 shape: a
+    100%-similarity rename (`bot.py` -> `runtime/bot.py`) plus a trivial
+    README edit. The module exists in the staging base first (that is
+    what makes the move a rename in the base..work diff). Real git,
+    host-safe."""
+
+    def _write_base(clone_dir: Path) -> None:
+        (clone_dir / "bot.py").write_text(RENAME_FILE_BODY)
+
+    _push_to_staging(tmp_path, staging_repo, name, _write_base)
+
+    clone_dir = tmp_path / f"{name}-clone"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-b", "work", "origin/staging"])
+    run_git(clone_dir, ["mv", "bot.py", "runtime_bot.py.tmp"])
+    (clone_dir / "runtime").mkdir(parents=True, exist_ok=True)
+    run_git(clone_dir, ["mv", "runtime_bot.py.tmp", "runtime/bot.py"])
+    readme = (clone_dir / "README.md").read_text()
+    (clone_dir / "README.md").write_text(readme + "see runtime/ for the bot\n")
+    run_git(clone_dir, ["add", "-A"])
+    run_git(clone_dir, ["commit", "--quiet", "-m", f"worker change for {name}"])
+    bundle_path = tmp_path / f"{name}.bundle"
+    run_git(clone_dir, ["bundle", "create", str(bundle_path), "refs/heads/work"])
+    return bundle_path
+
+
+def _rename_spy():
+    """A critic spy mirroring the full judge contract: records the
+    artifact, check_evidence, AND rename_evidence it receives, then
+    delegates to the real inner critic."""
+
+    class RenameEvidenceSpy:
+        def __init__(self, inner):
+            self._inner = inner
+            self.received_artifact = None
+            self.received_check_evidence = None
+            self.received_rename_evidence = "UNSET"
+
+        def judge(
+            self,
+            artifact,
+            rubric_items,
+            *,
+            check_evidence=None,
+            rename_evidence="UNSET",
+        ):
+            self.received_artifact = artifact
+            self.received_check_evidence = check_evidence
+            self.received_rename_evidence = rename_evidence
+            return self._inner.judge(
+                artifact,
+                rubric_items,
+                check_evidence=check_evidence,
+                rename_evidence=rename_evidence,
+            )
+
+    return RenameEvidenceSpy
+
+
+def test_rename_only_artifact_burns_ladder_before_fix_met_after(tmp_path, store, plane):
+    """Prove-can-fail (spec §5.2): the sched-t5 reproduction shape — a
+    100%-similarity rename plus a trivial README edit.
+
+    Before-fix arm (structural precondition that made UNMET inevitable):
+    the artifact handed to the critic shows the `similarity index 100%`
+    rename header with ZERO hunks for the moved file — no file body
+    anywhere in the diff, so a rubric item judging the moved module's
+    content could never find affirmative evidence.
+
+    After-fix arm: the trusted-evidence channel (rename_evidence) carries
+    the FULL post-move body, and a critic that keys its verdict on that
+    content evidence returns MET and the ticket lands.
+    """
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = _rename_bundle(tmp_path, staging_repo, name="t-140")
+    # Direct store.add_ticket (not add_parked_ticket) so the ticket's
+    # rubric is exactly the move-only content item that sched-t5 burned.
+    store.add_ticket(
+        id="t-140",
+        title="Ticket t-140",
+        state=PARKED,
+        work_product=str(bundle),
+        tier1_checks={"tests": "true"},
+        acceptance_criteria=[
+            "the runtime module wires MatrixBot with a restart simulation"
+        ],
+    )
+
+    # -- Before-fix arm: the artifact shape is structurally empty -------
+    # Build the artifact exactly as the pre-fix _build_artifact did (raw
+    # git diff, no evidence channel) and prove it carries the rename
+    # header but no hunks for the moved file.
+    from stigmergy.weaver import Weaver as _W
+
+    work_dir = tmp_path / "t-140-shape"
+    run_git(None, ["init", "--quiet", "-b", "main", str(work_dir)])
+    run_git(work_dir, ["config", "user.email", "shape@example.com"])
+    run_git(work_dir, ["config", "user.name", "Shape Probe"])
+    run_git(work_dir, ["fetch", "--quiet", str(staging_repo), "refs/heads/staging"])
+    run_git(work_dir, ["checkout", "--quiet", "-b", "probe", "FETCH_HEAD"])
+    # pinned = the staging tip (merge base) — captured BEFORE the bundle
+    # fetch overwrites FETCH_HEAD with the bundle's work tip.
+    pinned = rev_parse(work_dir, "FETCH_HEAD")
+    run_git(work_dir, ["fetch", "--quiet", str(bundle), "refs/heads/work"])
+    run_git(work_dir, ["merge", "--no-ff", "--no-edit", "--quiet", "FETCH_HEAD"])
+    merged = rev_parse(work_dir, "probe")
+    probe = _W.__new__(_W)
+    artifact = probe._build_artifact("t-140", work_dir, pinned, merged)
+
+    assert "similarity index 100%" in artifact
+    assert "rename from bot.py" in artifact
+    assert "rename to runtime/bot.py" in artifact
+    # THE structural precondition: zero hunks for the moved path — split
+    # the artifact into per-file diff sections and prove the moved file's
+    # section is header-only (no @@ hunks, no + lines). The README edit
+    # may carry its own hunk; that does not help the moved module's
+    # rubric item.
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in artifact.splitlines():
+        if line.startswith("diff --git "):
+            current = line.split(" b/", 1)[1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    moved_lines = sections["runtime/bot.py"]
+    assert not any(line.startswith("@@") for line in moved_lines), (
+        "expected zero hunks for the moved file"
+    )
+    assert not any(
+        line.startswith("+") and not line.startswith("+++") for line in moved_lines
+    ), (
+        "expected no body lines for the moved file"
+    )
+    # The module's content appears nowhere in the artifact.
+    assert "MatrixBot" not in artifact
+    assert RENAME_FILE_BODY not in artifact
+
+    # -- After-fix arm: trusted evidence carries the body; MET lands ----
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met", reason="moved module verified"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+    assert store.get_ticket("t-140")["state"] == LANDED
+
+    # The weaver handed the critic the post-move body as trusted evidence,
+    # naming both paths with the rename tag.
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    assert "R100" in rename_evidence
+    assert "bot.py" in rename_evidence
+    assert "runtime/bot.py" in rename_evidence
+    assert RENAME_FILE_BODY in rename_evidence
+    # The elision marker (harness truncation) must NOT be in the evidence
+    # for this small file — the FULL body was supplied.
+    assert "elided" not in rename_evidence
+    # The artifact itself is unchanged in shape: still the header, still
+    # zero hunks for the moved file — the evidence channel is what
+    # restored verifiability, not a diff re-rendering.
+    assert "similarity index 100%" in spy.received_artifact
+    assert "MatrixBot" not in spy.received_artifact
+    # Check evidence is still passed as before (both channels coexist).
+    assert spy.received_check_evidence is not None
+    assert "Tier-1 Check Results" in spy.received_check_evidence
+
+
+def test_weaver_passes_rename_content_as_evidence_to_critic(tmp_path, store, plane):
+    """A bundle committing a 100%-similarity rename: the spy-received
+    rename_evidence contains the full post-move body and both path
+    names, and the verdict still lands."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = _rename_bundle(tmp_path, staging_repo, name="t-140a")
+    add_parked_ticket(store, "t-140a", work_product=bundle)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    assert "R100" in rename_evidence
+    assert "bot.py" in rename_evidence
+    assert "runtime/bot.py" in rename_evidence
+    assert RENAME_FILE_BODY in rename_evidence
+
+
+def test_weaver_no_rename_no_evidence_block(tmp_path, store, plane):
+    """A plain-add bundle (no renames in the staged diff): the spy
+    receives rename_evidence=None and the gate is otherwise unchanged."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-140b", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t-140b", work_product=bundle)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+    assert spy.received_rename_evidence is None
+    # check evidence is still present — no-evidence-block means no
+    # moved-file block, not no trusted section.
+    assert spy.received_check_evidence is not None
+
+
+def test_weaver_partial_rename_supplies_post_move_body(tmp_path, store, plane):
+    """A <100%-similarity rename (R089): the post-move body is supplied
+    as evidence AND the paired diff hunks remain in the artifact
+    unchanged (spec AC2)."""
+    staging_repo = make_staging_repo(tmp_path)
+    # Base commit carries the module; the bundle renames it with one
+    # substantive line changed (~89% similarity).
+    seed = tmp_path / "partial-seed"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(seed)])
+    run_git(seed, ["fetch", "--quiet", "origin", "staging"])
+    run_git(seed, ["checkout", "--quiet", "origin/staging"])
+    lines = [f"line {i} of the module" for i in range(20)]
+    (seed / "bot.py").write_text("\n".join(lines) + "\n")
+    run_git(seed, ["add", "bot.py"])
+    run_git(seed, ["commit", "--quiet", "-m", "add module"])
+    run_git(seed, ["push", "--quiet", "origin", "HEAD:staging"])
+    run_git(seed, ["rev-parse", "HEAD"])
+
+    clone_dir = tmp_path / "t-140c-clone"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-b", "work", "origin/staging"])
+    lines[5] = "line 5 WIRE MatrixBot with restart simulation"
+    (clone_dir / "runtime_bot.py").write_text("\n".join(lines) + "\n")
+    run_git(clone_dir, ["rm", "--quiet", "bot.py"])
+    run_git(clone_dir, ["add", "runtime_bot.py"])
+    run_git(clone_dir, ["commit", "--quiet", "-m", "move + wire module"])
+    bundle_path = tmp_path / "t-140c.bundle"
+    run_git(clone_dir, ["bundle", "create", str(bundle_path), "refs/heads/work"])
+    add_parked_ticket(store, "t-140c", work_product=bundle_path)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    # The rename tag is not R100 — git reports the actual similarity.
+    assert "R100 " not in rename_evidence
+    assert "R0" in rename_evidence  # R0xx tag line: "R089  bot.py -> ..."
+    assert "bot.py" in rename_evidence
+    assert "runtime_bot.py" in rename_evidence
+    # The POST-move body (with the wired line) is what's supplied...
+    assert "line 5 WIRE MatrixBot with restart simulation" in rename_evidence
+    # ...and the artifact still carries the paired hunks unchanged.
+    assert "similarity index 8" in spy.received_artifact
+    assert "+line 5 WIRE MatrixBot with restart simulation" in spy.received_artifact
+    assert "-line 5 of the module" in spy.received_artifact
+
+
+def _rename_bundle_with_file(
+    tmp_path: Path, staging_repo: Path, *, name: str, content: str
+) -> Path:
+    """Like _rename_bundle but the renamed file's content is given:
+    `big.py` (with `content`) lands on staging first, then the bundle
+    commits the 100%-similarity rename to `big2.py`."""
+
+    def _write_base(clone_dir: Path) -> None:
+        (clone_dir / "big.py").write_text(content)
+
+    _push_to_staging(tmp_path, staging_repo, name, _write_base)
+
+    clone_dir = tmp_path / f"{name}-clone"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-b", "work", "origin/staging"])
+    (clone_dir / "big2.py").write_text(content)
+    run_git(clone_dir, ["add", "big2.py"])
+    run_git(clone_dir, ["rm", "--quiet", "big.py"])
+    run_git(clone_dir, ["commit", "--quiet", "-m", f"move big module ({name})"])
+    bundle_path = tmp_path / f"{name}.bundle"
+    run_git(clone_dir, ["bundle", "create", str(bundle_path), "refs/heads/work"])
+    return bundle_path
+
+
+def test_rename_evidence_truncates_oversized_file(tmp_path, store, plane):
+    """A renamed file above the 32 KiB per-file budget: the evidence
+    carries the head+tail with the harness elision marker (stating the
+    omitted byte count), NOT the whole body."""
+    from stigmergy.weaver import (
+        RENAME_ELISION_TEMPLATE,
+        RENAME_FILE_BUDGET,
+    )
+
+    staging_repo = make_staging_repo(tmp_path)
+    content = "x" * 34_000
+    bundle = _rename_bundle_with_file(
+        tmp_path, staging_repo, name="t-140d", content=content
+    )
+    add_parked_ticket(store, "t-140d", work_product=bundle)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    # The full 34 KB body is NOT in the evidence...
+    assert content not in rename_evidence
+    # ...only head + tail with the explicit elision label.
+    expected_elision = RENAME_ELISION_TEMPLATE.format(
+        elided_bytes=34_000 - 2 * RENAME_FILE_BUDGET, budget=2 * RENAME_FILE_BUDGET
+    )
+    assert expected_elision in rename_evidence
+    assert "harness truncation, not worker omission" in rename_evidence
+    head = content[:RENAME_FILE_BUDGET]
+    tail = content[-RENAME_FILE_BUDGET:]
+    assert head in rename_evidence
+    assert tail in rename_evidence
+    # The elision marker is harness text in the TRUSTED block — it must
+    # not appear in the artifact data channel.
+    assert expected_elision not in spy.received_artifact
+
+
+def test_rename_evidence_binary_label(tmp_path, store, plane):
+    """A renamed binary blob: the evidence carries the explicit
+    `<binary rename, body omitted>` label, no decoded bytes."""
+    from stigmergy.weaver import RENAME_BINARY_LABEL
+
+    staging_repo = make_staging_repo(tmp_path)
+    binary = bytes(range(256)) * 4
+
+    def _write_base(clone_dir: Path) -> None:
+        (clone_dir / "blob.bin").write_bytes(binary)
+
+    _push_to_staging(tmp_path, staging_repo, "t-140e", _write_base)
+
+    # Real binary content, renamed within the bundle (100% similarity).
+    clone_dir = tmp_path / "t-140e-clone"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-b", "work", "origin/staging"])
+    (clone_dir / "assets").mkdir(exist_ok=True)
+    run_git(clone_dir, ["mv", "blob.bin", "assets/blob.bin"])
+    run_git(clone_dir, ["commit", "--quiet", "-m", "move blob"])
+    bundle_path = tmp_path / "t-140e.bundle"
+    run_git(clone_dir, ["bundle", "create", str(bundle_path), "refs/heads/work"])
+    add_parked_ticket(store, "t-140e", work_product=bundle_path)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    assert "R100" in rename_evidence
+    assert "blob.bin" in rename_evidence
+    assert "assets/blob.bin" in rename_evidence
+    assert RENAME_BINARY_LABEL in rename_evidence
+    # No decoded binary bytes leaked into the prompt.
+    assert b"\x00".decode("utf-8", errors="replace") * 4 not in rename_evidence
+    assert "\ufffd\x01\xff" not in rename_evidence
+
+
+def test_rename_evidence_aggregate_overflow_lists_paths(tmp_path, store, plane):
+    """Pure renames totaling beyond the 64 KiB aggregate budget: the
+    evidence block feeds the first renames' bodies up to the cap and
+    NAMES the overflow paths without bodies; the gate still completes
+    normally (the critic call is not affected)."""
+    from stigmergy.weaver import RENAME_AGGREGATE_BUDGET
+
+    staging_repo = make_staging_repo(tmp_path)
+    # Two 30 KB files + one 34 KB file (94 KB total — well over the 64
+    # KiB aggregate). The first two renames get their full bodies
+    # (60 KB ≤ 64 KiB); the third (whose truncated body is 32 KB +
+    # elision marker) overflows and is named without a body.
+    contents = {"x.py": "A" * 30_000, "y.py": "B" * 30_000, "z.py": "C" * 34_000}
+
+    def _write_base(clone_dir: Path) -> None:
+        for fname, content in contents.items():
+            (clone_dir / fname).write_text(content)
+
+    _push_to_staging(tmp_path, staging_repo, "t-140f", _write_base)
+
+    clone_dir = tmp_path / "t-140f-clone"
+    run_git(None, ["clone", "--quiet", "--", str(staging_repo), str(clone_dir)])
+    run_git(clone_dir, ["fetch", "--quiet", "origin", "staging"])
+    run_git(clone_dir, ["checkout", "--quiet", "-b", "work", "origin/staging"])
+    for fname in contents:
+        moved = fname.replace(".py", "2.py")
+        run_git(clone_dir, ["mv", fname, moved])
+        run_git(clone_dir, ["commit", "--quiet", "-m", f"move {fname}"])
+    bundle_path = tmp_path / "t-140f.bundle"
+    run_git(clone_dir, ["bundle", "create", str(bundle_path), "refs/heads/work"])
+    add_parked_ticket(store, "t-140f", work_product=bundle_path)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+
+    rename_evidence = spy.received_rename_evidence
+    assert rename_evidence is not None
+    # The aggregate cap held: evidence is bounded (bodies + labels +
+    # overflow listing, well under cap + small label overhead).
+    assert len(rename_evidence.encode("utf-8")) <= RENAME_AGGREGATE_BUDGET + 4096
+    # All renamed paths are named in the block...
+    for fname in ("x.py", "x2.py", "y.py", "y2.py", "z.py", "z2.py"):
+        assert fname in rename_evidence
+    # The last rename overflowed the aggregate: named, but body-less.
+    assert "C" * 1000 not in rename_evidence
+    # ...while the first two renames DID get (truncated) bodies.
+    assert "A" * 1000 in rename_evidence
+    assert "B" * 1000 in rename_evidence
+    # Overflow paths are listed by name explicitly.
+    assert "overflow" in rename_evidence.lower()
+
+
+def test_rename_detection_failure_falls_back_silent(tmp_path, store, plane, monkeypatch):
+    """Fail-safe (spec §4.2): a failure inside rename detection (the new
+    `git diff --name-status --diff-filter=R` plumbing call) must log and
+    degrade to rename_evidence=None — the ticket is gated exactly as
+    before the fix, NEVER an infra gate outcome."""
+    import stigmergy.weaver as weaver_mod
+
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = _rename_bundle(tmp_path, staging_repo, name="t-140g")
+    add_parked_ticket(store, "t-140g", work_product=bundle)
+
+    spy_cls = _rename_spy()
+    spy = spy_cls(make_critic(outcome="met"))
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=spy,
+    )
+
+    orig_git = weaver_mod.Weaver._git
+
+    def exploding_git(self, repo, args, **kwargs):
+        if args[:3] == ["diff", "--name-status", "--diff-filter=R"]:
+            raise RuntimeError("rename detection boom")
+        return orig_git(self, repo, args, **kwargs)
+
+    monkeypatch.setattr(weaver_mod.Weaver, "_git", exploding_git)
+    result = weaver.weave(now=1000.0)[0]
+
+    # Gated exactly as before the fix: the ticket lands on the MET
+    # verdict with NO rename evidence and NO gate-infra outcome.
+    assert result.outcome == "landed"
+    assert result.failure_class is None
+    assert spy.received_rename_evidence is None
+    assert spy.received_check_evidence is not None
+    assert store.get_ticket("t-140g")["state"] == LANDED
+
+
+def test_weaver_rejects_stub_critic_without_rename_kwarg(tmp_path, store, plane):
+    """Stub-contract guard (spec §4.1 / appendix "Judge-signature stub
+    contract"): a critic stub whose judge() does NOT accept the
+    rename_evidence kwarg (i.e. predating this change) is rejected at
+    wire time — the weaver fails loudly instead of silently dropping
+    the evidence channel or crashing mid-weave."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-140h", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-140h", work_product=bundle)
+
+    from stigmergy.weaver import WeaverError
+
+    class LegacyStubCritic:
+        def judge(self, artifact, rubric_items, *, check_evidence=None):
+            return make_critic(outcome="met").judge(
+                artifact, rubric_items, check_evidence=check_evidence
+            )
+
+    with pytest.raises(WeaverError):
+        # The guard fires at WIRE time (construction) — the legacy stub is
+        # rejected before any weave work starts.
+        make_weaver(
+            tmp_path,
+            store,
+            plane,
+            staging_repo,
+            run_checks_fn=FakeRunChecks([green_result()]),
+            critic=LegacyStubCritic(),
+        )
+
+
+def test_weaver_accepts_critic_accepting_rename_kwarg(tmp_path, store, plane):
+    """The positive half of the stub contract: a critic accepting
+    rename_evidence (even one that never uses it) is accepted and the
+    weave proceeds normally."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-140i", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t-140i", work_product=bundle)
+
+    class QuietCritic:
+        def judge(self, artifact, rubric_items, *, check_evidence=None, rename_evidence=None):
+            # Delegate to a real scripted MET critic, ignoring the kwarg.
+            return make_critic(outcome="met").judge(
+                artifact, rubric_items, check_evidence=check_evidence
+            )
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=QuietCritic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"

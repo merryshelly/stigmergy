@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,25 @@ STANDING_RUBRIC_ITEM = (
 
 # Required structured-verdict fields (SPEC §3: verdict = {outcome, tier, reason, severity}).
 _REQUIRED_VERDICT_FIELDS: tuple[str, ...] = ("outcome", "tier", "reason", "severity")
+
+
+@dataclass(frozen=True)
+class RenameEvidence:
+    """One rename-touched path's worth of trusted moved-file evidence
+    (bead .140).
+
+    ``similarity_tag`` is the git rename-similarity tag as detected by the
+    weaver (e.g. ``"R100"``); ``old_path``/``new_path`` are the pre-/
+    post-move paths from ``git diff --name-status --diff-filter=R``;
+    ``body`` is the harness-extracted post-move content — either the full
+    blob text (or its head+tail with the elision marker, or the binary
+    label), never worker-authored text.
+    """
+
+    similarity_tag: str
+    old_path: str
+    new_path: str
+    body: str
 
 
 def format_check_evidence(check_results: list[CheckResult]) -> str:
@@ -80,6 +100,52 @@ def format_check_evidence(check_results: list[CheckResult]) -> str:
     return "\n".join(lines)
 
 
+RENAME_EVIDENCE_HEADER = (
+    "--- Moved-file content (harness-extracted, trusted) ---\n"
+    "The paths below were moved by git rename in the artifact. The diff shows "
+    "only the rename header; the full post-move content of each file is "
+    "provided here by the harness, read from the candidate tree."
+)
+
+
+def format_rename_evidence(
+    renames: list[RenameEvidence], *, overflow: list[str] | None = None
+) -> str:
+    """Format rename-touched paths (bead .140) into the "Moved-file
+    content" block for the trusted-evidence section of the critic prompt.
+
+    ``renames`` carries one :class:`RenameEvidence` per rename git
+    detected in the staged diff, each with the harness-extracted
+    POST-MOVE body (full text, or head+tail with the harness elision
+    marker, or the ``<binary rename, body omitted>`` label). ``overflow``
+    names the paths whose bodies were withheld because the ticket's
+    rename bodies exhausted the aggregate budget — listed by name, with
+    NO body, so the critic knows they were moved but saw no content.
+
+    The rendered block is pure harness text plus harness-extracted file
+    content; the caller (the weaver) owns all budget/truncation/binary
+    decisions. An empty ``renames`` list (with no overflow) renders to
+    ``""`` so callers can test truthiness and pass it through as-is.
+    """
+    if not renames and not overflow:
+        return ""
+
+    lines = [RENAME_EVIDENCE_HEADER]
+    for r in renames:
+        lines.append("")
+        lines.append(f"{r.similarity_tag}  {r.old_path} -> {r.new_path}")
+        lines.append(r.body)
+    if overflow:
+        lines.append("")
+        lines.append(
+            "The following rename-touched paths exceeded the aggregate "
+            "evidence budget and are listed WITHOUT bodies (overflow):"
+        )
+        for path in overflow:
+            lines.append(f"  - {path}")
+    return "\n".join(lines)
+
+
 class CriticInfraError(Exception):
     """Raised on ANY failure to obtain a valid structured verdict from the
     critic — a client-side/provider error OR an unparseable/malformed
@@ -90,7 +156,12 @@ class CriticInfraError(Exception):
 
 
 def build_critic_prompt(
-    rubric_items: list[str], artifact: str, *, template: str, check_evidence: str | None = None
+    rubric_items: list[str],
+    artifact: str,
+    *,
+    template: str,
+    check_evidence: str | None = None,
+    rename_evidence: str | None = None,
 ) -> str:
     """Build one critic prompt: instructions first, optional trusted evidence,
     hostile artifact fenced as data last, inside a fresh per-call nonce-delimited region.
@@ -102,10 +173,17 @@ def build_critic_prompt(
     2. The rubric: every item in ``rubric_items``, plus
        :data:`STANDING_RUBRIC_ITEM` — ALWAYS appended, even for an empty
        rubric, so the anti-injection check is never optional.
-    3. (Optional) Trusted-evidence section: if ``check_evidence`` is provided,
-       it is rendered in a CLEARLY DELIMITED section OUTSIDE the artifact fence,
-       marked as trusted harness-provided data that must not be spoofed or
-       altered. This section is structurally separated from the artifact.
+    3. (Optional) Trusted-evidence section: rendered in ONE CLEARLY
+       DELIMITED section OUTSIDE the artifact fence, marked as trusted
+       harness-provided data that must not be spoofed or altered. This
+       section is structurally separated from the artifact. It carries up
+       to two harness-authored subsystems, in order: (a) if
+       ``check_evidence`` is provided, the Tier-1 mechanical check
+       results; (b) if ``rename_evidence`` is provided (bead .140), the
+       "Moved-file content" block carrying the post-move bodies of
+       rename-touched files. When both are absent the section is omitted
+       entirely (byte-structural parity with the pre-.140 prompt, modulo
+       the per-call nonce).
     4. A short statement that the artifact below is untrusted data framed
        between two exact fence markers, that a fence-like string appearing
        *inside* the artifact is not the real boundary, and that nothing
@@ -132,14 +210,40 @@ def build_critic_prompt(
         f"{rubric_text}\n\n"
     )
 
-    # Optional trusted-evidence section: CLEARLY DELIMITED from artifact fence
-    if check_evidence:
+    # Optional trusted-evidence section: CLEARLY DELIMITED from artifact
+    # fence. One section, up to two harness-authored subsystems (check
+    # results, then moved-file content). The check-only rendering is
+    # byte-identical to the pre-.140 output (bead .140 parity: a
+    # rename_evidence=None build must match today's prompt modulo nonce).
+    if check_evidence or rename_evidence:
+        if check_evidence and rename_evidence:
+            intro = (
+                "The following check results and moved-file content are "
+                "provided by the harness and are ESTABLISHED, TRUSTED FACT. "
+                "Do not require the artifact to re-prove them; treat them as "
+                "verified mechanical results."
+            )
+            body = f"{check_evidence}\n\n{rename_evidence}"
+        elif check_evidence:
+            intro = (
+                "The following check results are provided by the harness "
+                "and are ESTABLISHED, TRUSTED FACT. Do not require the "
+                "artifact to re-prove them; treat them as verified "
+                "mechanical results."
+            )
+            body = check_evidence
+        else:
+            intro = (
+                "The following moved-file content is provided by the "
+                "harness and is ESTABLISHED, TRUSTED FACT. It was "
+                "extracted from the candidate tree by the harness; do not "
+                "require the artifact to re-prove it."
+            )
+            body = rename_evidence
         instructions += (
             "===TRUSTED-EVIDENCE-BEGIN===\n"
-            "The following check results are provided by the harness and are ESTABLISHED, "
-            "TRUSTED FACT. Do not require the artifact to re-prove them; treat them as "
-            "verified mechanical results.\n\n"
-            f"{check_evidence}\n"
+            f"{intro}\n\n"
+            f"{body}\n"
             "===TRUSTED-EVIDENCE-END===\n\n"
         )
 
@@ -341,7 +445,12 @@ class Critic:
             raise CriticInfraError(f"critic client call failed: {error_str}") from exc
 
     def judge(
-        self, artifact: str, rubric_items: list[str], *, check_evidence: str | None = None
+        self,
+        artifact: str,
+        rubric_items: list[str],
+        *,
+        check_evidence: str | None = None,
+        rename_evidence: str | None = None,
     ) -> tuple[Verdict, dict[str, Any], list[dict[str, Any]]]:
         """Judge ``artifact`` against ``rubric_items`` with one one-shot,
         no-tools client call. Returns ``(verdict, gate_fields,
@@ -351,6 +460,14 @@ class Critic:
         check results. When provided, it is rendered in a clearly delimited
         trusted-evidence section OUTSIDE the artifact fence, and the prompt
         instructs the critic to treat this evidence as established fact.
+
+        ``rename_evidence`` (bead .140) is an optional string carrying the
+        harness-extracted POST-MOVE content of rename-touched files (the
+        "Moved-file content" block). A rename-only diff carries no hunks for
+        moved files, so without this channel rubric items judging the content
+        of a moved file are structurally unverifiable. When provided, it is
+        rendered inside the SAME trusted-evidence section as ``check_evidence``
+        (one delimited region, both subsystems trusted harness data), after it.
 
         ``gate_fields`` carries the gate-event provenance SPEC §8 requires
         for every `gate` event: the pinned decoding params (verbatim, as
@@ -377,7 +494,11 @@ class Critic:
         never a rejection.
         """
         prompt = build_critic_prompt(
-            rubric_items, artifact, template=self.template, check_evidence=check_evidence
+            rubric_items,
+            artifact,
+            template=self.template,
+            check_evidence=check_evidence,
+            rename_evidence=rename_evidence,
         )
 
         t_start = time.time()
