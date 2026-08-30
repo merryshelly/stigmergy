@@ -706,11 +706,19 @@ class RigStore:
         The connection is always closed, even if the checkpoint itself
         raises (e.g. contention) — callers must be able to rely on
         `close()` releasing the file handle unconditionally.
+
+        Idempotent (bead .143 tail): a second close is a no-op. Daemon and
+        ResolvedRig can share one store, and teardown chains that close
+        both must not die on the second checkpoint (ProgrammingError on a
+        closed connection).
         """
+        if self._conn is None:
+            return
         try:
             self._conn.execute("PRAGMA wal_checkpoint(FULL)")
         finally:
-            self._conn.close()
+            conn, self._conn = self._conn, None
+            conn.close()
 
     def _row_to_ticket(self, row: sqlite3.Row) -> dict[str, Any]:
         ticket = dict(row)

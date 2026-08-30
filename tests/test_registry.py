@@ -349,3 +349,179 @@ def test_version_hash_stable_across_key_reorder(registry: Registry, tmp_path: Pa
     )
     reordered_registry = load_registry(reordered)
     assert reordered_registry.version_hash == registry.version_hash
+
+
+# ==========================================================================
+# bead .143 — optional `oa_*` provider-wiring fields (additive,
+# Anthropic-backwards-compatible defaults; non-Anthropic entries REQUIRE
+# `oa_type` — silent wire-type guessing is UnbudgetableError)
+# ==========================================================================
+
+_KIMI3_TOML = """
+[kimi3]
+provider = "synthetic"
+family = "kimi"
+version = "hf:moonshotai/Kimi-K3"
+pricing = "subscription"
+marginal_usd = 0.0
+quota = "synthetic-2500req-5h"
+"""
+
+
+def _tmp_registry(tmp_path: Path, text: str) -> Registry:
+    p = tmp_path / "models.toml"
+    p.write_text(text)
+    return load_registry(p)
+
+
+def test_registry_oa_fields_round_trip(tmp_path: Path) -> None:
+    """A non-Anthropic entry WITH the optional oa_* fields parses; all
+    three fields are populated on the entry."""
+    reg = _tmp_registry(
+        tmp_path,
+        _KIMI3_TOML
+        + """
+oa_provider_key = "synthetic"
+oa_base_url = "https://api.synthetic.new/openai/v1"
+oa_type = "openai"
+""",
+    )
+    entry = reg.resolve("kimi3")
+    assert entry.oa_provider_key == "synthetic"
+    assert entry.oa_type == "openai"
+    assert entry.oa_base_url == "https://api.synthetic.new/openai/v1"
+    # the pricing-axis fields are untouched by the OA wiring:
+    assert entry.provider == "synthetic"
+    assert entry.pricing is PricingClass.SUBSCRIPTION
+    assert entry.quota == "synthetic-2500req-5h"
+
+
+def test_registry_anthropic_entry_defaults_oa_fields(tmp_path: Path) -> None:
+    """An Anthropic entry WITHOUT the oa_* fields gets the backwards-
+    compatible defaults: oa_provider_key="anthropic", oa_type="anthropic",
+    oa_base_url=None — exactly reproducing today's routing."""
+    reg = _tmp_registry(
+        tmp_path,
+        """
+[opus]
+provider = "anthropic"
+family = "claude"
+version = "opus-4-1-20250805"
+pricing = "metered"
+input_usd_per_mtok = 15.0
+output_usd_per_mtok = 75.0
+""",
+    )
+    entry = reg.resolve("opus")
+    assert entry.oa_provider_key == "anthropic"
+    assert entry.oa_type == "anthropic"
+    assert entry.oa_base_url is None
+
+
+def test_registry_local_entry_oa_fields_default_none(tmp_path: Path) -> None:
+    """`provider = "local"` entries route to NO remote provider: absent
+    oa_* fields default to None/None/None WITHOUT requiring `oa_type`
+    (a local model never enters a remote provider config); explicit
+    oa_* fields on a local entry are still accepted and validated."""
+    reg = _tmp_registry(
+        tmp_path,
+        """
+[local-qwen]
+provider = "local"
+family = "qwen"
+version = "qwen2.5-coder-32b"
+pricing = "local"
+marginal_usd = 0.0
+approved = true
+""",
+    )
+    entry = reg.resolve("local-qwen")
+    assert entry.oa_provider_key is None
+    assert entry.oa_type is None
+    assert entry.oa_base_url is None
+    # explicit wiring on a local entry is accepted (validated str fields):
+    reg2 = _tmp_registry(
+        tmp_path,
+        """
+[local-qwen]
+provider = "local"
+family = "qwen"
+version = "qwen2.5-coder-32b"
+pricing = "local"
+marginal_usd = 0.0
+approved = true
+oa_provider_key = "vllm"
+oa_type = "openai"
+""",
+    )
+    entry2 = reg2.resolve("local-qwen")
+    assert entry2.oa_provider_key == "vllm"
+    assert entry2.oa_type == "openai"
+
+
+def test_registry_non_anthropic_missing_oa_type_raises(tmp_path: Path) -> None:
+    """A non-Anthropic entry that omits `oa_type` is UNBUDGETABLE at load —
+    registration must not silently guess a wire type."""
+    with pytest.raises(UnbudgetableError) as ei:
+        _tmp_registry(tmp_path, _KIMI3_TOML)
+    assert "oa_type" in str(ei.value)
+    # the partial explicit oa_provider_key without oa_type is rejected too:
+    with pytest.raises(UnbudgetableError):
+        _tmp_registry(tmp_path, _KIMI3_TOML + '\noa_provider_key = "synthetic"\n')
+
+
+def test_registry_oa_field_must_be_non_empty_string(tmp_path: Path) -> None:
+    """Present-but-invalid oa_* fields are rejected (same
+    `_require_str`-only-when-present discipline as the other str fields)."""
+    with pytest.raises(UnbudgetableError):
+        _tmp_registry(tmp_path, _KIMI3_TOML + '\noa_type = ""\noa_provider_key = "synthetic"\n')
+    with pytest.raises(UnbudgetableError):
+        _tmp_registry(tmp_path, _KIMI3_TOML + "\noa_type = 5\n")
+
+
+def test_registry_non_anthropic_oa_provider_key_defaults_to_provider(
+    tmp_path: Path,
+) -> None:
+    """A non-Anthropic entry with `oa_type` but WITHOUT `oa_provider_key`
+    derives the key from the `provider` value (the convention); with an
+    explicit `oa_provider_key` it is used verbatim."""
+    reg = _tmp_registry(tmp_path, _KIMI3_TOML + '\noa_type = "openai"\n')
+    assert reg.resolve("kimi3").oa_provider_key == "synthetic"
+    reg2 = _tmp_registry(
+        tmp_path,
+        _KIMI3_TOML + '\noa_type = "openai"\noa_provider_key = "synth-alt"\n',
+    )
+    assert reg2.resolve("kimi3").oa_provider_key == "synth-alt"
+
+
+def test_registry_existing_fixture_hash_unchanged(registry: Registry) -> None:
+    """AC6: pre-existing fixture registries hash-unchanged — the additive
+    fields change `version_hash` ONLY when the TOML actually declares them.
+    The fixture has no `oa_*` keys, so its hash is byte-for-byte what the
+    pre-.143 loader produced (pinned against an explicit canonical
+    recomputation of the untouched parsed TOML)."""
+    import hashlib
+    import json
+    import tomllib
+
+    raw = tomllib.loads(FIXTURE.read_text())
+    blob = json.dumps(raw, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    assert registry.version_hash == hashlib.sha256(blob).hexdigest()
+
+
+def test_registry_oa_fields_change_hash_iff_declared(tmp_path: Path) -> None:
+    """Adding the oa_* fields to an entry's TOML changes the hash (the OA
+    wiring is pinned into the charter-hash provenance gates already log).
+    (The 'original' here carries the REQUIRED oa_type; a fully-bare
+    non-Anthropic entry is un-loadable — see the missing-oa_type test.)"""
+    original = _tmp_registry(tmp_path, _KIMI3_TOML + '\noa_type = "openai"\n')
+    with_oa = _tmp_registry(
+        tmp_path,
+        _KIMI3_TOML
+        + """
+oa_provider_key = "synthetic"
+oa_base_url = "https://api.synthetic.new/openai/v1"
+oa_type = "openai"
+""",
+    )
+    assert original.version_hash != with_oa.version_hash

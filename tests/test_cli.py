@@ -1695,3 +1695,211 @@ def test_ticket_detail_still_works_unchanged(tmp_path: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "t-1" in out
     assert "functional_summary" in out
+
+
+# ==========================================================================
+# bead .143 — critic wiring migration to the OA provider layer
+# ==========================================================================
+
+
+def _set_charter_critic_section(rigs_root: Path, *, model: str | None = None, max_tokens=None):
+    """Rewrite the scaffolded rig's charter `[roles.critic]` section
+    (set `model` and/or `max_tokens` when given)."""
+    import re as _re
+
+    charter_path = rigs_root / RIG / "charter.toml"
+    text = charter_path.read_text()
+
+    def _replacement(_m: _re.Match[str]) -> str:
+        # Preserve keys the caller did NOT override: parse the matched
+        # section's existing key=value lines, overlay the requested
+        # changes, re-emit. (Rebuilding from scratch dropped an unset
+        # `model` and produced charter-invalidating sections.)
+        existing: dict[str, str] = {}
+        for line in _m.group(0).splitlines()[1:]:
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                existing[parts[0].strip()] = parts[1].strip()
+        if model is not None:
+            existing["model"] = f'"{model}"'
+        if max_tokens is not None:
+            existing["max_tokens"] = str(max_tokens)
+        lines = ["[roles.critic]"]
+        for key, value in existing.items():
+            lines.append(f"{key} = {value}")
+        return "\n".join(lines)
+
+    # Match ONLY the header + its key=value lines (lines not starting
+    # with `[`), leaving the blank line + next `[table]` header intact.
+    # Function-replacement (not a template string) so no re.sub escaping.
+    new_text = _re.sub(r"\[roles\.critic\](?:\n[^\n\[]+)*", _replacement, text)
+    assert new_text != text
+    assert "[roles.critic]" in new_text
+    # sanity: the next table after [roles.critic] is still a valid header
+    assert "\n[models]" in new_text
+    charter_path.write_text(new_text)
+
+
+def test_143_daemon_builds_critic_via_oa_factory(tmp_path: Path, monkeypatch) -> None:
+    """`_build_daemon` constructs the critic through
+    `make_oa_critic_client` (NOT the deleted `make_critic_client`),
+    forwarding the charter's `roles.critic.max_tokens` to the factory."""
+    rigs_root = scaffold_rig(tmp_path)
+    _set_charter_critic_section(rigs_root, max_tokens=8192)
+    recorded: list[dict] = []
+
+    def fake_oa_client(**kwargs):
+        recorded.append(kwargs)
+
+        def client(prompt, *, model, **params):
+            return {}
+
+        return client
+
+    monkeypatch.setattr(cli, "make_oa_critic_client", fake_oa_client)
+    monkeypatch.setattr(cli, "make_op_key_provider", lambda ref: (lambda: "dummy-key"))
+
+    from stigmergy.rig import resolve_rig
+
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        daemon = _build_daemon(resolved)
+        try:
+            assert len(recorded) == 1
+            assert recorded[0]["max_tokens"] == 8192  # charter value forwarded
+            # the key provider is the one built from the rig's critic op ref:
+            assert recorded[0]["key_provider"]() == "dummy-key"
+            assert isinstance(daemon._weaver.critic, Critic)
+        finally:
+            daemon._store.close()
+    finally:
+        resolved.store.close()
+
+
+def test_143_daemon_critic_key_ref_defaults_for_anthropic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the resolved critic entry is Anthropic-routed (the default),
+    the key provider is built from `_CRITIC_KEY_REF` (unchanged) — the
+    `STIGMERGY_CRITIC_OA_KEY_REF` env is NOT consulted (and its absence is not an
+    error)."""
+    rigs_root = scaffold_rig(tmp_path)
+    refs: list[str] = []
+    monkeypatch.delenv("STIGMERGY_CRITIC_OA_KEY_REF", raising=False)
+    monkeypatch.setattr(
+        cli, "make_op_key_provider", lambda ref: (refs.append(ref), lambda: "k")[1]
+    )
+    monkeypatch.setattr(
+        cli,
+        "make_oa_critic_client",
+        lambda **kw: (lambda prompt, **p: {}),
+    )
+
+    from stigmergy.rig import resolve_rig
+
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        daemon = _build_daemon(resolved)
+        try:
+            daemon._weaver.critic._client("x")  # force the key-provider build
+        finally:
+            daemon._store.close()
+    finally:
+        resolved.store.close()
+    # _build_daemon builds providers for BOTH the critic and the relay —
+    # and critic + relay SHARE the same op item today
+    # (_CRITIC_KEY_REF == _RELAY_KEY_REF, the .64/.25 rig-00 item), so the
+    # ref appears twice. Assert: the critic ref rode the default path, and
+    # the env var was NOT consulted for an Anthropic-routed entry.
+    assert refs.count(cli._CRITIC_KEY_REF) == 2
+    assert "op://shelly/Synthetic key/credential" not in refs
+
+
+def test_143_non_anthropic_critic_entry_requires_key_ref_env(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A non-Anthropic-routed critic entry (oa_provider_key !=
+    "anthropic") resolves its op ref via `STIGMERGY_CRITIC_OA_KEY_REF`; the env
+    missing -> a LOUD rig-launch failure (the `daemon run` path surfaces
+    it as exit 1 with stderr naming the env var), NOT a first-gate infra
+    trip (Decision 3)."""
+    rigs_root = scaffold_rig(tmp_path)
+    # registry: point the critic at a synthetic entry with explicit OA wiring
+    models_path = rigs_root / RIG / "models.toml"
+    models_path.write_text(
+        models_path.read_text()
+        + """
+[kimi3]
+provider = "synthetic"
+family = "kimi"
+version = "hf:moonshotai/Kimi-K3"
+pricing = "subscription"
+marginal_usd = 0.0
+quota = "synthetic-2500req-5h"
+oa_provider_key = "synthetic"
+oa_base_url = "https://api.synthetic.new/openai/v1"
+oa_type = "openai"
+"""
+    )
+    _set_charter_critic_section(rigs_root, model="kimi3")
+    monkeypatch.delenv("STIGMERGY_CRITIC_OA_KEY_REF", raising=False)
+    monkeypatch.setattr(cli, "make_op_key_provider", lambda ref: (lambda: "k"))
+    monkeypatch.setattr(
+        cli,
+        "make_oa_critic_client",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("factory must not be reached")),
+    )
+
+    rc = main(["daemon", "run", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    # construction fails BEFORE a daemon exists, so `daemon run` returns 1:
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "STIGMERGY_CRITIC_OA_KEY_REF" in err
+
+
+def test_143_non_anthropic_critic_key_ref_env_is_used(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """WITH `STIGMERGY_CRITIC_OA_KEY_REF` set, the non-Anthropic entry's key
+    provider is built from THAT ref (Decision 3's hook)."""
+    rigs_root = scaffold_rig(tmp_path)
+    models_path = rigs_root / RIG / "models.toml"
+    models_path.write_text(
+        models_path.read_text()
+        + """
+[kimi3]
+provider = "synthetic"
+family = "kimi"
+version = "hf:moonshotai/Kimi-K3"
+pricing = "subscription"
+marginal_usd = 0.0
+quota = "synthetic-2500req-5h"
+oa_provider_key = "synthetic"
+oa_base_url = "https://api.synthetic.new/openai/v1"
+oa_type = "openai"
+"""
+    )
+    _set_charter_critic_section(rigs_root, model="kimi3")
+    monkeypatch.setenv("STIGMERGY_CRITIC_OA_KEY_REF", "op://shelly/Synthetic key/credential")
+    refs: list[str] = []
+    monkeypatch.setattr(
+        cli, "make_op_key_provider", lambda ref: (refs.append(ref), lambda: "k")[1]
+    )
+    recorded: list[dict] = []
+
+    def fake_oa_client(**kwargs):
+        recorded.append(kwargs)
+        return (lambda prompt, **p: {})
+
+    monkeypatch.setattr(cli, "make_oa_critic_client", fake_oa_client)
+    recorded_daemons: list = []
+    monkeypatch.setattr(cli, "_run_daemon", recorded_daemons.append)
+
+    rc = main(["daemon", "run", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    # The relay's _RELAY_KEY_REF also rides make_op_key_provider at
+    # _build_daemon; assert the critic's env-resolved ref specifically.
+    assert refs.count("op://shelly/Synthetic key/credential") == 1
+    assert len(recorded) == 1
+    if recorded_daemons:
+        recorded_daemons[0]._store.close()

@@ -28,7 +28,7 @@ import json
 import math
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -58,6 +58,14 @@ class ModelEntry:
       ``cached_usd_per_mtok``, ``reasoning_usd_per_mtok`` (set only if declared).
     - ``LOCAL``: ``marginal_usd`` (>= 0.0), ``approved`` (always ``True``).
     - ``SUBSCRIPTION``: ``marginal_usd`` (always exactly 0.0), ``quota``.
+
+    The ``oa_*`` fields (bead .143) are the OA provider-layer wiring axis —
+    ALWAYS populated by the loader: absent in the TOML means
+    derive-by-convention (Anthropic entries default to
+    ``oa_provider_key="anthropic"`` / ``oa_type="anthropic"`` /
+    ``oa_base_url=None``, exactly reproducing the pre-.143 routing; a
+    non-Anthropic ``provider`` REQUIRES ``oa_type`` — see
+    :func:`_oa_wiring_fields`).
     """
 
     name: str
@@ -72,6 +80,10 @@ class ModelEntry:
     marginal_usd: float | None = None
     approved: bool | None = None
     quota: str | None = None
+    # bead .143 — OA provider-layer wiring (additive; see class docstring).
+    oa_provider_key: str | None = None
+    oa_type: str | None = None
+    oa_base_url: str | None = None
 
 
 class Registry:
@@ -241,12 +253,78 @@ def _build_entry(name: str, raw: Any) -> ModelEntry:
         raise UnbudgetableError(f"model {name!r}: unknown pricing class {pricing_raw!r}") from None
 
     if pricing is PricingClass.METERED:
-        return _build_metered(name, raw, provider, family, version)
-    if pricing is PricingClass.LOCAL:
-        return _build_local(name, raw, provider, family, version)
-    if pricing is PricingClass.SUBSCRIPTION:
-        return _build_subscription(name, raw, provider, family, version)
-    raise AssertionError("unreachable: PricingClass has no other members")  # pragma: no cover
+        entry = _build_metered(name, raw, provider, family, version)
+    elif pricing is PricingClass.LOCAL:
+        entry = _build_local(name, raw, provider, family, version)
+    elif pricing is PricingClass.SUBSCRIPTION:
+        entry = _build_subscription(name, raw, provider, family, version)
+    else:
+        raise AssertionError("unreachable: PricingClass has no other members")  # pragma: no cover
+
+    oa_provider_key, oa_type, oa_base_url = _oa_wiring_fields(name, raw, provider)
+    return replace(entry, oa_provider_key=oa_provider_key, oa_type=oa_type, oa_base_url=oa_base_url)
+
+
+def _oa_wiring_fields(
+    name: str, raw: dict[str, Any], provider: str
+) -> tuple[str, str, str | None]:
+    """Resolve the optional ``oa_*`` provider-wiring fields (bead .143).
+
+    Derive-by-convention, fail-loud:
+
+    - ``provider == "anthropic"``: absent fields default to
+      ``oa_provider_key="anthropic"`` / ``oa_type="anthropic"`` /
+      ``oa_base_url=None`` — byte-parity with the pre-.143 routing (the
+      registry's ``provider`` WAS the OA routing decision then).
+    - ``provider == "local"``: no remote provider is routed, so the OA
+      wiring stays ``None``/``None``/``None`` by default (a local model
+      never enters a remote provider config). Explicit ``oa_*`` fields
+      are still accepted and validated (a local entry COULD be exposed
+      through a remote wire — declared, never guessed).
+    - any other (remote, non-Anthropic) ``provider``: ``oa_type`` is
+      REQUIRED — a missing wire type is :class:`UnbudgetableError`
+      (registration must not silently guess a wire type);
+      ``oa_provider_key`` defaults to the ``provider`` value when
+      absent; ``oa_base_url`` may be absent (``None``) — some wire
+      types carry a built-in base URL.
+    - present fields use the same non-empty-string discipline as the
+      other str fields (:func:`_require_str`).
+    """
+    oa_type: str | None = None
+    if "oa_type" in raw:
+        oa_type = _require_str(name, raw, "oa_type")
+    oa_provider_key: str | None = None
+    if "oa_provider_key" in raw:
+        oa_provider_key = _require_str(name, raw, "oa_provider_key")
+    oa_base_url: str | None = None
+    if "oa_base_url" in raw:
+        oa_base_url = _require_str(name, raw, "oa_base_url")
+
+    if provider == "anthropic":
+        return (
+            oa_provider_key if oa_provider_key is not None else "anthropic",
+            oa_type if oa_type is not None else "anthropic",
+            oa_base_url,
+        )
+    if provider == "local":
+        # local: no remote provider routed; absent == None (validated
+        # explicit fields, if any, are honored).
+        return (
+            oa_provider_key,
+            oa_type,
+            oa_base_url,
+        )
+    if oa_type is None:
+        raise UnbudgetableError(
+            f"model {name!r}: provider {provider!r} requires 'oa_type' — the OA "
+            "wire type must be declared explicitly (silent wire-type guessing "
+            "is unbudgetable)"
+        )
+    return (
+        oa_provider_key if oa_provider_key is not None else provider,
+        oa_type,
+        oa_base_url,
+    )
 
 
 def load_registry(path: str | os.PathLike[str]) -> Registry:

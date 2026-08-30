@@ -39,15 +39,24 @@ from stigmergy import approval, checks, egress, spend, triage
 from stigmergy.charter import Charter, CharterError, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
-from stigmergy.critic_client import (
-    DEFAULT_MAX_TOKENS,
-    make_critic_client,
-    make_range_critic_client,
-)
 from stigmergy.daemon import Daemon, DaemonError
 from stigmergy.filing import file_proposals
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
+
+# bead .143 (A′): the critic/range-critic now route through OA's
+# provider layer — `oa_critic` is the ONLY OA-importing seam (lazy,
+# fail-closed at factory build). The legacy bare-urllib factories
+# (`make_critic_client` / `make_range_critic_client`) are deleted; the
+# module-level names below keep the old call sites' contract for the
+# .51 wiring-regression test, which monkeypatches them to prove the
+# range builder does NOT use the verdict client.
+from stigmergy.oa_critic import (
+    DEFAULT_MAX_TOKENS,
+    CriticOAUnavailableError,
+    make_oa_critic_client,
+    make_oa_range_critic_client,
+)
 from stigmergy.rangereport import (
     RangeCritic,
     RangeCriticResult,
@@ -56,7 +65,7 @@ from stigmergy.rangereport import (
     compute_range_report,
 )
 from stigmergy.records import EventType, RecordPlane, make_event
-from stigmergy.registry import PricingClass, UnbudgetableError
+from stigmergy.registry import PricingClass, Registry, UnbudgetableError
 from stigmergy.relay import CapabilityStore, CredentialRelay
 from stigmergy.relay_transport import RelayHandle, make_urllib_forwarder, start_relay
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
@@ -292,17 +301,24 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # v0: one image for worker + checker.
     checker_image = resolved.worker_image
     critic_cfg = charter.raw["roles"]["critic"]
-    # bead .36: the critic client is now real (direct Anthropic Messages call,
-    # SPEC §7) -- any client-side/provider failure surfaces as CriticInfraError,
-    # never a silent wrong gate verdict (critic.py's own fail-closed discipline).
+    # bead .36: the critic client is now real -- any client-side/provider
+    # failure surfaces as CriticInfraError, never a silent wrong gate
+    # verdict (critic.py's own fail-closed discipline).
     # bead .39: the staging-gate critic reads critic02+ (the D14 filing-
     # mandate prompt bump, carrying the optional filed_tickets schema field).
     # bead .140: critic03 adds the moved-file trusted-evidence exception
     # (SB-approved 2026-08-30) so rename-only artifacts are verifiable.
-    critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
+    # bead .143 (A′): the client is the OA provider-layer forced-tool
+    # call (hardened=True; the legacy bare-urllib client is deleted).
+    # The factory build is FAIL-CLOSED: an OA-less environment raises
+    # CriticOAUnavailableError here (rig launch), never at the first
+    # gate. The key ref follows the resolved entry's provider (Decision 3).
+    critic_key_provider = make_op_key_provider(
+        _critic_key_ref_for(resolved.registry, critic_cfg["model"])
+    )
     critic = Critic.from_prompt_file(
         rig_paths["prompts_dir"] / "critic03",  # hardcoded filename -- see §3.7 note
-        client=make_critic_client(
+        client=make_oa_critic_client(
             key_provider=critic_key_provider,
             registry=registry,
             # bead .118: charter-overridable verdict-critic output budget
@@ -965,21 +981,30 @@ def _cmd_ticket(args: argparse.Namespace) -> int:
 
 def _build_range_critic(resolved: ResolvedRig) -> RangeCritic:
     """Production `RangeCritic` builder (bead .42 build spec §D; fixed by
-    beads .51 + .41) — a monkeypatchable module-level helper: tests replace
-    `cli._build_range_critic` wholesale to inject a stub client, so this
-    function must be called by plain module-global name (never imported/
-    aliased/bound early) at every call site.
+    beads .51 + .41; migrated by bead .143) — a monkeypatchable
+    module-level helper: tests replace `cli._build_range_critic`
+    wholesale to inject a stub client, so this function must be called
+    by plain module-global name (never imported/aliased/bound early) at
+    every call site.
 
-    `.51` fix: wires `make_range_critic_client` (NOT the verdict client
-    `make_critic_client`, which returns the wrong `{outcome,tier,reason,
-    severity}` shape) and reads the `rangecrit02` prompt artifact (the
-    `.41` combined-schema prompt bump, superseding `rangecrit01`).
+    `.51` fix: wires `make_oa_range_critic_client` (NOT the verdict
+    client `make_oa_critic_client`, which returns the wrong
+    `{outcome,tier,reason,severity}` shape) and reads the `rangecrit02`
+    prompt artifact (the `.41` combined-schema prompt bump, superseding
+    `rangecrit01`). `.143`: the client is the OA provider-layer
+    forced-tool call; it resolves the SAME `[roles.critic].model` as the
+    staging-gate critic (shared model, separate forced tool).
     """
     charter = resolved.charter
     critic_cfg = charter.raw["roles"]["critic"]
-    critic_key_provider = make_op_key_provider(_CRITIC_KEY_REF)
+    critic_key_provider = make_op_key_provider(
+        _critic_key_ref_for(resolved.registry, critic_cfg["model"])
+    )
     return RangeCritic.from_prompt_file(
         resolved.rig_paths["prompts_dir"] / "rangecrit02",
+        # bead .51: route through the module-level ALIAS name so the
+        # wiring-regression test's monkeypatch of make_range_critic_client
+        # intercepts (the alias delegates to the OA factory by default).
         client=make_range_critic_client(
             key_provider=critic_key_provider, registry=resolved.registry
         ),
@@ -1083,7 +1108,15 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
         print(report.render())
 
         if args.critic:
-            critic = _build_range_critic(resolved)
+            try:
+                critic = _build_range_critic(resolved)
+            except (CriticOAUnavailableError, CharterError) as exc:
+                # bead .143: factory build is fail-closed — an OA-less
+                # environment or a missing STIGMERGY_CRITIC_OA_KEY_REF is a
+                # loud LAUNCH failure (exit 1, stderr), not a mid-run
+                # trip.
+                print(f"stigmergy range-report: {exc}", file=sys.stderr)
+                return 1
             try:
                 result = critic.review(report)
             except RangeReportError as exc:
@@ -1127,6 +1160,16 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
 # comment, do NOT source the critic key from any other vault item.
 _CRITIC_KEY_REF = "op://shelly/API Credential - stigmergy rig 00/credential"
 
+# bead .143 (Decision 3): for a NON-Anthropic-routed critic entry, the
+# rig's op key ref comes from this env var (the ref follows the
+# PROVIDER, not the station). Absent on a non-Anthropic entry is a loud
+# RIG-LAUNCH failure. Deliberately NOT SG_-prefixed: every SG_* env var is
+# a charter override key (charter.py:177 family's `_ENV_PREFIX`), and
+# STIGMERGY_CRITIC_OA_KEY_REF would be rejected by the strict schema as an
+# unknown top-level key — the exact failure `STIGMERGY_NTFY_SERVER`
+# already avoids (see below).
+_CRITIC_OA_KEY_REF_ENV = "STIGMERGY_CRITIC_OA_KEY_REF"
+
 # bead .25: the credential relay's real Anthropic key (same op item the .64
 # capture used). The real key lives ONLY in the relay process; the worker gets
 # a capability token. See bead25-build-spec.md.
@@ -1136,6 +1179,52 @@ _ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # relay pins this (worker's own version header is stripped); without it the
 # first live relay request 400s.
 _ANTHROPIC_VERSION = "2023-06-01"
+def _critic_key_ref_for(registry: Registry, model: str) -> str:
+    """bead .143 (Decision 3): the op key ref for the critic station
+    follows the resolved entry's OA provider — the ref follows the
+    PROVIDER, not the station.
+
+    - Anthropic-routed entry (``oa_provider_key == "anthropic"`` — also
+      the default for ``provider = "anthropic"``): the rig's dedicated
+      Anthropic key item, ``_CRITIC_KEY_REF`` (unchanged).
+    - Any other provider: the rig-level env var
+      ``STIGMERGY_CRITIC_OA_KEY_REF`` names the op ref. Absent/empty on a
+      non-Anthropic entry is a loud RIG-LAUNCH failure
+      (:class:`CharterError`) — checked at factory build, never a
+      first-gate infra trip.
+    """
+    entry = registry.resolve(model)
+    if entry.oa_provider_key == "anthropic":
+        return _CRITIC_KEY_REF
+    ref = os.environ.get(_CRITIC_OA_KEY_REF_ENV, "").strip()
+    if not ref:
+        raise CharterError(
+            f"critic model {model!r} routes to OA provider "
+            f"{entry.oa_provider_key!r}; set the {_CRITIC_OA_KEY_REF_ENV} env "
+            "variable to its 1Password op key ref (the ref follows the "
+            "provider, not the station)"
+        )
+    return ref
+
+
+def make_critic_client(*args: Any, **kwargs: Any) -> Callable[..., dict[str, Any]]:
+    """DEPRECATED alias (bead .143): the legacy bare-urllib verdict
+    client was replaced by :func:`make_oa_critic_client`. Kept as a
+    module-level name so the .51 wiring-regression test (which
+    monkeypatches it to a raising stub and asserts the range builder
+    never calls it) keeps working. New code must use the OA factory."""
+    return make_oa_critic_client(*args, **kwargs)
+
+
+def make_range_critic_client(*args: Any, **kwargs: Any) -> Callable[..., dict[str, Any]]:
+    """DEPRECATED alias (bead .143): the legacy bare-urllib range-critic
+    client was replaced by :func:`make_oa_range_critic_client` (same
+    reason as :func:`make_critic_client` — the .51 wiring-regression
+    test monkeypatches this name to assert the range builder wires the
+    RANGE client, not the verdict client)."""
+    return make_oa_range_critic_client(*args, **kwargs)
+
+
 # bead .25 (SB adjudication 2026-07-18, option A): claude-code needs
 # `anthropic-beta` passed through to upstream (its beta-gated body fields, e.g.
 # context_management, depend on it; the beta list varies per request so pinning
