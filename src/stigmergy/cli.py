@@ -67,7 +67,13 @@ from stigmergy.rangereport import (
 )
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.registry import PricingClass, Registry, UnbudgetableError
-from stigmergy.relay import CapabilityStore, CredentialRelay
+from stigmergy.relay import (
+    DEFAULT_RELAY_PROFILE,
+    CapabilityStore,
+    CredentialRelay,
+    RelayProfile,
+    _openai_json_usage_extractor,
+)
 from stigmergy.relay_transport import RelayHandle, make_urllib_forwarder, start_relay
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
@@ -354,10 +360,64 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # authorizes against it; a second instance would make every relay request
     # deny "unknown" (load-bearing; see bead25-build-spec §8 / test case E18).
     capability_store = CapabilityStore()
-    # Constructed ONCE (reused across dispatches): the key provider caches
-    # fetch-once (one `op read` per process); the forwarder is stateless.
+    # bead .147 §1F: the per-dispatch RELAY PROFILE side-channel. The daemon
+    # (its dispatch path, where lane + registry + charter are in scope)
+    # DERIVES each lane's profile and writes it into this cell keyed by the
+    # real dispatch id; the closure below READS it (fallback: the DEFAULT
+    # anthropic profile — today's exact shape, so the pre-`.147` wiring tests
+    # and stubs keep observing identical behaviour). The `relay_setup_fn`
+    # signature stays 2-arg (ten+ test stubs pin it); the profile travels
+    # through the cell, not the callback.
+    relay_profile_cell: dict[str, RelayProfile] = {}
+    # Per-profile resources, constructed LAZILY once per (upstream_base_url,
+    # auth) and cached: the op-backed key provider is fetch-once per process
+    # (one `op read` per profile's key ref), the forwarder is stateless. The
+    # DEFAULT (anthropic) pair is the pre-`.147` construction, byte-identical.
     relay_key_provider = make_op_key_provider(_RELAY_KEY_REF)
+    # bead .147: the Synthetic OpenAI-lane key provider (fetch-once per
+    # process, like the Anthropic one) — shared by the bearer-auth relay
+    # resources and the transcript-secrets backstop below.
+    synthetic_relay_key_provider = make_op_key_provider(_SYNTHETIC_RELAY_KEY_REF)
     relay_forwarder = make_urllib_forwarder(base_url=_ANTHROPIC_BASE_URL)
+    relay_resource_cache: dict[tuple[str, str], tuple] = {}
+
+    def _relay_resources(profile: RelayProfile):
+        """(key_provider, forwarder) for a profile — built lazily, cached.
+
+        - anthropic profile: the pre-`.147` shared pair (key ref
+          `_RELAY_KEY_REF`, base `_ANTHROPIC_BASE_URL`) — returned exactly as
+          before for the default profile (the `.25` wiring test asserts the
+          same objects).
+        - openai + bearer: the Synthetic key ref (`_SYNTHETIC_RELAY_KEY_REF`
+          — wired by name only, the provider owns the fetch) + a
+          `make_urllib_forwarder` for the profile's upstream (cached per
+          base_url: the no-redirect, proxy-disabled opener is shared).
+        - openai + none (keyless, e.g. blackwell): a key provider that
+          returns None (the header is OMITTED upstream — never `Bearer
+          None`) + the per-base_url forwarder.
+        """
+        if profile is DEFAULT_RELAY_PROFILE or (
+            profile.wire == "anthropic" and profile.auth == "x-api-key"
+        ):
+            return relay_key_provider, relay_forwarder
+        cache_key = (profile.upstream_base_url, profile.auth)
+        resources = relay_resource_cache.get(cache_key)
+        if resources is None:
+            if profile.auth == "none":
+
+                def _none_key_provider() -> None:
+                    # Keyless lane: the upstream carries no credential. The
+                    # relay OMITS the header entirely (relay.py
+                    # prepare_upstream's `none` branch).
+                    return None
+
+                key_provider: Callable[[], str | None] = _none_key_provider
+            else:  # bearer (and any future auth form: a fetched key)
+                key_provider = synthetic_relay_key_provider
+            forwarder = make_urllib_forwarder(base_url=profile.upstream_base_url)
+            resources = (key_provider, forwarder)
+            relay_resource_cache[cache_key] = resources
+        return resources
 
     def secrets_for_capability(capability):
         # bead .25 audit (F-2): arm the sealed-transcript backstop against the
@@ -368,25 +428,60 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         # adds no extra op calls after warmup. No ACTIVE leak exists (the worker
         # never holds the key) -- this is the last-line defense-in-depth the bead
         # was chartered to wire.
-        return frozenset({capability.token, relay_key_provider()})
+        # bead .147 review fix F2 (2026-08-30): over-arm the backstop with the
+        # SYNTHETIC key too — OpenAI lanes inject it toward their upstream, so
+        # a sealed transcript must redact it as well. Best-effort by design: a
+        # key that cannot be resolved was never injected toward any upstream,
+        # so there is nothing to redact (and a pure-Anthropic rig must not
+        # gain a new failure mode at seal time). Per-profile precision lives
+        # in `relay.injected_secrets`; this closure is the coarse last line.
+        secrets = {capability.token, relay_key_provider()}
+        try:
+            synthetic_key = synthetic_relay_key_provider()
+            if synthetic_key:
+                secrets.add(synthetic_key)
+        except Exception:  # noqa: BLE001 - unresolvable key == never on the wire
+            pass
+        return frozenset(secrets)
 
     def relay_setup_fn(provisional_id: str, runtime_dir: Path) -> RelayHandle:
-        # Per-dispatch relay. The sync `forwarder` slot is a sentinel that
-        # raises — the streaming serve_relay path uses prepare_upstream +
-        # the injected async forwarder, never CredentialRelay._forwarder.
-        relay = CredentialRelay(
+        # Per-dispatch relay (signature UNCHANGED — the profile arrives via
+        # the side-channel cell, not an extra argument). The sync
+        # `forwarder` slot is a sentinel that raises — the streaming
+        # serve_relay path uses prepare_upstream + the injected async
+        # forwarder, never CredentialRelay._forwarder.
+        profile = relay_profile_cell.get(provisional_id, DEFAULT_RELAY_PROFILE)
+        key_provider, forwarder = _relay_resources(profile)
+        relay_kwargs: dict[str, Any] = dict(
             store=capability_store,
-            key_provider=relay_key_provider,
+            key_provider=key_provider,
             forwarder=_unused_sync_forwarder,
-            upstream_headers_pinned={"anthropic-version": _ANTHROPIC_VERSION},
-            upstream_header_allowlist=_RELAY_UPSTREAM_HEADER_ALLOWLIST,
+            upstream_headers_pinned=dict(profile.pinned_headers),
+            capability_header=profile.capability_header,
+            allowed_endpoints=profile.allowed_endpoints,
+            auth=profile.auth,
+            pricing_class=profile.pricing_class,
+            wire=profile.wire,
         )
+        if profile.wire == "openai":
+            # OpenAI wire: no version pin (profile.pinned_headers is {}),
+            # the default tight allowlist (content-type/accept — the
+            # worker's own `authorization` is the capability header,
+            # dropped by construction), and the OpenAI JSON usage extractor
+            # (`usage.completion_tokens` -> output; the full usage dict
+            # feeds the relay JSONL).
+            relay_kwargs["usage_extractor"] = _openai_json_usage_extractor
+        else:
+            # anthropic: today's exact shape (SB option A widened allowlist
+            # + anthropic-version pin, carried by the profile).
+            relay_kwargs["upstream_header_allowlist"] = _RELAY_UPSTREAM_HEADER_ALLOWLIST
+        relay = CredentialRelay(**relay_kwargs)
         log_path = Path(runtime_dir) / f"relay-{provisional_id}.jsonl"
         return start_relay(
             provisional_id,
             runtime_dir,
             relay,
-            forwarder=relay_forwarder,
+            forwarder=forwarder,
             log_path=log_path,
         )
 
@@ -411,6 +506,9 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         # relay_teardown_fn stays at Daemon's default (RelayHandle.stop).
         egress_setup_fn=egress.setup_dispatch_egress,
         relay_setup_fn=relay_setup_fn,
+        # bead .147 §1F: the profile side-channel (daemon derives per lane,
+        # closure reads; default None elsewhere = today's behaviour).
+        relay_profile_cell=relay_profile_cell,
         secrets_for_capability=secrets_for_capability,
     )
 
@@ -1173,6 +1271,12 @@ _CRITIC_OA_KEY_REF_ENV = "STIGMERGY_CRITIC_OA_KEY_REF"
 # capture used). The real key lives ONLY in the relay process; the worker gets
 # a capability token. See bead25-build-spec.md.
 _RELAY_KEY_REF = "op://shelly/API Credential - stigmergy rig 00/credential"
+# bead .147: the Synthetic OpenAI-lane relay key — the SAME 1Password item
+# the critic uses for its OpenAI-routed entries (the ref follows the
+# provider, not the station — Decision 3, bead .143). Wired BY NAME ONLY:
+# this module never fetches, logs, or caches the key itself; the op-backed
+# provider (fetch-once, in the relay process) owns it.
+_SYNTHETIC_RELAY_KEY_REF = "op://shelly/cqntl7jj446cxwplb2hafwxinq/credential"
 _ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # Current REQUIRED header value per Anthropic docs (verified 2026-07-18). The
 # relay pins this (worker's own version header is stripped); without it the

@@ -176,7 +176,7 @@ from stigmergy.notify import NotificationStore, NtfyNotifier
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.recover import ContainerReaper, RecoveryReport
 from stigmergy.registry import Registry
-from stigmergy.relay import Capability, CapabilityStore, build_redactor
+from stigmergy.relay import Capability, CapabilityStore, build_redactor, derive_relay_profile
 from stigmergy.relay_transport import RelayHandle
 from stigmergy.rig import RigStore
 from stigmergy.spend import SpendLeash
@@ -328,6 +328,7 @@ class Daemon:
         egress_setup_fn: Callable[..., EgressHandle] | None = None,
         egress_teardown_fn: Callable[[EgressHandle], None] = egress.teardown,
         relay_setup_fn: Callable[..., RelayHandle] | None = None,
+        relay_profile_cell: dict | None = None,
         relay_teardown_fn: Callable[[RelayHandle], None] = _default_relay_teardown,
         secrets_for_capability: Callable[[Capability], frozenset[str]] | None = None,
         now_fn: Callable[[], float] = time.time,
@@ -360,6 +361,18 @@ class Daemon:
         self._egress_setup_fn = egress_setup_fn
         self._egress_teardown_fn = egress_teardown_fn
         self._relay_setup_fn = relay_setup_fn
+        # bead .147 §1F: the per-dispatch RELAY PROFILE side-channel. The
+        # cli (`_build_daemon`) creates this dict and passes it here; the
+        # dispatch path writes the lane's derived `RelayProfile` into it
+        # keyed by the REAL dispatch id, immediately before the
+        # `_setup_relay` call. The cli's `relay_setup_fn` closure (whose
+        # signature stays `fn(dispatch_id, runtime_dir)` — ten+ existing
+        # test stubs pin those 2 args) READS `cell.get(dispatch_id)`,
+        # falling back to the DEFAULT anthropic profile when absent.
+        # Default `None` -> the daemon skips derivation and today's
+        # behaviour holds (existing stubs + the .25 wiring test keep
+        # working untouched).
+        self._relay_profile_cell: dict | None = relay_profile_cell
         self._relay_teardown_fn = relay_teardown_fn
         self._secrets_for_capability = (
             secrets_for_capability
@@ -678,7 +691,7 @@ class Daemon:
         # shared CapabilityStore (not by dispatch_id), so it is safe to stand
         # up before the capability is minted inside prepare_dispatch — the
         # worker only issues a request once it is running, well after mint.
-        relay_handle = self._setup_relay(ticket_id, now, real_dispatch_id)
+        relay_handle = self._setup_relay(ticket_id, now, real_dispatch_id, lane=lane)
         relay_socket = relay_handle.socket_path if relay_handle is not None else None
 
         fresh_row = self._store.get_ticket(ticket_id)
@@ -742,16 +755,38 @@ class Daemon:
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_egress_runtime"
         return self._egress_setup_fn(dispatch_id, policy, runtime_dir)
 
-    def _setup_relay(self, ticket_id: str, now: float, dispatch_id: str) -> RelayHandle | None:
+    def _setup_relay(
+        self, ticket_id: str, now: float, dispatch_id: str, *, lane: Any = None
+    ) -> RelayHandle | None:
         """bead .25: `None` unless `relay_setup_fn` is injected (wired for real
         by `cli._build_daemon`). Mirrors `_setup_egress`: the real dispatch id + a
         per-rig runtime dir; the injected fn constructs a `CredentialRelay`
         (sharing this daemon's `CapabilityStore`) and `start_relay`s it,
         returning a `RelayHandle` whose `socket_path` the caller threads into
-        the dispatch. No lane/policy input — the relay authorizes by capability
-        token, not by lane."""
+        the dispatch. The relay authorizes by capability token, not by lane —
+        BUT bead .147 §1F threads the lane's RELAY PROFILE through the
+        side-channel: when `relay_profile_cell` is wired and `lane` is given,
+        the profile is derived from the lane's model NOW (immediately before
+        the setup call — the one point where lane + registry + charter are
+        all in scope pre-`prepare_dispatch`) and written into the cell under
+        the REAL dispatch id. The `relay_setup_fn` signature stays
+        `(dispatch_id, runtime_dir)` (the 2-arg contract ten+ test stubs
+        pin); the closure reads the cell and falls back to the default
+        anthropic profile when absent. Derivation failure is a loud dispatch
+        failure (unknown wire / missing openai base URL — a caller bug that
+        must never silently fall back to a DIFFERENT upstream)."""
         if self._relay_setup_fn is None:
             return None
+        if self._relay_profile_cell is not None and lane is not None:
+            # Derivation failure is a loud dispatch failure (unknown wire /
+            # missing openai base URL — a caller bug that must never silently
+            # fall back to a DIFFERENT upstream).
+            profile = derive_relay_profile(
+                lane_model=lane.model,
+                registry=self._registry,
+                charter=self._charter,
+            )
+            self._relay_profile_cell[dispatch_id] = profile
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_relay_runtime"
         return self._relay_setup_fn(dispatch_id, runtime_dir)
 

@@ -38,7 +38,8 @@ from __future__ import annotations
 import json
 import secrets
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 REDACTED_PLACEHOLDER = "«redacted»"
 
@@ -57,7 +58,6 @@ CAPABILITY_HEADER_DEFAULT = "x-api-key"
 DEFAULT_UPSTREAM_HEADER_ALLOWLIST: frozenset[str] = frozenset({"content-type", "accept"})
 DEFAULT_ALLOWED_ENDPOINTS: frozenset[tuple[str, str]] = frozenset({("POST", "/v1/messages")})
 
-
 class RelayError(Exception):
     """Base for all relay errors (caller bugs, malformed inputs) — distinct
     from :class:`CapabilityDenied`, which is the expected, fail-closed
@@ -75,6 +75,236 @@ class CapabilityDenied(RelayError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+# --------------------------------------------------------------------------- #
+# bead .147 — relay endpoint profiles (per-dispatch upstream selection).      #
+#                                                                             #
+# Pre-`.147` the relay served exactly ONE upstream (Anthropic /v1/messages,  #
+# x-api-key header, Anthropic-shaped metering) as module constants. `.147`   #
+# makes that choice PER-DISPATCH: the daemon derives a frozen RelayProfile   #
+# from the dispatch lane's registry entry + pricing class, and the cli       #
+# closure builds the CredentialRelay/forwarder from it (spec §1A/§1F). The   #
+# DEFAULT profile below reproduces the pre-`.147` constants EXACTLY          #
+# (regression gate: the full existing suite must pass with zero edits —      #
+# every code path that does not supply a profile observes today's            #
+# behaviour byte-for-byte).                                                  #
+# --------------------------------------------------------------------------- #
+
+# The pre-`.147` upstream constants, now the DEFAULT profile's values.
+_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+_ANTHROPIC_VERSION = "2023-06-01"
+# OpenAI wire: worker-facing path is `/chat/completions` WITHOUT `/v1` (the
+# driver sets the worker's OPENAI_BASE_URL to the shim root) while
+# `upstream_base_url` CARRIES `/v1`, so `base_url + path` composition in
+# make_urllib_forwarder is exact (spec §1A: NO rewrite mechanism).
+_OPENAI_ENDPOINT: tuple[str, str] = ("POST", "/chat/completions")
+
+#: The `stream_options.include_usage` deny's fixed marker reason (bead .147
+#: §1D, verify-don't-mutate). The only non-:class:`CapabilityDenied` reason
+#: in the relay deny vocabulary: a POLICY deny (status 422, nothing
+#: forwarded, nothing charged — distinct from the .56 §C upstream-failure
+#: charges), issued on a metered OpenAI lane when a streaming request does
+#: not request usage.
+MISSING_USAGE_REQUESTED = "missing-usage-requested"
+
+
+def _derive_pricing_class(pricing: Any) -> str:
+    """Map a registry pricing value to the relay's two-valued pricing class
+    (bead .147 §1A/§1F): ``subscription`` -> ``metered`` (the subscription
+    quota IS the metering leash — .56 §C's no-unmetered-retry property
+    applies), ``local`` -> ``local``, and EVERYTHING else (any other value,
+    a future class, or missing/``None``) -> ``metered``. D10 fail-closed:
+    ``$0`` (i.e. ``local``) is only ever a declared value, never a fallback
+    — an unknown pricing must never weaken the metering guarantee."""
+    if pricing == "local":
+        return "local"
+    # "subscription", "metered", and any other/missing value -> metered.
+    return "metered"
+
+
+@dataclass(frozen=True)
+class RelayProfile:
+    """One dispatch's relay endpoint profile (bead .147 §1A, immutable).
+
+    Constructed per dispatch by :func:`derive_relay_profile` (daemon side)
+    or taken from :data:`DEFAULT_RELAY_PROFILE` (the cli fallback). The
+    forwarder keeps composing ``upstream_base_url + worker path`` with
+    netloc pinning — there is NO path-rewrite mechanism; ``allowed_endpoints``
+    plus the base URL's own prefix define the exact upstream surface a
+    capability may reach (one capability = one upstream = one endpoint).
+    """
+
+    upstream_base_url: str  # origin+prefix, e.g. "http://10.0.20.111:8000/v1"
+    wire: str  # "anthropic" | "openai" — metering/contract selection axis
+    auth: str  # "x-api-key" | "bearer" | "none" — upstream credential contract
+    capability_header: str  # derived, not independent: where the capability rides
+    pricing_class: str  # "metered" | "local" — DERIVED (see derive_relay_profile)
+    allowed_endpoints: frozenset[tuple[str, str]]  # worker-facing (method, path) pairs
+    pinned_headers: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # bead .147 §2.5: unknown wire/auth/pricing is a BUILD error (profile
+        # construction), never a request-time surprise — and the pricing
+        # class can only ever be one of the two valid values, so there is no
+        # "unknown pricing" fallthrough to `local` (D10 fail-closed).
+        if self.wire not in ("anthropic", "openai"):
+            raise RelayError(
+                f"unknown relay wire {self.wire!r} (expected 'anthropic' or 'openai')"
+            )
+        if self.auth not in ("x-api-key", "bearer", "none"):
+            raise RelayError(
+                f"unknown relay auth {self.auth!r} (expected 'x-api-key', 'bearer' or 'none')"
+            )
+        if self.pricing_class not in ("metered", "local"):
+            raise RelayError(
+                f"unknown pricing_class {self.pricing_class!r} (expected 'metered' or 'local')"
+            )
+        if not self.upstream_base_url or "://" not in self.upstream_base_url:
+            raise RelayError(
+                "upstream_base_url must be an absolute scheme://host[/prefix] URL "
+                f"(got {self.upstream_base_url!r})"
+            )
+        if not self.capability_header:
+            raise RelayError("capability_header must be a non-empty header name")
+
+    @property
+    def is_metered(self) -> bool:
+        """True iff undeterminable usage on a 2xx saturates the capability
+        (``charge_unbudgetable``). ``local`` lanes are accounting-only
+        (bead .147 §1C): best-effort charge of the parsed value, 0 when
+        unparseable, JSONL reason ``accounting-only`` — never saturated."""
+        return self.pricing_class == "metered"
+
+
+def derive_relay_profile(
+    *,
+    lane_model: str,
+    registry: Any,
+    charter: Any = None,
+) -> RelayProfile:
+    """Derive the per-dispatch :class:`RelayProfile` from the lane's resolved
+    registry entry (bead .147 §1A/§1F — called by the daemon in the dispatch
+    path, immediately before the ``_setup_relay`` call).
+
+    Inputs: ``lane_model`` (the charter lane's model name — the registry
+    entry name), ``registry`` (a :class:`stigmergy.registry.Registry`), and
+    ``charter`` (optional; accepted so the derivation surface is complete for
+    future charter-level knobs — the v0 derivation reads ONLY the registry
+    entry, the charter's lane fields being the same model name the registry
+    entry is keyed by).
+
+    Derivation (normative, spec §1A):
+
+    - ``pricing_class``: the entry's ``pricing`` value mapped
+      ``subscription`` -> ``metered`` (the subscription quota IS the metering
+      leash), ``local`` -> ``local``, anything else/missing -> ``metered``
+      (D10: `$0` only ever as a declared value, never a fallback).
+    - ``wire``: the entry's ``oa_type`` (bead .143 OA wiring axis) —
+      ``"anthropic"`` or ``"openai"``; anything else (including missing/
+      ``None``) is a BUILD error (:class:`RelayError`), never a
+      request-time guess.
+    - ``upstream_base_url``: the entry's ``oa_base_url`` when the wire is
+      ``openai`` (REQUIRED there — a base-less OpenAI upstream is unbudgetable
+      to relay to); the fixed ``_ANTHROPIC_BASE_URL`` for ``anthropic``
+      (today's exact value, whether or not the entry declares one — the
+      anthropic lane keeps today's byte-for-byte behaviour).
+    - ``auth``: for the ``openai`` wire, DERIVED FROM THE PRICING CLASS
+      (bead .147 review fix F1, 2026-08-30): ``local`` (declared $0, the
+      blackwell class) -> ``"none"`` (keyless — the header is omitted
+      upstream entirely); every metered class -> ``"bearer"`` (the OpenAI
+      credential contract, spec §1B). Fail-safe direction: a $0 upstream
+      can never receive a foreign provider's key (the bug this closes: a
+      `local` openai lane deriving `bearer` would inject the Synthetic key
+      toward blackwell); a local upstream that DID need a key fails loudly
+      at the upstream (401 -> infra), never by leaking. A future
+      keyed-local upstream will need an explicit registry auth field —
+      not invented silently here. ``"x-api-key"`` for ``anthropic``.
+      (``"none"`` can also be constructed directly for keyless upstreams;
+      ``derive_relay_profile`` derives it only from declared
+      ``pricing="local"``.)
+    - ``capability_header``: ``"authorization"`` for the ``openai`` wire,
+      ``"x-api-key"`` for ``anthropic`` (derived, not independent).
+    - ``allowed_endpoints``: ``{("POST", "/v1/messages")}`` for ``anthropic``
+      (today's exact set, incl. the `.25` ``anthropic-beta`` handling living
+      in the allowlist, not here), ``{("POST", "/chat/completions")}`` for
+      ``openai``.
+    - ``pinned_headers``: ``{"anthropic-version": _ANTHROPIC_VERSION}`` for
+      ``anthropic`` (today's exact pin), ``{}`` for ``openai`` (no version
+      pin on the OpenAI wire).
+
+    Raises :class:`RelayError` on an unknown/missing wire, a missing
+    ``oa_base_url`` on an openai entry, or any registry failure (the
+    registry's own :class:`UnbudgetableError` propagates — an unresolvable
+    model is unbudgetable, and the daemon's existing registry-error handling
+    owns that path).
+    """
+    entry = registry.resolve(lane_model)
+    pricing_raw = getattr(entry, "pricing", None)
+    pricing_value = getattr(pricing_raw, "value", pricing_raw)
+    pricing_class = _derive_pricing_class(pricing_value)
+
+    oa_type = getattr(entry, "oa_type", None)
+    if oa_type == "anthropic":
+        return RelayProfile(
+            upstream_base_url=_ANTHROPIC_BASE_URL,
+            wire="anthropic",
+            auth="x-api-key",
+            capability_header=CAPABILITY_HEADER_DEFAULT,
+            pricing_class=pricing_class,
+            allowed_endpoints=DEFAULT_ALLOWED_ENDPOINTS,
+            pinned_headers={"anthropic-version": _ANTHROPIC_VERSION},
+        )
+    if oa_type == "openai":
+        base_url = getattr(entry, "oa_base_url", None)
+        if not base_url:
+            raise RelayError(
+                f"model {lane_model!r} declares wire 'openai' but has no "
+                "oa_base_url — an OpenAI relay upstream must be declared "
+                "explicitly (silent base-URL guessing is unbudgetable)"
+            )
+        # Review fix F1 (bead .147, 2026-08-30): auth derives from the
+        # PRICING CLASS, fail-safe. `local` ($0 declared — the blackwell
+        # class) is KEYLESS: deriving `bearer` there would inject the
+        # Synthetic key toward a foreign LAN upstream (the exact wiring bug
+        # this closes). A local upstream that actually needed a key fails
+        # loudly at the upstream instead of leaking one. Metered classes
+        # carry the OpenAI Bearer credential contract (spec §1B).
+        auth: str = "none" if pricing_class == "local" else "bearer"
+        return RelayProfile(
+            upstream_base_url=base_url,
+            wire="openai",
+            auth=auth,
+            capability_header="authorization",
+            pricing_class=pricing_class,
+            allowed_endpoints=frozenset({_OPENAI_ENDPOINT}),
+            pinned_headers={},
+        )
+    # Unknown/missing wire: BUILD error (spec §1A/§2.5), never a request-
+    # time surprise. `charter` is unused in v0 (the lane's model IS the
+    # registry key) but is part of the derivation surface.
+    raise RelayError(
+        f"model {lane_model!r}: unknown/missing OA wire {oa_type!r} — a relay "
+        "profile requires a declared 'anthropic' or 'openai' wire "
+        "(silent wire-type guessing is unbudgetable)"
+    )
+
+
+#: The pre-`.147` default endpoint profile — byte-identical to the module
+#: constants it replaces (``_ANTHROPIC_BASE_URL`` + ``DEFAULT_ALLOWED_
+#: ENDPOINTS`` + ``CAPABILITY_HEADER_DEFAULT`` + the `.25` pinned
+#: ``anthropic-version``). The cli closure falls back to THIS when the
+#: daemon's per-dispatch profile cell carries no entry, so existing stubs
+#: and wiring tests keep observing today's relay shape.
+DEFAULT_RELAY_PROFILE = RelayProfile(
+    upstream_base_url=_ANTHROPIC_BASE_URL,
+    wire="anthropic",
+    auth="x-api-key",
+    capability_header=CAPABILITY_HEADER_DEFAULT,
+    pricing_class="metered",
+    allowed_endpoints=DEFAULT_ALLOWED_ENDPOINTS,
+    pinned_headers={"anthropic-version": _ANTHROPIC_VERSION},
+)
 
 
 @dataclass(frozen=True)
@@ -282,6 +512,26 @@ def _find_header(headers: Mapping[str, str], name: str) -> str | None:
     return None
 
 
+def parse_bearer_token(header_value: str) -> str:
+    """bead .147 §1B: strip an OPTIONAL ``Bearer `` prefix from the worker's
+    ``Authorization`` header value for the capability lookup.
+
+    Case-insensitive on the scheme token (``bearer``/``BEARER``/
+    ``Bearer`` all strip; a different scheme or any other value is NOT a
+    capability credential and is returned unchanged — the store lookup
+    then fails ``unknown``, exactly as a bare unknown token would). A
+    scheme with NO space after it (``Bearer<token>``) is not the Bearer
+    form and is likewise returned unchanged. Surrounding whitespace is
+    stripped in all cases (the header parser strips outer whitespace; this
+    tolerates stray internal padding)."""
+    value = header_value.strip()
+    # The 7-char prefix already ends in the required space; any further
+    # whitespace belongs to (or pads) the token and is stripped below.
+    if len(value) > 7 and value[:7].lower() == "bearer ":
+        return value[7:].strip()
+    return value
+
+
 def extract_usage(response: RelayResponse) -> dict:
     """Parse an Anthropic-style JSON body's top-level ``"usage"`` object.
 
@@ -303,6 +553,75 @@ def extract_usage(response: RelayResponse) -> dict:
     if not isinstance(usage, dict):
         return {}
     return usage
+
+
+def extract_openai_usage(response: RelayResponse) -> dict:
+    """Parse an OpenAI-wire JSON body's top-level ``"usage"`` object
+    (bead .147 §1C — the JSON / non-stream shape selected when
+    ``profile.wire == "openai"``).
+
+    Same tri-state discipline as :func:`extract_usage`: never raises; an
+    unparseable, empty, bodyless, or usage-less response yields ``{}``.
+    The CALLER applies the charge: the capability charge is
+    ``usage.completion_tokens`` (a valid non-negative int, else
+    undetermined — see :meth:`CredentialRelay._meter_usage` / the
+    transport's OpenAI JSON branch), while the FULL parsed usage dict
+    (including ``prompt_tokens`` / ``prompt_tokens_details.cached_tokens``
+    / ``reasoning_tokens``) is what the relay JSONL records as the
+    CV/quota-governor feed.
+    """
+    if not response.body:
+        return {}
+    try:
+        parsed = json.loads(response.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    usage = parsed.get("usage")
+    if not isinstance(usage, dict):
+        return {}
+    return usage
+
+
+def openai_output_tokens(usage: Any) -> int | None:
+    """bead .147 §1C: the OpenAI-wire output measurement — the ``usage``
+    dict's ``completion_tokens`` when POSITIVELY determined (a valid
+    non-negative int; bool rejected), else ``None`` (undetermined — the
+    caller applies the pricing-class re-scope: ``metered`` ->
+    ``charge_unbudgetable``, ``local`` -> 0).
+
+    Shared by the JSON path (:meth:`CredentialRelay._meter_usage`, via the
+    extractor's ``output_tokens`` alias below) and the SSE meter's
+    finalize, so both OpenAI shapes observe one tri-state rule."""
+    if not isinstance(usage, dict):
+        return None
+    raw = usage.get("completion_tokens")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return None
+
+
+def openai_output_tokens_alias(usage: Any) -> int | None:
+    """Alias mapping the OpenAI ``usage.completion_tokens`` field onto the
+    ``output_tokens`` key the shared charge code reads (see
+    :func:`openai_output_tokens` — same tri-state rule, different field
+    name)."""
+    return openai_output_tokens(usage)
+
+
+def _openai_json_usage_extractor(response: RelayResponse) -> dict:
+    """usage_extractor factory output for OpenAI-wire JSON relays: the
+    full parsed ``usage`` dict with its ``output_tokens`` slot set to the
+    tri-state-validated ``completion_tokens`` (``None`` when undetermined)
+    so the shared charge code (:meth:`CredentialRelay._meter_usage`) can
+    stay wire-agnostic."""
+    usage = extract_openai_usage(response)
+    if not usage:
+        return usage
+    out = dict(usage)
+    out["output_tokens"] = openai_output_tokens(usage)
+    return out
 
 
 def build_redactor(secrets: Iterable[str]) -> Callable[[str], str]:
@@ -417,14 +736,25 @@ def prepare_upstream(
        headers whose lowercased name is in ``relay._upstream_header_allowlist``
        are copied, then ``relay._upstream_headers_pinned`` is overlaid (the
        relay's pinned values WIN over anything the worker sent), then the
-       real key is injected under ``relay._capability_header``. Everything
-       else the worker sent (``authorization``, ``anthropic-beta``, ``host``,
-       ``x-*``, cookies, proxy-*, ...) is dropped. Method/path/body pass
-       through unchanged.
+       real key is injected per ``relay._auth`` (bead .147 §1B):
+       ``"x-api-key"`` injects the key under ``relay._capability_header``
+       (today's exact behaviour); ``"bearer"`` injects
+       ``"Bearer <real-key>"`` under the (authorization) capability header;
+       ``"none"`` OMITS the header entirely (a non-None key there is a
+       wiring bug -> :class:`RelayError`). Everything else the worker sent
+       (``authorization``, ``anthropic-beta``, ``host``, ``x-*``, cookies,
+       proxy-*, ...) is dropped. Method/path/body pass through unchanged.
     """
     token = _find_header(request.headers, relay._capability_header)
     if token is None:
         return DenyResponse(status=401, reason="missing-capability")
+    # bead .147 §1B: on the `authorization` (bearer) capability header the
+    # worker may send `Bearer <capability-token>` — strip the OPTIONAL
+    # scheme prefix (case-insensitive) for the lookup. On `x-api-key` this
+    # is a no-op (no "Bearer " prefix is ever a valid x-api-key value), so
+    # the anthropic lane is byte-for-byte unchanged.
+    if relay._capability_header.lower() == "authorization":
+        token = parse_bearer_token(token)
 
     endpoint_path = request.path.split("?", 1)[0]
     if (request.method.upper(), endpoint_path) not in relay._allowed_endpoints:
@@ -453,7 +783,30 @@ def prepare_upstream(
             if key.lower() != pinned_name.lower()
         }
         upstream_headers[pinned_name] = pinned_value
-    upstream_headers[relay._capability_header] = real_key
+
+    # Upstream credential injection (bead .147 §1B):
+    #  - auth="x-api-key": today's exact behaviour — the real key under the
+    #    (removed) capability header name.
+    #  - auth="bearer": `Authorization: Bearer <real-key>` — the OpenAI
+    #    wire's credential form (the worker's own `Authorization` header
+    #    was already dropped by the allowlist above; the injected value
+    #    REPLACES it, never appends).
+    #  - auth="none": the header is OMITTED upstream entirely (blackwell is
+    #    keyless) — NEVER `Bearer None`, never a placeholder credential.
+    #    `real_key` is None here (the profile's key_provider returns None);
+    #    a non-None key on a none-auth relay is a wiring bug and still
+    #    omits the header (omission is the only safe shape).
+    if relay._auth == "bearer":
+        upstream_headers[relay._capability_header] = f"Bearer {real_key}"
+    elif relay._auth == "x-api-key":
+        upstream_headers[relay._capability_header] = real_key
+    else:  # "none"
+        if real_key is not None:
+            raise RelayError(
+                "auth='none' relay profile with a non-None key — the key "
+                "provider must return None on keyless lanes (the header "
+                "is omitted upstream, never `Bearer <key>`)"
+            )
 
     upstream_request = RelayRequest(
         method=request.method,
@@ -480,13 +833,16 @@ class CredentialRelay:
         self,
         *,
         store: CapabilityStore,
-        key_provider: Callable[[], str],
+        key_provider: Callable[[], str | None],
         forwarder: Callable[[RelayRequest], RelayResponse],
         usage_extractor: Callable[[RelayResponse], dict] = extract_usage,
         capability_header: str = CAPABILITY_HEADER_DEFAULT,
         upstream_header_allowlist: frozenset[str] = DEFAULT_UPSTREAM_HEADER_ALLOWLIST,
         upstream_headers_pinned: Mapping[str, str] | None = None,
         allowed_endpoints: frozenset[tuple[str, str]] = DEFAULT_ALLOWED_ENDPOINTS,
+        auth: str = "x-api-key",
+        pricing_class: str = "metered",
+        wire: str = "anthropic",
     ) -> None:
         self._store = store
         self._key_provider = key_provider
@@ -500,6 +856,13 @@ class CredentialRelay:
             upstream_headers_pinned if upstream_headers_pinned is not None else {}
         )
         self._allowed_endpoints = allowed_endpoints
+        # bead .147 §1A/§1B: the per-profile wire, credential contract, and
+        # pricing class. Defaults are TODAY'S exact shape (anthropic wire,
+        # x-api-key, metered), so a relay built without them (all
+        # pre-`.147` construction sites) behaves byte-for-byte as before.
+        self._wire = wire
+        self._auth = auth
+        self._pricing_class = pricing_class
 
     def handle(self, request: RelayRequest) -> RelayResponse:
         """Authorize, inject, forward, meter — fail closed at every step.
@@ -517,15 +880,26 @@ class CredentialRelay:
            upstream").
         3. Only once authorized: build the upstream request by copying
            the headers, REMOVING the capability header, and INJECTING the
-           real key (from ``key_provider()``) under the same header name.
-           Method/path/body pass through unchanged.
+           real key (from ``key_provider()``) per ``self._auth`` (see
+           :func:`prepare_upstream`). Method/path/body pass through
+           unchanged.
         4. ``forwarder(upstream_request)`` -> the real response.
-        5. Meter usage: ``usage_extractor(response)`` then
-           ``store.charge(token, output_tokens=...)`` (defaults to 0 if
-           the extractor found nothing; the call still counts via
-           ``charge``'s default ``calls=1``).
+        5. Meter usage (bead .147 §1C re-scope, gated on
+           ``self._pricing_class``): the extractor's ``output_tokens``
+           must be a POSITIVELY-determined valid non-negative int.
+           - ``metered``: a determined value charges exactly; an
+             undetermined value (absent/non-int/bool/negative) charges
+             ``charge_unbudgetable`` (saturate = kill switch — the .56 F4
+             leash, unchanged from today's behaviour).
+           - ``local``: accounting-only — a determined value charges
+             best-effort; an undetermined value charges 0 (never
+             saturate a $0 capability for a metering gap).
+           The call still counts via ``charge``'s default ``calls=1``.
         6. Return the forwarder's response AS-IS toward the worker — the
-           real key is never added to anything returned here.
+           real key is never added to anything returned here; the
+           response's ``usage`` slot carries the charged usage dict
+           (the full parsed ``usage`` object on OpenAI wires, ``{}`` when
+           nothing was determined) for observability only.
 
         As of bead .31, this delegates the authorize+inject decision to the
         module-level :func:`prepare_upstream` (the single authority shared
@@ -539,20 +913,61 @@ class CredentialRelay:
         response = self._forwarder(prepared.request)
 
         usage = self._usage_extractor(response)
-        output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
-        if not isinstance(output_tokens, int) or isinstance(output_tokens, bool) or (
-            output_tokens < 0
-        ):
-            output_tokens = 0
-        self._store.charge(prepared.token, output_tokens=output_tokens)
+        charged_usage = self._meter_usage(prepared.token, usage)
+        return RelayResponse(
+            status=response.status,
+            headers=response.headers,
+            body=response.body,
+            usage=charged_usage,
+        )
 
-        return response
+    def _meter_usage(self, token: str, usage: dict) -> dict:
+        """bead .147 §1C: the pricing-class-gated metering decision shared
+        by :meth:`handle` (the .12 sync full-body path).
+
+        The tri-state validity rule is IDENTICAL to the transport's JSON
+        path (bead .56 §8 fix A): ``output_tokens`` is a POSITIVELY
+        determined measurement only when present as a valid non-negative
+        int (bool rejected). A valid value charges exactly; an
+        undetermined value is ``charge_unbudgetable`` (saturate) on
+        ``metered`` lanes and a 0-charge on ``local`` lanes (accounting-
+        only — never saturate a $0 capability). Returns the charged usage
+        dict (the full parsed ``usage`` when a measurement was determined,
+        ``{}`` otherwise) for the response's observability slot."""
+        output_tokens: int | None
+        raw = usage.get("output_tokens") if isinstance(usage, dict) else None
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            output_tokens = raw
+        else:
+            output_tokens = None
+
+        if output_tokens is None:
+            if self._pricing_class == "metered":
+                # .56 F4 fail-closed: an unmeterable metered call never
+                # charges ~0 — it saturates the capability (kill switch).
+                try:
+                    self._store.charge_unbudgetable(token)
+                except CapabilityDenied:
+                    pass  # dead token in the sync window: fail closed
+                return {}
+            # local: accounting-only, best-effort 0 (JSONL reason
+            # "accounting-only" is the transport's concern; this sync path
+            # has no JSONL).
+            self._store.charge(token, output_tokens=0)
+            return {}
+        self._store.charge(token, output_tokens=output_tokens)
+        return usage
 
     def injected_secrets(self, token: str) -> frozenset[str]:
         """The values this relay put on the wire for ``token`` that MUST
         be redacted from any sealed transcript: the capability token
         itself and the real provider key. Raises :class:`RelayError` for
         a token that was never minted.
+
+        bead .147 §1B: on a keyless (``auth="none"``) lane the key
+        provider returns ``None`` — the secrets set is just the capability
+        token (nothing else was ever put on the wire), so sealing works
+        unchanged on no-auth lanes.
 
         Deliberately checks raw registration (via
         ``CapabilityStore._exists``) rather than ``authorize`` — sealing a
@@ -565,4 +980,7 @@ class CredentialRelay:
         live = self._store._exists(token)
         if live is None:
             raise RelayError(f"unknown token {token!r}")
-        return frozenset({token, self._key_provider()})
+        real_key = self._key_provider()
+        if real_key is None:
+            return frozenset({token})
+        return frozenset({token, real_key})

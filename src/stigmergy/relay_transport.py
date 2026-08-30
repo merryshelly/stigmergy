@@ -103,6 +103,7 @@ from urllib.parse import urlsplit
 from stigmergy.container import dispatch_socket_path
 from stigmergy.critic_client import _NoRedirectHandler
 from stigmergy.relay import (
+    MISSING_USAGE_REQUESTED,
     CapabilityDenied,
     CredentialRelay,
     DenyResponse,
@@ -111,7 +112,10 @@ from stigmergy.relay import (
     RelayResponse,
     UpstreamRequest,
     _find_header,
+    extract_openai_usage,
     extract_usage,
+    openai_output_tokens,
+    parse_bearer_token,
     prepare_upstream,
 )
 
@@ -587,6 +591,188 @@ class _SseUsageMeter:
 
 
 # --------------------------------------------------------------------------- #
+# _OpenAiSseUsageMeter — bead .147 §1C: the OpenAI-wire incremental SSE meter #
+# --------------------------------------------------------------------------- #
+#
+# A SEPARATE, small state machine — deliberately NOT bolted onto
+# `_SseUsageMeter`/`_sse_event_usage_update` (spec §6: do not contort the
+# Anthropic pair). The OpenAI shape is structurally different:
+#
+#   - usage arrives ONLY in the FINAL `data:` chunk, and ONLY when the
+#     request carried `stream_options:{"include_usage":true}` (that
+#     requirement itself is the §1D policy deny's job — the meter just
+#     observes);
+#   - the stream ends with a `data: [DONE]` sentinel (informational here —
+#     the terminator is the stream's EOF, as for Anthropic);
+#   - the usage dict is `{"prompt_tokens": N, "completion_tokens": M, ...}`
+#     — the charge is `completion_tokens` (bead .147 §1C), and the FULL
+#     parsed dict (4-key set incl. `prompt_tokens_details.cached_tokens`
+#     and reasoning tokens from BOTH shapes) goes to the relay JSONL.
+#
+# Tri-state validity is the SAME discipline as `_SseUsageMeter` (bead .56
+# §8 fix A): `finalize()` returns a usage dict ONLY when a usage event was
+# positively determined with a valid non-negative `completion_tokens` int
+# (bool rejected); any invalid-present usage (negative/non-int/bool/None
+# value) or any parse failure is STICKY-unmeterable (a later valid value
+# must never rescue an earlier invalid one — the corrupt final answer may
+# be the true one). A stream that ends without a valid usage event
+# returns `None` (undetermined — the caller applies the pricing-class
+# re-scope: metered -> charge_unbudgetable, local -> 0 "accounting-only").
+#
+# Bounded like its Anthropic sibling: only the pending (not-yet-terminated)
+# event is retained, capped at `_MAX_SSE_EVENT_BYTES`; a complete event
+# over the cap is unmeterable. Never raises.
+
+
+def _is_valid_completion_tokens(value: Any) -> bool:
+    """A POSITIVELY-determined ``completion_tokens``: a valid non-negative
+    int (bool rejected) — the OpenAI-wire tri-state rule (spec §1C)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+class _OpenAiSseUsageMeter:
+    """Incremental, bounded OpenAI-wire SSE usage meter (bead .147 §1C)."""
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+        self.usage: dict | None = None
+        self.prompt_tokens: int | None = None
+        self._unmeterable = False
+
+    def feed(self, chunk: bytes) -> None:
+        """Append ``chunk`` and consume every complete SSE event (same
+        tolerant terminator matching as :class:`_SseUsageMeter`). Never
+        raises; non-bytes input transitions to ``_unmeterable``."""
+        if self._unmeterable:
+            return
+        if not isinstance(chunk, (bytes, bytearray)):
+            self._unmeterable = True
+            self.pending = bytearray()
+            return
+        try:
+            self.pending.extend(chunk)
+            data = bytes(self.pending)
+            pos = 0
+            for match in _SSE_EVENT_TERMINATOR.finditer(data):
+                if match.start() - pos > _MAX_SSE_EVENT_BYTES:
+                    self._unmeterable = True
+                    self.pending = bytearray()
+                    return
+                self._consume_event(data[pos : match.start()])
+                pos = match.end()
+            if pos:
+                del self.pending[:pos]
+            if len(self.pending) > _MAX_SSE_EVENT_BYTES:
+                self._unmeterable = True
+                self.pending = bytearray()
+        except Exception:  # noqa: BLE001 - never raise; fail closed instead
+            self._unmeterable = True
+            self.pending = bytearray()
+
+    def _consume_event(self, event_bytes: bytes) -> None:
+        text = event_bytes.decode("utf-8", errors="replace")
+        data_lines: list[str] = []
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if not line or line.startswith(":"):
+                continue  # blank / keep-alive comment
+            if line.startswith("data:"):
+                data_lines.append(line[len("data:") :].strip())
+        if not data_lines:
+            return
+        data_str = "\n".join(data_lines)
+        if data_str == "[DONE]":
+            return  # sentinel — informational; EOF is the real terminator
+        try:
+            parsed = json.loads(data_str)
+        except Exception:  # noqa: BLE001 - never raise; that event contributes nothing
+            return
+        if not isinstance(parsed, dict):
+            return
+        usage = parsed.get("usage")
+        if usage is None:
+            return  # a content chunk (delta) — no usage this event
+        # A usage-bearing event has arrived (the OpenAI contract: only the
+        # final chunk carries one). LAST-WINS: a later usage event fully
+        # replaces the earlier dict (mirrors Anthropic's cumulative
+        # last-`message_delta`-wins semantics).
+        if not isinstance(usage, dict):
+            # Present but not a dict (e.g. `null`/string) — a genuinely
+            # INVALID usage measurement, not "no opinion": sticky-unmeterable.
+            self._unmeterable = True
+            return
+        completion = usage.get("completion_tokens")
+        prompt = usage.get("prompt_tokens")
+        if isinstance(prompt, int) and not isinstance(prompt, bool):
+            self.prompt_tokens = prompt
+        self.usage = usage
+        if not _is_valid_completion_tokens(completion):
+            # Present-but-invalid completion_tokens (negative / non-int /
+            # bool / missing / null): this IS the final-usage signal and it
+            # is corrupt — sticky-unmeterable. A later valid value must
+            # never rescue it (bead .56 round 3, §9 fix H, same
+            # discipline).
+            self._unmeterable = True
+
+    def finalize(self) -> dict | None:
+        """Flush any unterminated tail as a final event, then return the
+        positively-determined usage dict — or ``None`` when undetermined
+        (no usage event, or the meter went unmeterable). The caller MUST
+        then apply the pricing-class re-scope (metered: unbudgetable;
+        local: accounting-only 0), never guess."""
+        if not self._unmeterable and self.pending:
+            tail = bytes(self.pending)
+            self.pending = bytearray()
+            if len(tail) > _MAX_SSE_EVENT_BYTES:
+                self._unmeterable = True
+            else:
+                self._consume_event(tail)
+        if self._unmeterable:
+            return None
+        if self.usage is None:
+            return None
+        # Re-validate on finalize: `usage` may have been set by an event
+        # that later went unmeterable was caught above; here `usage` is the
+        # LAST usage event's dict and the meter is clean, but the
+        # completion_tokens check is the POSITIVE determination itself.
+        completion = self.usage.get("completion_tokens")
+        if not _is_valid_completion_tokens(completion):
+            return None
+        return self.usage
+
+    def usage_snapshot(self) -> dict:
+        """The 4-key CV/quota-governor feed for the relay JSONL (bead .147
+        §1C), best-effort from whatever parsed (empty when nothing did):
+        ``prompt_tokens``, ``completion_tokens``,
+        ``prompt_tokens_details.cached_tokens``, and reasoning tokens from
+        BOTH observed shapes (Synthetic/SGLang top-level
+        ``usage.reasoning_tokens``; OpenAI-standard nested
+        ``completion_tokens_details.reasoning_tokens``)."""
+        if self.usage is None:
+            return {}
+        usage = self.usage
+        out: dict[str, Any] = {}
+
+        def _int(value: Any) -> int | None:
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+            v = _int(usage.get(key))
+            if v is not None:
+                out[key] = v
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            v = _int(details.get("cached_tokens"))
+            if v is not None:
+                out["cached_tokens"] = v
+        completion_details = usage.get("completion_tokens_details")
+        if isinstance(completion_details, dict):
+            v = _int(completion_details.get("reasoning_tokens"))
+            if v is not None and "reasoning_tokens" not in out:
+                out["reasoning_tokens"] = v
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # Origin-form path validation (F1, bead .55) — layer 1 of the netloc-pinning   #
 # defense: a worker-controlled request path must never be able to steer the   #
 # upstream connection target when string-concatenated onto ``base_url``.      #
@@ -847,6 +1033,33 @@ def make_urllib_forwarder(
                     method=upstream.request.method,
                 )
                 resp = opener.open(req, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                # spec §1E (bead .147): upstream NON-2xx bodies are forwarded
+                # verbatim and (for 429) logged — a 4xx/5xx is a REAL
+                # response, not a transport failure. urllib RAISES
+                # ``HTTPError`` for any status the handler chain does not
+                # return as-is (``HTTPErrorProcessor`` only returns 2xx;
+                # the ``_NoRedirectHandler`` chain keeps HTTPError
+                # processing), so without this branch every real 4xx/5xx
+                # (including the Synthetic 429 the quota-governor feed
+                # exists to capture) would be misread as a synthesized 502
+                # `upstream-error` — the body never reaches the worker and
+                # is never logged. Treat a 4xx/5xx HTTPError as the response
+                # itself (its status, its headers, its body — all readable
+                # off the HTTPError). A 3xx HTTPError (a redirect refused by
+                # ``_NoRedirectHandler``) is NOT a terminal response — the
+                # key-bearing request must never be re-sent — so it stays
+                # an UpstreamError (the .36/.55 no-redirect guard,
+                # unchanged).
+                if 400 <= exc.code <= 599:
+                    resp = exc
+                else:
+                    err = UpstreamError(f"upstream request failed: {exc.__class__.__name__}")
+                    try:
+                        loop.call_soon_threadsafe(_set_head_exception, err)
+                    except RuntimeError:
+                        pass
+                    return
             except Exception as exc:  # noqa: BLE001 - fail closed, never leak exc details
                 err = UpstreamError(f"upstream request failed: {exc.__class__.__name__}")
                 try:
@@ -994,11 +1207,57 @@ def _build_response_head(status: int, headers: list[tuple[str, str]]) -> bytes:
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 
-async def _write_deny_response(writer: asyncio.StreamWriter, status: int) -> None:
+# --------------------------------------------------------------------------- #
+# bead .147 §1E (`.134` relay half): machine-readable deny                   #
+# --------------------------------------------------------------------------- #
+#
+# Every relay deny (401/403/429/422 + the .56 synthesized 400/502/500)
+# gains a JSON body `{"error":{"type":"stigmergy_relay_deny","reason":
+# "<reason>"}}` plus an `x-stigmergy-deny-reason: <reason>` header.
+# Body-ADDITIVE and status-preserving: clients that parsed the pre-`.147`
+# empty deny bodies still work (they key on the status line). `<reason>`
+# is the fixed-vocabulary reason already carried by the log entry — the
+# CapabilityDenied reasons (`missing-capability`/`unknown`/`revoked`/
+# `quota-calls`/`quota-tokens`), the transport's `forbidden-endpoint` /
+# `malformed-request` / `upstream-error` / `handler-exception`, and the
+# `.147` policy deny `missing-usage-requested`. Never a free-text value,
+# never a worker-controlled string.
+
+_DENY_TYPE_MARKER = "stigmergy_relay_deny"
+_DENY_REASON_HEADER = "x-stigmergy-deny-reason"
+# Bounded capture for the JSONL feed (the future quota governor's only
+# input): an upstream 429 body (verbatim, the Synthetic shape is
+# unobserved — first occurrence must be recoverable from the log) and the
+# `x-synthetic-quotas` response header. 4 KiB each, generous vs any real
+# error body, tight vs an adversarial upstream.
+_MAX_CAPTURED_429_BODY = 4 * 1024
+_MAX_CAPTURED_QUOTAS_HEADER = 1024
+
+
+def _deny_marker_body(reason: str) -> bytes:
+    """The machine-readable deny body (bead .147 §1E). ``reason`` is
+    ASCII-safe by construction (fixed vocabulary); latin-1 keeps the
+    serialization total even if a future reason ever isn't."""
+    return (
+        json.dumps({"error": {"type": _DENY_TYPE_MARKER, "reason": reason}}) + "\n"
+    ).encode("latin-1")
+
+
+async def _write_deny_response(
+    writer: asyncio.StreamWriter, status: int, *, reason: str
+) -> None:
     phrase = http.client.responses.get(status, "Error")
-    head = f"HTTP/1.1 {status} {phrase}\r\nConnection: close\r\n\r\n".encode("latin-1")
+    body = _deny_marker_body(reason)
+    head = (
+        f"HTTP/1.1 {status} {phrase}\r\n"
+        f"{_DENY_REASON_HEADER}: {reason}\r\n"
+        f"content-type: application/json\r\n"
+        f"content-length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("latin-1")
     try:
         writer.write(head)
+        writer.write(body)
         await writer.drain()
     except (OSError, ConnectionError):
         pass
@@ -1033,6 +1292,18 @@ async def _handle_connection(
     # worker's beta selection is AUDITED, not invisible — the observability half
     # of the decision-5b posture (server-side-tool betas would bypass the cage).
     beta: str | None = None
+    # bead .147 §1E: the per-request JSONL profile fields (explicit, not
+    # inferred) + the quota-governor feed captures. `usage` is the 4-key
+    # OpenAI usage dict (JSONL feed) or the parsed Anthropic usage dict;
+    # `synthetic_quotas` is the bounded `x-synthetic-quotas` response
+    # header; `upstream_429_body` is the bounded VERBATIM upstream 429 body
+    # (the Synthetic 429 shape is unobserved — first occurrence must be
+    # recoverable from the log).
+    wire = relay._wire
+    pricing_class = relay._pricing_class
+    usage: dict | None = None
+    synthetic_quotas: str | None = None
+    upstream_429_body: str | None = None
     try:
         try:
             request = await read_relay_request(
@@ -1045,17 +1316,104 @@ async def _handle_connection(
             status = 400
             decision = "deny"
             reason = "malformed-request"
-            await _write_deny_response(writer, status)
+            await _write_deny_response(writer, status, reason=reason)
             return
 
         beta = _find_header(request.headers, "anthropic-beta")
+
+        # bead .147 §1D — `stream_options` VERIFY-DON'T-MUTATE. For METERED
+        # OpenAI lanes with `"stream": true` the request MUST carry
+        # `stream_options.include_usage == true` (the driver contract; this
+        # is the backstop that makes metering possible-by-construction).
+        #
+        # ORDERING (spec §1D, normative): the body check runs BETWEEN
+        # authorize and reserve, gated on a STANDALONE authorize pre-check:
+        #   1. bearer-parsed capability lookup via `relay._store.authorize`
+        #      (a PURE store read — it never calls `key_provider`, so the
+        #      real key is not fetched by the pre-check);
+        #   2. a DEAD/unknown/missing token (or one already quota-exhausted)
+        #      skips the body check and falls through to
+        #      prepare_upstream's CANONICAL 401/429 deny (a dead capability
+        #      is an auth failure, never a 422 policy deny);
+        #   3. only a LIVE token reaches the body check: `stream:true`
+        #      without `stream_options.include_usage:true` (or an
+        #      unparseable body) -> deny 422 `missing-usage-requested`,
+        #      with NO prepare_upstream call (the key is never fetched) and
+        #      nothing charged (a policy deny, distinct from the .56 §C
+        #      no-unmetered-retry property, which concerns FORWARDED calls —
+        #      nothing is forwarded here).
+        # There is NO `await` between the pre-check and prepare_upstream
+        # (`authorize`, `json.loads`, and `prepare_upstream` are all
+        # synchronous; the only `await` in this block is the 422 deny write,
+        # which returns before prepare_upstream is ever reached) — so the
+        # .56 max_calls TOCTOU guard (reserve atomically with authorize, no
+        # event-loop interleaving in the gap) is preserved exactly.
+        # No body rewriting EVER (no parse→re-serialize of a worker-
+        # controlled body in the highest-security component): the body is
+        # parsed read-only for this check and forwarded byte-identical on
+        # the allow path. `local` lanes: no requirement (accounting-only
+        # metering tolerates a missing usage event). `wire="anthropic"`:
+        # NO body inspection at all (today's byte-for-byte behaviour).
+        if wire == "openai" and pricing_class == "metered":
+            # (1) Standalone authorize pre-check — bearer-parsed, no key
+            # fetch (authorize is a pure store read).
+            precheck_token = _find_header(request.headers, relay._capability_header)
+            if precheck_token is not None and (
+                relay._capability_header.lower() == "authorization"
+            ):
+                precheck_token = parse_bearer_token(precheck_token)
+            token_live = False
+            if precheck_token is not None:
+                try:
+                    relay._store.authorize(precheck_token)
+                    token_live = True
+                except CapabilityDenied:
+                    token_live = False
+            # (2)+(3) A dead/missing token falls through to
+            # prepare_upstream's canonical deny; only a LIVE token is
+            # subject to the stream_options policy check.
+            if token_live:
+                body_obj: Any = None
+                if request.body:
+                    try:
+                        body_obj = json.loads(request.body)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        body_obj = None
+                if not isinstance(body_obj, dict):
+                    # Live token, metered OpenAI lane, but the body is
+                    # unparseable/empty/non-object: the flag CANNOT be
+                    # verified — "never guess" (spec §1D): deny 422, nothing
+                    # forwarded, nothing charged, key never fetched (no
+                    # prepare_upstream call).
+                    status = 422
+                    decision = "deny"
+                    reason = MISSING_USAGE_REQUESTED
+                    await _write_deny_response(writer, status, reason=reason)
+                    return
+                streaming = body_obj.get("stream") is True
+                if streaming:
+                    stream_options = body_obj.get("stream_options")
+                    include_usage = (
+                        isinstance(stream_options, dict)
+                        and stream_options.get("include_usage") is True
+                    )
+                    if not include_usage:
+                        # Live token, streaming, but usage not requested:
+                        # deny 422, marker reason, nothing forwarded,
+                        # nothing charged, key never fetched (no
+                        # prepare_upstream call).
+                        status = 422
+                        decision = "deny"
+                        reason = MISSING_USAGE_REQUESTED
+                        await _write_deny_response(writer, status, reason=reason)
+                        return
 
         prepared = prepare_upstream(relay, request)
         if isinstance(prepared, DenyResponse):
             status = prepared.status
             decision = "deny"
             reason = prepared.reason
-            await _write_deny_response(writer, status)
+            await _write_deny_response(writer, status, reason=reason)
             return
 
         # RESERVE the call slot NOW — atomically with authorize (no `await`
@@ -1079,7 +1437,7 @@ async def _handle_connection(
             status = 401
             decision = "deny"
             reason = exc.reason
-            await _write_deny_response(writer, status)
+            await _write_deny_response(writer, status, reason=reason)
             return
 
         # F5 round 2 (bead .56, §8 fix C / review-56-codex.md MAJOR-3): the
@@ -1133,9 +1491,36 @@ async def _handle_connection(
                 # forwarded to the worker. §9 fix I: any OTHER (or absent)
                 # media type is fed to neither accumulator — nothing is
                 # retained for it, and it is unbudgetable below.
-                meter = _SseUsageMeter() if is_sse else None
+                # bead .147 §1C: wire-selected metering accumulators. The
+                # Anthropic pair (`_SseUsageMeter` / `extract_usage`) is
+                # UNTOUCHED for `wire="anthropic"`; the OpenAI wire gets its
+                # own small state machine (`_OpenAiSseUsageMeter`, §1C) and
+                # the OpenAI JSON extractor (`extract_openai_usage`).
+                if wire == "openai":
+                    meter = None
+                    openai_meter = _OpenAiSseUsageMeter() if is_sse else None
+                else:
+                    meter = _SseUsageMeter() if is_sse else None
+                    openai_meter = None
                 json_tee = bytearray()
                 json_overflow = False
+
+                # bead .147 §1E: bounded capture of the quota-governor feed
+                # — `x-synthetic-quotas` (first header value, capped) on
+                # every response, and the upstream 429 body VERBATIM (capped)
+                # on every 429 — the Synthetic 429 shape is unobserved, the
+                # first occurrence must be recoverable from the JSONL. The
+                # 429 body has its OWN bounded buffer (independent of the
+                # metering accumulators, which may be off for non-JSON
+                # content types or overflowed).
+                capture_429 = head.status == 429
+                if capture_429:
+                    upstream_429_body = ""
+                quotas_values = [
+                    v.strip() for (k, v) in head.headers if k.lower() == "x-synthetic-quotas"
+                ]
+                if quotas_values:
+                    synthetic_quotas = quotas_values[0][:_MAX_CAPTURED_QUOTAS_HEADER]
 
                 writer.write(_build_response_head(head.status, head.headers))
                 head_written = True
@@ -1143,14 +1528,20 @@ async def _handle_connection(
                 async for chunk in chunks:
                     writer.write(chunk)
                     await writer.drain()
-                    if is_sse:
+                    if is_sse and meter is not None:
                         meter.feed(chunk)
-                    elif is_json and not json_overflow:
+                    elif is_sse and openai_meter is not None:
+                        openai_meter.feed(chunk)
+                    if is_json and not json_overflow:
                         if len(json_tee) + len(chunk) > _MAX_JSON_METER_BYTES:
                             json_overflow = True
                             json_tee = bytearray()
                         else:
                             json_tee.extend(chunk)
+                    if capture_429 and upstream_429_body is not None:
+                        upstream_429_body += chunk.decode("utf-8", errors="replace")
+                        if len(upstream_429_body) > _MAX_CAPTURED_429_BODY:
+                            upstream_429_body = upstream_429_body[:_MAX_CAPTURED_429_BODY]
         except Exception:  # noqa: BLE001 - forwarder/stream failure or deadline, fail closed
             if not head_written:
                 # A timeout/failure BEFORE the head was ever written toward
@@ -1165,7 +1556,7 @@ async def _handle_connection(
                 # `finally` below closes `chunks` if the forwarder somehow
                 # returned one before this branch was reached (it did not
                 # here, but kept uniform for any future forwarder shape).
-                await _write_deny_response(writer, status)
+                await _write_deny_response(writer, status, reason=reason)
                 return
             # A timeout/failure AFTER the head was already sent (mid-stream
             # truncation, or the deadline firing during the stream loop):
@@ -1212,14 +1603,41 @@ async def _handle_connection(
             # `except` below (which would synthesize a 500 and, worse,
             # leave the capability's usage un-reconciled/live).
             try:
+                # (usage, output_tokens) — `usage` is the FULL parsed usage
+                # dict for the JSONL feed (bead .147 §1C: the 4-key OpenAI
+                # set / the Anthropic usage object); `output_tokens` is the
+                # tri-state-validated charge value (None = undetermined).
                 if unsupported_encoding:
                     # §8 fix B: never trust a parsed usage value from a
                     # compressed/unrecognized 2xx representation.
+                    usage = None
                     output_tokens = None
+                elif wire == "openai":
+                    if is_sse:
+                        # bead .147 §1C: the separate OpenAI SSE state
+                        # machine — usage only in the final chunk (when
+                        # requested), `[DONE]` sentinel, same tri-state
+                        # validity as the Anthropic meter.
+                        usage = openai_meter.finalize() if openai_meter is not None else None
+                        output_tokens = openai_output_tokens(usage)
+                    elif is_json:
+                        if json_overflow:
+                            usage = None
+                            output_tokens = None
+                        else:
+                            usage = extract_openai_usage(
+                                RelayResponse(status=head.status, headers={}, body=bytes(json_tee))
+                            )
+                            output_tokens = openai_output_tokens(usage)
+                    else:
+                        usage = None
+                        output_tokens = None
                 elif is_sse:
+                    usage = None
                     output_tokens = meter.finalize()
                 elif is_json:
                     if json_overflow:
+                        usage = None
                         output_tokens = None
                     else:
                         usage = extract_usage(
@@ -1244,10 +1662,12 @@ async def _handle_connection(
                     # representations (text/event-stream, application/json)
                     # is unmeterable — nothing was accumulated for it, and
                     # this relay must never guess.
+                    usage = None
                     output_tokens = None
             except Exception:  # noqa: BLE001 - bounded-parser failure after a
                 # delivered 200 fails closed (unbudgetable), never a 500 that
                 # would leave the capability's usage un-reconciled/live.
+                usage = None
                 output_tokens = None
 
             if stream_error:
@@ -1256,14 +1676,26 @@ async def _handle_connection(
                 # truncate-to-avoid-charge bypass (a compromised worker
                 # aborting right before the final usage delta must not
                 # dodge metering).
+                usage = None
                 output_tokens = None
 
             if output_tokens is None:
-                try:
-                    relay._store.charge_unbudgetable(prepared.token)
-                except CapabilityDenied:
-                    pass
-                reason = "unbudgetable"
+                # bead .147 §1C re-scope: saturation ONLY on metered
+                # pricing classes. `local` lanes are accounting-only — a
+                # metering gap charges 0 (best-effort), never saturates a
+                # $0 capability; the JSONL reason records WHY.
+                if pricing_class == "metered":
+                    try:
+                        relay._store.charge_unbudgetable(prepared.token)
+                    except CapabilityDenied:
+                        pass
+                    reason = "unbudgetable"
+                else:
+                    try:
+                        relay._store.charge(prepared.token, output_tokens=0, calls=0)
+                    except CapabilityDenied:
+                        pass
+                    reason = "accounting-only"
             else:
                 # Reconcile output tokens only — the call slot was reserved
                 # (calls=1) before the forward, so this must NOT re-count
@@ -1287,7 +1719,7 @@ async def _handle_connection(
         # head has gone out yet; otherwise just let `finally` close.
         if not head_written:
             try:
-                await _write_deny_response(writer, 500)
+                await _write_deny_response(writer, 500, reason=reason)
             except Exception:  # noqa: BLE001
                 pass
     finally:
@@ -1300,6 +1732,17 @@ async def _handle_connection(
                 "reason": reason,
                 "status": status,
                 "anthropic_beta": beta,
+                # bead .147 §1E: the profile fields explicit on EVERY line
+                # (not just denies), + the quota-governor feed (the 4-key
+                # OpenAI usage dict on the OpenAI wire, the parsed usage
+                # object otherwise; bounded captures on 429s / synthetic
+                # quota headers). Never the capability token, never the
+                # real key, never full request/response bodies.
+                "wire": wire,
+                "pricing_class": pricing_class,
+                "usage": usage,
+                "synthetic_quotas": synthetic_quotas,
+                "upstream_429_body": upstream_429_body,
             },
         )
         try:
