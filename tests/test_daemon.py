@@ -2081,7 +2081,6 @@ def test_harvest_failure_with_escape_check_falls_through_to_normal_outcome(
     (green Tier-1 -> PARKED). The harvest failure does not break the dispatch."""
     add_dispatchable_ticket(env, "t-1", attempts_used=0, current_rung="cheap")
     # BadFilingSpawn writes malformed JSON
-    daemon = make_daemon(env, spawn_fn=BadFilingSpawn())
     # Checks pass
     run_checks_fn = ScriptedChecks([pass_result("pytest")])
     daemon = make_daemon(env, spawn_fn=BadFilingSpawn(), run_checks_fn=run_checks_fn)

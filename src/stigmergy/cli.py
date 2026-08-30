@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -770,11 +771,12 @@ def _cmd_intake(args: argparse.Namespace) -> int:
             "rubric_only",
             "work_product",
         }
-        manifest_ids = set()
-
+        # Count occurrences of each id in the manifest (single O(n) pass)
+        id_counts = Counter()
         for entry in manifest:
             if isinstance(entry, dict) and "id" in entry:
-                manifest_ids.add(entry["id"])
+                id_counts[entry["id"]] += 1
+        manifest_ids = set(id_counts.keys())
 
         # Second pass: validate all entries before inserting anything
         entries_to_insert: list[dict[str, Any]] = []
@@ -812,12 +814,9 @@ def _cmd_intake(args: argparse.Namespace) -> int:
                 )
                 return 1
 
-            # Check for duplicate ids within the manifest (counting in manifest_ids)
+            # Check for duplicate ids within the manifest using pre-computed counts
             entry_id = entry["id"]
-            count_in_manifest = sum(
-                1 for e in manifest if isinstance(e, dict) and e.get("id") == entry_id
-            )
-            if count_in_manifest > 1:
+            if id_counts[entry_id] > 1:
                 print(
                     f"stigmergy intake: manifest entry {idx} ({entry_id}) has duplicate id",
                     file=sys.stderr,

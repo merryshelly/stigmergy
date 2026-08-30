@@ -1685,6 +1685,40 @@ def test_intake_duplicate_id_in_manifest(tmp_path: Path, capsys) -> None:
     assert _ticket(rigs_root, "t-duplicate") is None
 
 
+def test_intake_unresolved_blocks_predecessor_rejected(tmp_path: Path, capsys) -> None:
+    """Test intake rejects manifest with unresolved blocks reference.
+
+    Regression test: lock in the existing unresolved-blocks rejection behavior
+    in the intake manifest handler so a future refactor cannot silently drop it.
+    """
+    rigs_root = scaffold_rig(tmp_path)
+
+    manifest = [
+        {
+            "id": "t-dependent",
+            "title": "Dependent ticket",
+            "functional_summary": "Operator-facing: depends on unknown ticket.",
+            "acceptance_criteria": ["done"],
+            "target_scope": ["src/"],
+            "blocks": ["t-nonexistent"],  # references a ticket that does not exist
+        },
+    ]
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest))
+
+    rc = main(
+        ["intake", "--rig", RIG, "--rigs-root", str(rigs_root), "--manifest", str(manifest_file)]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unresolved predecessor" in err
+    assert "t-nonexistent" in err
+
+    # Verify no tickets were created (even the dependent one)
+    assert _ticket(rigs_root, "t-dependent") is None
+    assert _ticket(rigs_root, "t-nonexistent") is None
+
+
 def test_ticket_detail_still_works_unchanged(tmp_path: Path, capsys) -> None:
     """Regression test: ticket <id> show-detail subcommand still works."""
     rigs_root = scaffold_rig(tmp_path)
