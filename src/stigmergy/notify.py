@@ -290,7 +290,7 @@ class NtfyNotifier:
         return {"delivered": delivered, "still_pending": still_pending, "attempted": len(pending)}
 
 
-def make_ntfy_sender(server_url: str) -> Sender:
+def make_ntfy_sender(server_url: str, *, token: str | None = None) -> Sender:
     """Build the production :data:`Sender`: stdlib-only (`urllib.request`)
     HTTP POST to ``f"{server_url}/{topic}"`` with the title carried in the
     ``Title`` header and the message as the request body (ntfy's plain-HTTP
@@ -298,17 +298,31 @@ def make_ntfy_sender(server_url: str) -> Sender:
     any network error — :meth:`NtfyNotifier.deliver_pending` treats any
     raise from the injected sender as one retryable failure, never a crash.
 
+    ``token`` (bead .117): OPTIONAL bearer credential for servers that
+    require auth to PUBLISH (confirmed live 2026-08-31: the self-hosted
+    server 403s anonymous publishes, silently eating every escalation —
+    ``records/notifications.jsonl`` showed ~100 retries per intent with
+    ``delivered_at: null``). When set, the POST carries
+    ``Authorization: Bearer <token>``; when ``None`` (the default) NO
+    Authorization header is emitted — never ``Bearer None``, never a
+    placeholder (the `.147` F1 discipline for optional credentials). The
+    value arrives via the ``STIGMERGY_NTFY_TOKEN`` env var at daemon
+    launch (cli wiring) — never inlined in a charter.
+
     NOT exercised by this module's tests (which inject fakes); this is the
     production default, wired in later by the daemon/CLI integration.
     """
 
     def sender(topic: str, title: str, message: str) -> None:
         url = f"{server_url.rstrip('/')}/{topic}"
+        headers: dict[str, str] = {"Title": title}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(  # noqa: S310 - fixed ntfy server URL, not user input
             url,
             data=message.encode("utf-8"),
             method="POST",
-            headers={"Title": title},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310

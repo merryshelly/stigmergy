@@ -289,7 +289,7 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     notification_store = NotificationStore(records_dir / "notifications.jsonl")
     notifier = NtfyNotifier(
         charter.raw["notify"]["ntfy_topic"],
-        sender=make_ntfy_sender(_ntfy_server()),
+        sender=make_ntfy_sender(_ntfy_server(), token=_ntfy_token()),
     )
 
     budgets_cfg = charter.raw["loop"]["budgets"]
@@ -1362,10 +1362,22 @@ _DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 _NTFY_SERVER_ENV_VAR = "STIGMERGY_NTFY_SERVER"  # deliberately NOT an SG_ charter
 # override (those are schema-validated against the charter's known key set; ntfy
 # server url is not, and is not, a charter field in the current schema).
+# bead .117: the self-hosted server requires auth to PUBLISH (confirmed live
+# 2026-08-31 — every escalation 403'd silently). The bearer token arrives via
+# the same launch-env channel (never a charter field, never inlined); the
+# production value lives at /etc/ntfy/alert-token (root:openalph 640) and the
+# launch recipe sets STIGMERGY_NTFY_TOKEN from it. Empty/absent -> None -> no
+# Authorization header (never "Bearer None").
+_NTFY_TOKEN_ENV_VAR = "STIGMERGY_NTFY_TOKEN"
 
 
 def _ntfy_server() -> str:
     return os.environ.get(_NTFY_SERVER_ENV_VAR, _DEFAULT_NTFY_SERVER)
+
+
+def _ntfy_token() -> str | None:
+    value = os.environ.get(_NTFY_TOKEN_ENV_VAR, "").strip()
+    return value or None
 
 
 _DEFAULT_PROTECTED_PATHS = (

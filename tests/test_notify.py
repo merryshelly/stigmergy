@@ -12,6 +12,7 @@ ready for the next retry.
 
 from __future__ import annotations
 
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -196,3 +197,63 @@ def test_tolerant_reader_skips_torn_tail(store: NotificationStore, store_path: P
     pending = store.pending()
     assert len(pending) == 1
     assert pending[0].intent_id == intent.intent_id
+
+
+# --- bead .117: bearer-token auth on the production sender ------------------
+# The self-hosted ntfy server now REQUIRES auth to publish (confirmed live
+# 2026-08-31, execdogfood01: every escalation POST 403'd ~100 retries,
+# delivered_at:null). make_ntfy_sender gains an OPTIONAL bearer token —
+# absent token = byte-identical pre-.117 behavior (no Authorization header).
+
+
+class _CapturingURLOpener:
+    """Monkeypatch stand-in for urllib.request.urlopen that records the
+    request's headers and returns a minimal 200 response."""
+
+    def __init__(self) -> None:
+        self.requests: list[urllib.request.Request] = []
+
+    def __call__(self, request: urllib.request.Request, timeout: float | None = None):
+        self.requests.append(request)
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+
+def test_ntfy_sender_with_token_sends_bearer_header(monkeypatch) -> None:
+    """bead .117: a configured token rides `Authorization: Bearer <token>`
+    on the publish POST — the self-hosted server 403s anonymous publishes."""
+    import urllib.request
+
+    from stigmergy.notify import make_ntfy_sender
+
+    capture = _CapturingURLOpener()
+    monkeypatch.setattr(urllib.request, "urlopen", capture)
+    sender = make_ntfy_sender("http://127.0.0.1:8090", token="secret-token-value")
+    sender("stigmergy", "t", "m")
+    assert len(capture.requests) == 1
+    auth = capture.requests[0].headers.get("Authorization")
+    assert auth == "Bearer secret-token-value"
+
+
+def test_ntfy_sender_without_token_sends_no_authorization_header(monkeypatch) -> None:
+    """Byte-identical pre-.117 default: token=None emits NO Authorization
+    header (never `Bearer None`, never a placeholder — the .147 F1
+    discipline for optional credentials)."""
+    import urllib.request
+
+    from stigmergy.notify import make_ntfy_sender
+
+    capture = _CapturingURLOpener()
+    monkeypatch.setattr(urllib.request, "urlopen", capture)
+    sender = make_ntfy_sender("http://127.0.0.1:8090")
+    sender("stigmergy", "t", "m")
+    assert "Authorization" not in capture.requests[0].headers
