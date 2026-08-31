@@ -189,10 +189,22 @@ def heartbeat(store: Any, ticket_id: str, *, now: float, ttl_seconds: float) -> 
     )
 
 
+#: The only states in which a ticket may legitimately carry a lease.
+#: Anything else with a stale lease row is either terminal (`landed`/
+#: `rejected`/`done`), mid-pipeline (`parked`/`gated`/`tier1_green` —
+#: demotion would corrupt its pipeline position), or `escalated` (whose
+#: re-entry is the operator's `resume` verb, never a silent expiry).
+#: Caught live on quotagov01 2026-08-31: a daemon restart's recover()
+#: sweep demoted 3 landed + 1 escalated tickets whose land/escalation
+#: paths had left stale lease columns behind.
+_EXPIRABLE_STATES: frozenset[str] = frozenset({"claimed", "in_flight"})
+
+
 def expire_leases(store: Any, *, now: float) -> list[str]:
     """Reset every orphaned (expired-lease) ticket back to `pool`.
 
-    A ticket qualifies iff it carries a non-``None`` `lease_expires_at`
+    A ticket qualifies iff it is in an active-dispatch state
+    (`claimed`/`in_flight`) AND carries a non-``None` `lease_expires_at`
     strictly less than ``now``. For each: `state` resets to `pool` and all
     four lease fields (`lease_owner`, `lease_dispatch_id`,
     `lease_expires_at`, `lease_heartbeat_at`) clear to `None` — recoverable
@@ -200,11 +212,17 @@ def expire_leases(store: Any, *, now: float) -> list[str]:
     are lifetime-per-ticket counters (SPEC §9 "Retry semantics") and are
     never named here, so they are never touched by expiry.
 
+    Tickets in any other state are never demoted, even if their rows carry
+    stale lease columns (terminal states are final; escalated re-entry is
+    operator-authority via `resume`).
+
     Returns the expired ticket ids, sorted for determinism.
     """
     expired: list[str] = []
     for row in store.list_tickets():
         expires_at = row.get("lease_expires_at")
+        if row.get("state") not in _EXPIRABLE_STATES:
+            continue
         if expires_at is not None and expires_at < now:
             store.update_ticket(
                 row["id"],

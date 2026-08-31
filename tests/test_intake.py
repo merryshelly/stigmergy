@@ -367,6 +367,72 @@ def test_expire_leases_resets_orphan_and_spares_lifetime_counters(store: RigStor
     assert row["integration_failures"] == 1
 
 
+def test_expire_leases_never_demotes_non_dispatch_states(store: RigStore) -> None:
+    """Lease case 10b (caught live on quotagov01 2026-08-31): a daemon
+    restart ran recover() -> expire_leases, which demoted LANDED and
+    ESCALATED tickets to pool because their rows still carried stale
+    lease columns from their dispatch days. Only a ticket in an
+    active-dispatch state (`claimed`/`in_flight`) may be lease-expired:
+    terminal states are final, and ESCALATED re-entry is the operator's
+    `resume` verb — never a silent expiry.
+    """
+    steering = base_steering()
+    execution = base_execution()
+
+    # A landed ticket whose land path left stale lease columns behind.
+    store.add_ticket(id="t-landed", title="Landed", state="pool")
+    approve(store, "t-landed", steering=steering)
+    claim(
+        store,
+        "t-landed",
+        owner="worker-old",
+        dispatch_id="dispatch-old",
+        ttl_seconds=100,
+        now=3000.0,
+        steering=steering,
+        execution=execution,
+    )
+    store.update_ticket("t-landed", state="landed")
+
+    # An escalated ticket with a stale lease from the same dispatch.
+    store.add_ticket(id="t-escalated", title="Escalated", state="pool")
+    approve(store, "t-escalated", steering=steering)
+    claim(
+        store,
+        "t-escalated",
+        owner="worker-old2",
+        dispatch_id="dispatch-old2",
+        ttl_seconds=100,
+        now=3000.0,
+        steering=steering,
+        execution=execution,
+    )
+    store.update_ticket("t-escalated", state="escalated")
+
+    # A genuinely orphaned in-flight dispatch — the case expiry EXISTS for.
+    store.add_ticket(id="t-orphan", title="Orphan", state="pool")
+    approve(store, "t-orphan", steering=steering)
+    claim(
+        store,
+        "t-orphan",
+        owner="worker-9",
+        dispatch_id="dispatch-9",
+        ttl_seconds=100,
+        now=3000.0,
+        steering=steering,
+        execution=execution,
+    )
+
+    expired_ids = expire_leases(store, now=3200.0)
+
+    assert expired_ids == ["t-orphan"]
+    assert store.get_ticket("t-landed")["state"] == "landed"
+    assert store.get_ticket("t-landed")["lease_owner"] is not None  # untouched
+    assert store.get_ticket("t-escalated")["state"] == "escalated"
+    assert store.get_ticket("t-escalated")["lease_owner"] is not None  # untouched
+    assert store.get_ticket("t-orphan")["state"] == "pool"
+
+
 def test_expire_leases_ignores_tickets_with_no_lease_or_unexpired_lease(store: RigStore) -> None:
     steering = base_steering()
     execution = base_execution()
