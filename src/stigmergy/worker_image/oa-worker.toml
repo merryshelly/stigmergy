@@ -28,8 +28,14 @@
 name = "stigmergy-worker"
 default_model = "blackwell/qwen38-27b-fp8"
 max_tokens = 8192
-workspace = "/scratch"
 thinking = "off"
+
+# OA's config schema: the workspace is a TABLE with a `path` key
+# (config.py load path: `[workspace]` section, or inline
+# `[agent.workspace]` with `path`) — a bare `workspace = "..."` string on
+# [agent] is a load error ("Missing required field: workspace.path").
+[workspace]
+path = "/scratch"
 
 [providers.blackwell]
 type = "openai"

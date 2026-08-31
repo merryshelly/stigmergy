@@ -1481,3 +1481,43 @@ def test_provision_without_oa_wheelhouse_is_byte_identical(tmp_path, monkeypatch
     cf = (images_dir / "Containerfile").read_text()
     assert "wheels" not in cf
     assert "openalph" not in cf
+
+
+def test_oa_worker_toml_template_schema():
+    """bead .149: the packaged worker agent TOML must satisfy OA's REAL
+    config schema — proven the hard way in the wire smoke (a bare
+    `workspace = "..."` string on [agent] is a load error: "Missing
+    required field: workspace.path"; OA wants a [workspace] table with a
+    `path` key). Structural pins (tomllib parse, no OA import — AC9):
+
+    - [workspace] table with a non-empty `path` (the cage tmpfs /scratch);
+    - NO bare `workspace` string key on [agent];
+    - every provider is type=openai, points at the in-cage relay shim root
+      (http://127.0.0.1:18081, NO /v1 — the .147 worker-facing contract),
+      and authenticates via api_key_env (never an inlined api_key — a real
+      key must never be baked into an image);
+    - a default_model is present (the --model flag overrides per-dispatch).
+    """
+    import tomllib
+
+    template = Path(__file__).resolve().parents[1] / "src" / "stigmergy" / "worker_image" / "oa-worker.toml"
+    data = tomllib.loads(template.read_text(encoding="utf-8"))
+
+    agent = data["agent"]
+    assert "workspace" not in agent, "bare workspace string on [agent] is a load error"
+    assert agent["name"] == "stigmergy-worker"
+    assert isinstance(agent.get("default_model"), str) and agent["default_model"]
+
+    ws = data["workspace"]
+    assert isinstance(ws, dict) and isinstance(ws.get("path"), str) and ws["path"] == "/scratch"
+
+    providers = data["providers"]
+    assert providers, "worker TOML must define at least the blackwell provider"
+    for key, prov in providers.items():
+        assert prov["type"] == "openai", key
+        base = prov["base_url"]
+        assert base == "http://127.0.0.1:18081", (
+            f"{key}: base_url must be the in-cage relay shim root WITHOUT /v1, got {base!r}"
+        )
+        assert "api_key" not in prov, f"{key}: never bake a literal api_key into an image"
+        assert prov.get("api_key_env") == "OPENAI_API_KEY", key
