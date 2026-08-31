@@ -29,6 +29,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -920,29 +921,77 @@ def _build_oa_wheelhouse(wheels_dir: Path) -> None:
     available host-side at provision time, so the in-image install itself
     can be fully offline ``--no-index --find-links=/wheels``).
 
+    pip builds a directory source IN the source tree (setuptools writes
+    ``egg-info`` next to the package), and ``/opt/openalph`` is root-owned
+    and read-only for the rig owner — so the wheel is built from a
+    throwaway WRITABLE COPY (git/venv/caches excluded; the wheel bytes are
+    identical). Caught live in the .149 dogfood scaffold
+    ("Cannot update time stamp of directory 'src/openalph.egg-info'").
+
+    Two-step build, because the HOST python (3.13) and the WORKER IMAGE
+    python (3.11, bookworm) differ: ``pip wheel`` emits binary dependency
+    wheels tagged for the running interpreter (cp313), which the image's
+    pip (3.11, ``--no-index``) cannot install. So: (1) build the OA wheel
+    alone with ``--no-deps`` (pure-python, ``py3-none-any`` —
+    interpreter-agnostic); (2) resolve OA's dependency tree from THAT wheel
+    with ``pip download --python-version 311 --only-binary=:all:
+    --platform manylinux…`` so every binary dep lands as a cp311-compatible
+    wheel. Caught live in the .149 dogfood scaffold (podman build failed in
+    the in-image offline install).
+
     Raises :class:`RigError` on any pip failure — a broken wheelhouse must
     fail loud at scaffold time, not surface as an opaque build error in the
     digest-pinned ``build_image`` step. Module-level seam so tests can
     monkeypatch it (no real network in the unit suite)."""
     wheels_dir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            str(_OA_SOURCE_DIR),
-            "-w",
-            str(wheels_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    with tempfile.TemporaryDirectory(prefix="oa-wheelbuild-") as tmp:
+        tmp_src = Path(tmp) / "openalph-src"
+        shutil.copytree(
+            _OA_SOURCE_DIR,
+            tmp_src,
+            ignore=shutil.ignore_patterns(
+                ".git", ".venv", "__pycache__", "*.pyc", ".pytest_cache",
+                "sessions", "logs", "*.egg-info",
+            ),
+        )
+        oa_wheel = subprocess.run(  # noqa: S603
+            [
+                sys.executable, "-m", "pip", "wheel",
+                "--no-deps",
+                str(tmp_src),
+                "-w", str(wheels_dir),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if oa_wheel.returncode != 0:
+            raise RigError(
+                "openalph wheel build failed (exit "
+                f"{oa_wheel.returncode}): {oa_wheel.stderr.strip()}"
+            )
+        built = sorted(wheels_dir.glob("openalph-*.whl"))
+        if not built:
+            raise RigError("openalph wheel build produced no openalph-*.whl")
+        # Deps of the just-built wheel, resolved for the IMAGE interpreter.
+        dep_dl = subprocess.run(  # noqa: S603
+            [
+                sys.executable, "-m", "pip", "download",
+                str(built[-1]),
+                "-d", str(wheels_dir),
+                "--python-version", "311",
+                "--platform", "manylinux_2_17_x86_64",
+                "--platform", "manylinux2014_x86_64",
+                "--only-binary=:all:",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if dep_dl.returncode != 0:
         raise RigError(
-            f"openalph wheelhouse build failed (exit {result.returncode}): "
-            f"{result.stderr.strip()}"
+            "openalph dependency wheelhouse download failed (exit "
+            f"{dep_dl.returncode}): {dep_dl.stderr.strip()}"
         )
 
 
