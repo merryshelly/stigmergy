@@ -323,6 +323,10 @@ class Daemon:
         weaver: Weaver,
         container_reaper: ContainerReaper,
         steering_of: Callable[[str], dict[str, Any]],
+        # The DEFAULT (claude-code) driver — still the spawn_fn for any lane
+        # whose driver is not in `driver_registry`, and for ALL lanes when
+        # `driver_registry` is None (the pre-.149 shape; byte-identical
+        # behavior for every existing stub).
         spawn_fn: Callable[..., DispatchResult] = claude_code.spawn,
         run_checks_fn: Callable[..., list[CheckResult]] = checks.run_checks,
         egress_setup_fn: Callable[..., EgressHandle] | None = None,
@@ -338,6 +342,7 @@ class Daemon:
         owner: str = "daemon",
         relay_base_url: str = "http://127.0.0.1:0/stigmergy-relay-placeholder",
         image: str | None = None,
+        driver_registry: dict[str, Callable[..., DispatchResult]] | None = None,
     ) -> None:
         missing = [k for k in _REQUIRED_RIG_PATH_KEYS if k not in rig_paths]
         if missing:
@@ -357,6 +362,12 @@ class Daemon:
         self._container_reaper = container_reaper
         self._steering_of = steering_of
         self._spawn_fn = spawn_fn
+        # bead .149: per-lane driver selection (spec §2 decision 3: a
+        # concrete union, no Protocol). Maps a charter lane.driver value to
+        # that driver's spawn callable. With this None (the default — every
+        # existing stub/test), _driver_for returns self._spawn_fn for every
+        # lane: byte-identical to the pre-.149 behavior.
+        self._driver_registry: dict[str, Callable[..., DispatchResult]] | None = driver_registry
         self._run_checks_fn = run_checks_fn
         self._egress_setup_fn = egress_setup_fn
         self._egress_teardown_fn = egress_teardown_fn
@@ -710,6 +721,10 @@ class Daemon:
             relay_socket=relay_socket,
             prior_evidence=self._gather_prior_evidence(ticket_id),
             dispatch_id=real_dispatch_id,
+            # bead .149: the exec-lane branch of prepare_dispatch derives
+            # the in-cage worker_model from the registry entry's OA provider
+            # wiring — claude-code lanes never touch it (byte-identical path).
+            registry=self._registry,
         )
         # Reconcile the ticket's lease_dispatch_id to the REAL dispatch
         # identity now that prepare_dispatch has generated it — see module
@@ -790,6 +805,16 @@ class Daemon:
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_relay_runtime"
         return self._relay_setup_fn(dispatch_id, runtime_dir)
 
+    def _driver_for(self, lane: Any) -> Callable[..., DispatchResult]:
+        """bead .149: the spawn callable for ``lane.driver``. With a
+        driver_registry, an unknown driver value falls back to the default
+        ``spawn_fn`` — charter validation is the closed-set gate (the daemon
+        never invents a third driver); without a registry, the default is
+        always used (pre-.149 byte-identity)."""
+        if self._driver_registry is not None:
+            return self._driver_registry.get(lane.driver, self._spawn_fn)
+        return self._spawn_fn
+
     # -- dispatch cycle ---------------------------------------------------------
 
     def _run_dispatch_cycle(
@@ -813,7 +838,7 @@ class Daemon:
         dispatch_status_value = "none"
         try:
             t_start = self._now_fn()
-            result = self._spawn_fn(
+            result = self._driver_for(plan.lane)(
                 plan.task_pack,
                 plan.work_clone,
                 plan.model_cfg,

@@ -28,6 +28,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -38,6 +39,13 @@ from stigmergy import __version__
 from stigmergy.charter import Charter, CharterError, load_charter
 from stigmergy.container import build_image
 from stigmergy.registry import Registry, load_registry
+
+# bead .149: the host-side OA source the rig's worker wheelhouse is built
+# from (the provision station runs ON the rig owner's host, where network +
+# the OA checkout are available; the BAKE itself is fully offline via
+# --no-index). The in-cage agent TOML template shipped with the package.
+_OA_SOURCE_DIR = Path("/opt/openalph")
+_OA_WORKER_TOML = Path(__file__).parent / "worker_image" / "oa-worker.toml"
 
 # --- schema (SPEC.md §3 rig definition, §6 ticket work-order contract) -------
 
@@ -905,6 +913,39 @@ def _clone_repo(repo: str, dest: Path) -> None:
 # --- resolve: read-side inverse of create_rig -------------------------------
 
 
+def _build_oa_wheelhouse(wheels_dir: Path) -> None:
+    """bead .149: build the host-side openalph wheelhouse (spec §5:
+    ``pip wheel /opt/openalph -w <rig_root>/images/worker/wheels/`` — OA +
+    all deps incl. matrix-nio; heavy but one-time per rig; network is
+    available host-side at provision time, so the in-image install itself
+    can be fully offline ``--no-index --find-links=/wheels``).
+
+    Raises :class:`RigError` on any pip failure — a broken wheelhouse must
+    fail loud at scaffold time, not surface as an opaque build error in the
+    digest-pinned ``build_image`` step. Module-level seam so tests can
+    monkeypatch it (no real network in the unit suite)."""
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            str(_OA_SOURCE_DIR),
+            "-w",
+            str(wheels_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RigError(
+            f"openalph wheelhouse build failed (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+
+
 def provision_rig_image(rig_root: Path, charter: Charter, *, store: RigStore | None = None) -> str:
     """Build the per-rig worker image (bead .79) and record it in rig meta.
 
@@ -914,6 +955,15 @@ def provision_rig_image(rig_root: Path, charter: Charter, *, store: RigStore | N
     in-cage instead of dying ``command not found``. Deps are baked at BUILD
     time (provision has the `:registries` egress); the RUNTIME worker lane
     stays inference-only.
+
+    bead .149: ``[provision] oa_wheelhouse = true`` additionally bakes the
+    ``openalph`` worker stack into the image — a host-built wheelhouse
+    (``pip wheel /opt/openalph -w images/worker/wheels/``; network available
+    at PROVISION time, so the in-image install is fully offline
+    ``--no-index --find-links=/wheels``) + the packaged
+    ``worker_image/oa-worker.toml`` agent template copied to
+    ``/etc/openalph/agents/stigmergy-worker.toml``. Key absent (the default)
+    -> the generated Containerfile is byte-identical to the pre-.149 output.
 
     Only tools/deps are baked — NEVER the project package itself. A
     ``pip install -e .`` would make ``import <project>`` resolve to the stale
@@ -927,17 +977,36 @@ def provision_rig_image(rig_root: Path, charter: Charter, *, store: RigStore | N
     returns it. Opens its own store if one is not supplied.
     """
     base_image = charter.raw["rig"]["image"]
-    pip_specs = charter.raw.get("provision", {}).get("pip", [])
+    provision_cfg = charter.raw.get("provision", {})
+    pip_specs = provision_cfg.get("pip", [])
+    oa_wheelhouse = bool(provision_cfg.get("oa_wheelhouse", False))
 
     images_dir = rig_root / "images" / "worker"
     images_dir.mkdir(parents=True, exist_ok=True)
     lines = [f"FROM {base_image}"]
-    if pip_specs:
+    if oa_wheelhouse or pip_specs:
+        # The base worker image carries python3 but NOT python3-pip (node +
+        # python3 + git only) — bootstrap it exactly once when EITHER stack
+        # needs it.
         lines.append(
             "RUN apt-get update "
             "&& apt-get install -y --no-install-recommends python3-pip "
             "&& rm -rf /var/lib/apt/lists/*"
         )
+    if oa_wheelhouse:
+        # bead .149 (spec §5): the openalph worker stack, BEFORE the
+        # existing pip line (spec §5 ordering). (1) host-side wheelhouse
+        # (the one network step — at provision time, not build time); (2)
+        # the fully-offline in-image install; (3) the agent TOML.
+        _build_oa_wheelhouse(images_dir / "wheels")
+        lines.append("COPY wheels/ /wheels/")
+        lines.append(
+            "RUN pip3 install --break-system-packages --no-cache-dir "
+            "--no-index --find-links=/wheels openalph"
+        )
+        shutil.copy(_OA_WORKER_TOML, images_dir / "oa-worker.toml")
+        lines.append("COPY oa-worker.toml /etc/openalph/agents/stigmergy-worker.toml")
+    if pip_specs:
         lines.append(
             "RUN pip3 install --break-system-packages --no-cache-dir "
             + " ".join(shlex.quote(spec) for spec in pip_specs)

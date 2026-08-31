@@ -1,0 +1,42 @@
+# stigmergy-worker — the in-cage `openalph exec` worker agent (bead .149 §5).
+#
+# Provisioned to /etc/openalph/agents/stigmergy-worker.toml ONLY on rigs that
+# declare `[provision] oa_wheelhouse = true` (openalph is pip-installed from
+# the rig's host-built wheelhouse). The `openalph exec` driver launches
+# `openalph exec --agent stigmergy-worker ...` inside the hardened cage.
+#
+#   workspace = "/scratch"   -> the OA agent's WORKSPACE: SessionLog /
+#   flight-recorder JSONLs (full transcripts + the capability token) root
+#   under it, on the tmpfs that dies with the cage — they can NEVER land in
+#   the mounted git clone (spec .149 §2 decision 1). The PROCESS cwd is
+#   /work (the clone) — set by the driver's --workdir — so OA's file tools
+#   resolve relative paths into the tree.
+#
+#   default_model is OVERRIDDEN per-dispatch by the driver's --model
+#   (worker_model, derived from the rig's models.toml entry:
+#   f"{oa_provider_key}/{version}"); it is a load-time fallback only.
+#
+# Both providers point at the IN-CAGE loopback relay shim (shim.py
+# RELAY_PORT 18081 -> /run/relay.sock -> host CredentialRelay). The worker
+# authenticates with OPENAI_API_KEY = the per-dispatch capability token
+# (injected by the driver; the relay authorizes the capability on every
+# lane, and a local lane omits the upstream auth header — .147 F1). `api_key`
+# is resolved via the `_env` suffix (openalph config `_resolve_secret`),
+# never inlined here — a real key must never be baked into an image.
+
+[agent]
+name = "stigmergy-worker"
+default_model = "blackwell/qwen38-27b-fp8"
+max_tokens = 8192
+workspace = "/scratch"
+thinking = "off"
+
+[providers.blackwell]
+type = "openai"
+base_url = "http://127.0.0.1:18081"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.synthetic]
+type = "openai"
+base_url = "http://127.0.0.1:18081"
+api_key_env = "OPENAI_API_KEY"

@@ -264,6 +264,7 @@ def build_run_argv(
     env: Mapping[str, str] | None = None,
     dispatch_id: str | None = None,
     entrypoint_override: str | None = None,
+    workdir: str | None = None,
 ) -> list[str]:
     """Render ``profile`` into an exact `podman run` argv (SPEC §4).
 
@@ -334,6 +335,19 @@ def build_run_argv(
     argv (regression guard, exactly the discipline ``egress_socket=None``/
     ``env=None`` already get).
 
+    ``workdir`` (bead .149) sets the container's WORKING DIRECTORY —
+    ``--workdir=<workdir>``, emitted immediately AFTER the
+    ``--network=...``/``--label=...`` position (right after the dispatch
+    label when one is set, directly after ``--network=...`` otherwise) and
+    immediately before the first ``--volume=...`` token. The .149 exec
+    driver passes ``workdir="/work"`` so the in-cage agent's file tools
+    resolve relative paths into the mounted clone (spec .149 §2 decision 1:
+    workspace = ``/scratch`` per the agent config, process cwd = ``/work``).
+    Left at its default ``None``, the returned argv is byte-identical to
+    the pre-.149 argv (regression guard, exactly the discipline
+    ``egress_socket=None``/``env=None``/``dispatch_id=None``/
+    ``entrypoint_override=None`` already get).
+
     ``entrypoint_override`` (bead .87) is the ONLY thing that can displace
     the image's own ENTRYPOINT. When given, exactly one
     ``--entrypoint=<value>`` token is emitted immediately before the image
@@ -383,6 +397,8 @@ def build_run_argv(
     ])
     if dispatch_id is not None:
         argv.append(f"--label={DISPATCH_ID_LABEL_KEY}={dispatch_id}")
+    if workdir is not None:
+        argv.append(f"--workdir={workdir}")
     argv.append(f"--volume={work}:/work:rw")
     argv.append(f"--volume={task}:/task:ro")
     argv.append(f"--tmpfs=/scratch:rw,size={profile.scratch_size},nosuid,nodev")

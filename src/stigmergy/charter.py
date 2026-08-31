@@ -162,18 +162,33 @@ _KNOWN_CADENCES_KEYS = {"staging_quiescent_tickets", "staging_max_wait_seconds"}
 # loop.timers is intentionally open-ended: any key is legal as long as it is
 # `_seconds`-suffixed (rule 6) — there is no fixed key set for this section.
 _KNOWN_PROMPTS_KEYS = {"dir"}
-_KNOWN_LANE_KEYS = {"selector", "driver", "model", "prompt", "egress", "entry"}
+_KNOWN_LANE_KEYS = {"selector", "driver", "model", "prompt", "egress", "entry", "effort"}
+# bead .149: the closed driver vocabulary. `claude-code` is the v0 default;
+# `openalph-exec` is the .149 in-cage `openalph exec` worker driver (spec
+# §4.2: a concrete union, no Protocol — an unknown driver value is a
+# charter-load error, never a runtime mystery).
+_KNOWN_LANE_DRIVERS = frozenset({"claude-code", "openalph-exec"})
+# bead .149 (spec §2 decision 8): the card-native effort vocabulary
+# (kdsn.301). `high`/`max` are charter-load ERRORS (collapsed onto
+# `medium`/`xhigh` at the provider layer — a warn-spam rung no human will
+# ever notice); only the four card values are legal. `effort` is an
+# openalph-exec concept ONLY — on a claude-code lane it is meaningless and
+# rejected at charter-load.
+_KNOWN_LANE_EFFORTS = frozenset({"none", "low", "medium", "xhigh"})
 _KNOWN_STEPUP_KEYS = {"ladder"}
 _KNOWN_ROLES_KEYS = {"critic"}
 _KNOWN_CRITIC_KEYS = {"model", "max_tokens"}
 _KNOWN_MODELS_KEYS = {"registry"}
 _KNOWN_EGRESS_GROUP_KEYS = {"hosts"}
 _KNOWN_NOTIFY_KEYS = {"ntfy_topic"}
-# bead .79: the per-rig worker-image provision table. `pip` is the only key
-# -- a list of package specs (may carry version pins) the provision station
-# installs into the per-rig worker image on top of the charter's pinned
-# base (SPEC §3 provision).
-_KNOWN_PROVISION_KEYS = {"pip"}
+# bead .79: the per-rig worker-image provision table. `pip` is a list of
+# package specs (may carry version pins) the provision station installs into
+# the per-rig worker image on top of the charter's pinned base (SPEC §3
+# provision). bead .149 adds `oa_wheelhouse` (bool): when true, the provision
+# station also bakes openalph (from a host-built wheelhouse, installed fully
+# offline) + the stigmergy-worker agent TOML, enabling the `openalph exec`
+# worker driver.
+_KNOWN_PROVISION_KEYS = {"pip", "oa_wheelhouse"}
 
 _ENV_PREFIX = "SG_"
 
@@ -428,6 +443,7 @@ def _validate(merged: dict[str, Any], charter_dir: Path) -> list[str]:
     if lanes is None:
         lanes = {}
     _validate_lanes_keys(lanes)
+    _validate_lanes_values(lanes)
 
     stepup = merged.get("stepup")
     if stepup is None:
@@ -501,6 +517,14 @@ def _validate_provision(provision_cfg: Any) -> None:
                 raise CharterError(
                     f"provision.pip entries must be non-empty strings (got {spec!r})"
                 )
+    if "oa_wheelhouse" in provision_cfg:
+        # bead .149: a strict boolean (a truthy-but-non-bool value like "true"
+        # would be a silent typo — fail closed).
+        if not isinstance(provision_cfg["oa_wheelhouse"], bool):
+            raise CharterError(
+                "provision.oa_wheelhouse must be a boolean "
+                f"(got {provision_cfg['oa_wheelhouse']!r})"
+            )
 
 
 _MEMORY_SIZE_RE = re.compile(r"^[0-9]+[bkmgBKMG]?$")
@@ -557,6 +581,45 @@ def _validate_lanes_keys(lanes_cfg: Any) -> None:
         raise CharterError("[lanes] must be a table")
     for name, entry in lanes_cfg.items():
         _validate_keys(entry, _KNOWN_LANE_KEYS, f"lanes.{name}")
+
+
+def _validate_lanes_values(lanes_cfg: dict[str, Any]) -> None:
+    """bead .149: per-lane VALUE checks (the key-set check is
+    :func:`_validate_lanes_keys`; this one closes the value vocabulary):
+
+    - ``driver`` (when present) must be in the closed set
+      :data:`_KNOWN_LANE_DRIVERS` — an unknown driver is a charter-load
+      error (fail closed; there is no runtime fallback).
+    - ``effort`` (when present) must be a card-native value from
+      :data:`_KNOWN_LANE_EFFORTS` — ``high``/``max`` are rejected naming
+      the kdsn.301 collapse (spec §2 decision 8).
+    - ``effort`` on a ``claude-code`` lane is rejected (meaningless there
+      — the claude-code driver has no effort concept).
+    """
+    for name, entry in lanes_cfg.items():
+        if not isinstance(entry, dict):
+            raise CharterError(f"lanes.{name} must be a table")
+        driver = entry.get("driver", "claude-code")
+        if driver not in _KNOWN_LANE_DRIVERS:
+            raise CharterError(
+                f"lanes.{name}.driver {driver!r} is not a known driver "
+                f"(known: {sorted(_KNOWN_LANE_DRIVERS)})"
+            )
+        if "effort" not in entry:
+            continue
+        effort = entry["effort"]
+        if not isinstance(effort, str) or effort not in _KNOWN_LANE_EFFORTS:
+            raise CharterError(
+                f"lanes.{name}.effort {effort!r} is not a card-native effort "
+                f"(known: {sorted(_KNOWN_LANE_EFFORTS)}) — `high`/`max` collapse "
+                "at the provider layer (kdsn.301) and are charter-load errors, "
+                "not rungs"
+            )
+        if driver == "claude-code":
+            raise CharterError(
+                f"lanes.{name}.effort is meaningless on a claude-code lane "
+                f"(effort is an openalph-exec driver concept)"
+            )
 
 
 def _validate_roles_keys(roles_cfg: Any) -> None:

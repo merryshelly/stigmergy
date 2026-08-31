@@ -1329,3 +1329,155 @@ def test_anti_trap_checker_reads_work_candidate(provisioned_worker_image):
             "anti-trap", cmd, work, image=provisioned_worker_image, flake_reruns=0
         )
         assert failing.outcome is CheckOutcome.FAIL, failing.output
+
+
+# ==========================================================================
+# bead .149 — [provision] oa_wheelhouse: the openalph worker image stack
+# ==========================================================================
+
+
+def _charter_with_oa_wheelhouse(base_image: str) -> str:
+    """BASE_CHARTER_TOML with [rig].image swapped + the .149 provision
+    table (oa_wheelhouse + the .79 check-tool pip list)."""
+    out = []
+    for ln in BASE_CHARTER_TOML.splitlines():
+        out.append(f'image = "{base_image}"' if ln.strip().startswith("image =") else ln)
+    text = "\n".join(out)
+    return text + '\n[provision]\npip = ["ruff", "pytest"]\noa_wheelhouse = true\n'
+
+
+def test_provision_oa_wheelhouse_bakes_openalph_stack(tmp_path, monkeypatch):
+    """spec §5: oa_wheelhouse=true -> (1) host-side wheelhouse built into
+    images/worker/wheels/, (2) Containerfile gains COPY wheels/ + the
+    OFFLINE pip install + the agent TOML COPY, (3) the TOML lands in the
+    build context. The real podman build + real pip are both faked."""
+    import stigmergy.rig as rig_mod
+
+    captured: dict = {}
+    wheelhouse_calls: list[Path] = []
+
+    def fake_build_oa_wheelhouse(wheels_dir):
+        wheelhouse_calls.append(Path(wheels_dir))
+        Path(wheels_dir).mkdir(parents=True, exist_ok=True)
+        (Path(wheels_dir) / "openalph-0.0.0-py3-none-any.whl").write_text("fake wheel")
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        d = Path(containerfile_dir)
+        captured["dir"] = d
+        captured["containerfile"] = (d / "Containerfile").read_text()
+        return _FAKE_DIGEST
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+    monkeypatch.setattr(rig_mod, "_build_oa_wheelhouse", fake_build_oa_wheelhouse)
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_oa_wheelhouse(_FAKE_BASE)
+    )
+    rig_root = create_rig(charter_path, base_dir=base_dir)
+
+    images_dir = rig_root / "images" / "worker"
+    # (1) the host-side wheelhouse was requested at the build context.
+    assert wheelhouse_calls == [images_dir / "wheels"]
+    assert (images_dir / "wheels" / "openalph-0.0.0-py3-none-any.whl").is_file()
+    # (3) the agent TOML is in the build context (the packaged template).
+    assert (images_dir / "oa-worker.toml").is_file()
+
+    cf = captured["containerfile"]
+    # (2) the three new lines, in order: wheels COPY, offline install, TOML.
+    assert "COPY wheels/ /wheels/" in cf
+    assert (
+        "RUN pip3 install --break-system-packages --no-cache-dir "
+        "--no-index --find-links=/wheels openalph" in cf
+    )
+    assert "COPY oa-worker.toml /etc/openalph/agents/stigmergy-worker.toml" in cf
+    assert cf.index("COPY wheels/ /wheels/") < cf.index(
+        "--no-index --find-links=/wheels openalph"
+    )
+    assert cf.index("--no-index --find-links=/wheels openalph") < cf.index(
+        "COPY oa-worker.toml /etc/openalph/agents/stigmergy-worker.toml"
+    )
+    # The .79 pip line is UNTOUCHED (both stacks coexist).
+    assert "pip3 install --break-system-packages --no-cache-dir ruff pytest" in cf
+    # The offline install is the ONLY openalph install — no network at build.
+    assert cf.count("--no-index") == 1
+    # The worker TOML content is the packaged template (providers -> shim).
+    toml_text = (images_dir / "oa-worker.toml").read_text()
+    assert 'name = "stigmergy-worker"' in toml_text
+    assert 'workspace = "/scratch"' in toml_text
+    assert 'base_url = "http://127.0.0.1:18081"' in toml_text
+
+
+def test_provision_oa_wheelhouse_without_pip_bootstraps_pip(tmp_path, monkeypatch):
+    """The base image carries python3 but NOT python3-pip: oa_wheelhouse
+    WITHOUT a `pip` list still bootstraps python3-pip so the offline
+    install can run."""
+    import stigmergy.rig as rig_mod
+
+    captured: dict = {}
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        captured["cf"] = (Path(containerfile_dir) / "Containerfile").read_text()
+        return _FAKE_DIGEST
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+    monkeypatch.setattr(
+        rig_mod, "_build_oa_wheelhouse", lambda d: Path(d).mkdir(parents=True, exist_ok=True)
+    )
+
+    out = []
+    for ln in BASE_CHARTER_TOML.splitlines():
+        out.append(f'image = "{_FAKE_BASE}"' if ln.strip().startswith("image =") else ln)
+    content = "\n".join(out) + '\n[provision]\noa_wheelhouse = true\n'
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(tmp_path, repo, content=content)
+    create_rig(charter_path, base_dir=base_dir)
+
+    assert "python3-pip" in captured["cf"]
+    assert "COPY wheels/ /wheels/" in captured["cf"]
+    assert "--no-index --find-links=/wheels openalph" in captured["cf"]
+
+
+def test_provision_without_oa_wheelhouse_is_byte_identical(tmp_path, monkeypatch):
+    """Regression: key absent (the default) -> NO wheels/, NO oa-worker.toml
+    in the build context, and the Containerfile is exactly the pre-.149
+    shape (FROM + the .79 lines only)."""
+    import stigmergy.rig as rig_mod
+
+    wheelhouse_calls: list = []
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        d = Path(containerfile_dir)
+        captured_cf = (d / "Containerfile").read_text()
+        assert captured_cf == (
+            f"FROM {_FAKE_BASE}\n"
+            "RUN apt-get update "
+            "&& apt-get install -y --no-install-recommends python3-pip "
+            "&& rm -rf /var/lib/apt/lists/*\n"
+            "RUN pip3 install --break-system-packages --no-cache-dir ruff pytest\n"
+        )
+        return _FAKE_DIGEST
+
+    def fake_build_oa_wheelhouse(wheels_dir):
+        wheelhouse_calls.append(wheels_dir)
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+    monkeypatch.setattr(rig_mod, "_build_oa_wheelhouse", fake_build_oa_wheelhouse)
+
+    repo = make_local_repo(tmp_path)
+    base_dir = tmp_path / "rigs"
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_base(_FAKE_BASE, provision=True)
+    )
+    rig_root = create_rig(charter_path, base_dir=base_dir)
+
+    assert wheelhouse_calls == []  # the wheelhouse builder was NEVER called
+    images_dir = rig_root / "images" / "worker"
+    assert not (images_dir / "wheels").exists()
+    assert not (images_dir / "oa-worker.toml").exists()
+    cf = (images_dir / "Containerfile").read_text()
+    assert "wheels" not in cf
+    assert "openalph" not in cf

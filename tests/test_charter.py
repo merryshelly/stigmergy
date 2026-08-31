@@ -802,3 +802,85 @@ def test_critic_max_tokens_must_be_positive_int(tmp_path: Path) -> None:
     )
     with pytest.raises(CharterError):
         load_charter(make_charter(tmp_path, content), env={})
+
+
+# ==========================================================================
+# bead .149: lane driver closed set + card-native `effort`
+# ==========================================================================
+
+
+def _append_exec_lane(
+    content: str, *, driver: str = "openalph-exec", effort: str | None = None
+) -> str:
+    """Append a new entry-eligible lane (WITH a selector, so the
+    exactly-one-selector-less rule is not perturbed — `default` remains the
+    fallthrough). `effort=None` omits the key entirely."""
+    lines = [
+        "\n[lanes.exec]",
+        'selector = { label = "exec-lane" }',
+        f'driver = "{driver}"',
+        'model = "haiku"',
+        'prompt = "code01"',
+    ]
+    if effort is not None:
+        lines.append(f'effort = "{effort}"')
+    lines.append('egress = ["inference"]')
+    return content + "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "xhigh"])
+def test_lane_effort_card_native_values_accepted(tmp_path: Path, effort: str) -> None:
+    charter = load_charter(
+        make_charter(tmp_path, _append_exec_lane(BASE_CHARTER_TOML, effort=effort)), env={}
+    )
+    assert charter.raw["lanes"]["exec"]["effort"] == effort
+    assert charter.raw["lanes"]["exec"]["driver"] == "openalph-exec"
+
+
+def test_lane_effort_high_rejected_naming_kdsn_301(tmp_path: Path) -> None:
+    # spec §2 decision 8: `high`/`max` are charter-load ERRORS (card-native
+    # only, kdsn.301 — no warn-spam rungs).
+    content = _append_exec_lane(BASE_CHARTER_TOML, effort="high")
+    with pytest.raises(CharterError, match="kdsn.301"):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_lane_effort_max_rejected_naming_kdsn_301(tmp_path: Path) -> None:
+    content = _append_exec_lane(BASE_CHARTER_TOML, effort="max")
+    with pytest.raises(CharterError, match="kdsn.301"):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_lane_effort_on_claude_code_lane_rejected(tmp_path: Path) -> None:
+    # effort is meaningless on a claude-code lane (no such driver concept
+    # there) — fail closed at charter-load.
+    content = _append_exec_lane(BASE_CHARTER_TOML, driver="claude-code", effort="medium")
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_lane_unknown_driver_rejected(tmp_path: Path) -> None:
+    content = _append_exec_lane(BASE_CHARTER_TOML, driver="gemini-code")
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_lane_driver_openalph_exec_accepted_without_effort(tmp_path: Path) -> None:
+    # effort is OPTIONAL on an openalph-exec lane (absent -> None).
+    charter = load_charter(make_charter(tmp_path, _append_exec_lane(BASE_CHARTER_TOML)), env={})
+    assert "effort" not in charter.raw["lanes"]["exec"]
+
+
+# --- bead .149: provision.oa_wheelhouse (strict boolean) -------------------
+
+
+def test_provision_oa_wheelhouse_bool_accepted(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\n[provision]\npip = [\"ruff\"]\noa_wheelhouse = true\n"
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["provision"]["oa_wheelhouse"] is True
+
+
+def test_provision_oa_wheelhouse_non_bool_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[provision]\noa_wheelhouse = "true"\n'
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})

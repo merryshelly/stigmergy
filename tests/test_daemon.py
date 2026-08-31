@@ -622,6 +622,7 @@ def make_daemon(
     relay_teardown_fn: Any = None,
     egress_setup_fn: Any = None,
     egress_teardown_fn: Any = None,
+    driver_registry: Any = None,
 ) -> Daemon:
     if run_checks_fn is None:
         run_checks_fn = ScriptedChecks([pass_result("lint"), pass_result("pytest")])
@@ -641,6 +642,8 @@ def make_daemon(
         extra["egress_setup_fn"] = egress_setup_fn
     if egress_teardown_fn is not None:
         extra["egress_teardown_fn"] = egress_teardown_fn
+    if driver_registry is not None:
+        extra["driver_registry"] = driver_registry
     return Daemon(
         store=env.store,
         record_plane=env.record_plane,
@@ -2160,3 +2163,161 @@ def test_concurrent_infra_trip_counter_no_lost_updates(env: Env) -> None:
     assert daemon._consecutive_infra_trips == expected, (
         f"Expected {expected} bumps, got {daemon._consecutive_infra_trips}"
     )
+
+
+# ==========================================================================
+# bead .149: per-lane driver selection via driver_registry
+# ==========================================================================
+
+
+def _exec_lane_env(tmp_path: Path) -> Env:
+    """An Env whose `default` (fallthrough) lane is an openalph-exec lane
+    with a local model carrying .143 OA provider wiring — the .149 dogfood
+    shape, minus the dogfood's notify/provision extras."""
+    e = Env(tmp_path)
+    text = BASE_CHARTER_TOML
+    assert text.count('[lanes.default]\ndriver = "claude-code"\nmodel = "sonnet"') == 1
+    text = text.replace(
+        '[lanes.default]\ndriver = "claude-code"\nmodel = "sonnet"',
+        '[lanes.default]\ndriver = "openalph-exec"\nmodel = "local-qwen"\neffort = "medium"',
+    )
+    (tmp_path / "charter_src" / "charter.toml").write_text(text)
+    (tmp_path / "charter_src" / "models.toml").write_text(
+        '[haiku]\n'
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "haiku-3-5-20241022"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 0.8\n'
+        'output_usd_per_mtok = 4.0\n'
+        "\n[sonnet]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "sonnet-4-5-20250514"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 3.0\n'
+        'output_usd_per_mtok = 15.0\n'
+        "\n[opus]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "opus-4-1-20250805"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 15.0\n'
+        'output_usd_per_mtok = 75.0\n'
+        'reasoning_usd_per_mtok = 15.0\n'
+        "\n[local-qwen]\n"
+        'provider = "blackwell"\n'
+        'family = "qwen"\n'
+        'version = "qwen38-27b-fp8"\n'
+        'pricing = "local"\n'
+        'marginal_usd = 0.0\n'
+        'approved = true\n'
+        'oa_type = "openai"\n'
+        'oa_base_url = "http://10.0.20.111:8000/v1"\n'
+        "\n[claude-max-sub]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "claude-code-subscription"\n'
+        'pricing = "subscription"\n'
+        'marginal_usd = 0.0\n'
+        'quota = "5x-plan-weekly-hours"\n'
+    )
+    e.charter = load_charter(tmp_path / "charter_src" / "charter.toml", env={})
+    e.charter.raw["rig"]["image"] = PINNED_IMAGE
+    e.registry = load_registry(tmp_path / "charter_src" / "models.toml")
+    return e
+
+
+@pytest.fixture
+def exec_env(tmp_path: Path) -> Env:
+    e = _exec_lane_env(tmp_path)
+    yield e
+    e.close()
+
+
+def test_driver_for_with_registry_routes_exec_lane(exec_env: Env) -> None:
+    """spec §4.2: with a registry, lane.driver="openalph-exec" routes to the
+    registry's exec spawn; "claude-code" routes to the default spawn_fn; an
+    UNKNOWN driver value falls back to the default spawn_fn (charter
+    validation is the closed-set gate — the daemon never invents a third)."""
+    import stigmergy.drivers.claude_code as cc
+    import stigmergy.drivers.openalph_exec as oa
+
+    default_spawn = ScriptedSpawn([])
+    registry = {"claude-code": cc.spawn, "openalph-exec": oa.spawn}
+    daemon = make_daemon(exec_env, spawn_fn=default_spawn, driver_registry=registry)
+
+    class _Lane:
+        def __init__(self, driver: str):
+            self.driver = driver
+
+    assert daemon._driver_for(_Lane("openalph-exec")) is oa.spawn
+    assert daemon._driver_for(_Lane("claude-code")) is cc.spawn
+    # default (the spawn_fn) when the registry has no entry for the driver
+    assert daemon._driver_for(_Lane("mystery-driver")) is default_spawn
+
+
+def test_driver_for_without_registry_is_always_default(exec_env: Env) -> None:
+    """With no registry injected (the pre-.149 shape — all existing test
+    stubs), _driver_for returns the default spawn_fn for EVERY lane."""
+    default_spawn = ScriptedSpawn([])
+    daemon = make_daemon(exec_env, spawn_fn=default_spawn)
+
+    class _Lane:
+        def __init__(self, driver: str):
+            self.driver = driver
+
+    assert daemon._driver_for(_Lane("openalph-exec")) is default_spawn
+    assert daemon._driver_for(_Lane("claude-code")) is default_spawn
+    assert daemon._driver_for(_Lane("anything")) is default_spawn
+
+
+def test_poll_routes_exec_lane_to_registry_spawn(exec_env: Env) -> None:
+    """End-to-end: a poll on an openalph-exec lane invokes the registry's
+    exec spawn (NOT the default claude-code spawn) with the plan, and the
+    exec-lane model_cfg is the openalph_exec.ModelConfig derived from the
+    registry entry."""
+    import stigmergy.drivers.openalph_exec as oa
+
+    default_spawn = ScriptedSpawn([])
+    exec_spawn = ScriptedSpawn(
+        [make_result(DispatchStatus.DONE, bundle_ref="/tmp/exec-work.bundle")]
+    )
+    daemon = make_daemon(
+        exec_env,
+        spawn_fn=default_spawn,
+        run_checks_fn=ScriptedChecks([pass_result("lint"), pass_result("pytest")]),
+        driver_registry={"claude-code": default_spawn, "openalph-exec": exec_spawn},
+    )
+    add_dispatchable_ticket(exec_env, "t-exec")
+
+    daemon.poll_once()
+
+    assert default_spawn.calls == []  # the claude-code path was NEVER used
+    assert len(exec_spawn.calls) == 1
+    _task_pack, _work_clone, model_cfg, _capability, _budgets = exec_spawn.calls[0]
+    assert isinstance(model_cfg, oa.ModelConfig)
+    assert model_cfg.worker_model == "blackwell/qwen38-27b-fp8"
+    assert model_cfg.effort == "medium"
+    assert exec_env.store.get_ticket("t-exec")["state"] == PARKED
+
+
+def test_poll_no_registry_exec_lane_still_uses_default_spawn_fn(exec_env: Env) -> None:
+    """Back-compat: with NO registry, an exec-lane dispatch still routes to
+    the default spawn_fn (the pre-.149 behavior — today's claude_code
+    default receives the plan; this build does not change what a no-registry
+    daemon does)."""
+    default_spawn = ScriptedSpawn(
+        [make_result(DispatchStatus.DONE, bundle_ref="/tmp/default-work.bundle")]
+    )
+    daemon = make_daemon(
+        exec_env,
+        spawn_fn=default_spawn,
+        run_checks_fn=ScriptedChecks([pass_result("lint"), pass_result("pytest")]),
+    )
+    add_dispatchable_ticket(exec_env, "t-legacy")
+
+    daemon.poll_once()
+
+    assert len(default_spawn.calls) == 1
+    assert exec_env.store.get_ticket("t-legacy")["state"] == PARKED

@@ -65,8 +65,9 @@ from typing import Any
 
 from stigmergy import pathsafety
 from stigmergy.charter import Charter
-from stigmergy.drivers import claude_code
+from stigmergy.drivers import claude_code, openalph_exec
 from stigmergy.pathsafety import PathSafetyError
+from stigmergy.registry import Registry
 from stigmergy.relay import Capability, CapabilityStore
 from stigmergy.rig import RigStore
 
@@ -101,10 +102,11 @@ class LaneSelection:
     """One resolved lane, selected by :func:`select_lane` (§0.2)."""
 
     name: str  # the lane's charter key, e.g. "cheap" / "default" / "exquisite"
-    driver: str  # charter lane.driver (v0: always "claude-code")
+    driver: str  # charter lane.driver (closed set: "claude-code" / "openalph-exec" — bead .149)
     model: str  # charter lane.model (registry entry name)
     prompt: str  # charter lane.prompt (prompt id, e.g. "code01")
     egress: list[str]  # charter lane.egress (egress group names)
+    effort: str | None = None  # charter lane.effort (bead .149; openalph-exec lanes only)
 
 
 @dataclass(frozen=True)
@@ -129,7 +131,9 @@ class DispatchPlan:
     lane: LaneSelection
     task_pack: Path
     work_clone: Path
-    model_cfg: claude_code.ModelConfig
+    # bead .149: the concrete per-lane driver config union (spec §2 decision
+    # 3 — no Protocol; both types carry `.image`, the only cross-driver read).
+    model_cfg: claude_code.ModelConfig | openalph_exec.ModelConfig
     budgets: claude_code.Budgets
     capability: Capability
     prompt_artifact_hash: str
@@ -248,6 +252,7 @@ def _build_lane_selection(name: str, cfg: dict[str, Any]) -> LaneSelection:
         model=cfg["model"],
         prompt=cfg["prompt"],
         egress=list(cfg.get("egress") or []),
+        effort=cfg.get("effort"),
     )
 
 
@@ -553,6 +558,7 @@ def prepare_dispatch(
     relay_socket: Path | str | None = None,
     prior_evidence: PriorEvidence | None = None,
     dispatch_id: str | None = None,
+    registry: Registry | None = None,
 ) -> DispatchPlan:
     """The one entry point `.22` calls (bead .21 build spec §1). Composes
     :func:`select_lane` + :func:`generate_worker_name` +
@@ -615,13 +621,46 @@ def prepare_dispatch(
         dispatch_id, max_output_tokens=output_tokens, max_calls=driver_turns
     )
 
-    model_cfg = claude_code.ModelConfig(
-        model=lane.model,
-        image=image,
-        relay_base_url=relay_base_url,
-        egress_socket=egress_socket,
-        relay_socket=relay_socket,
-    )
+    if lane.driver == "openalph-exec":
+        # bead .149: the in-cage worker_model is DERIVED from the registry
+        # entry's OA provider wiring (spec §2 decision 7:
+        # f"{entry.oa_provider_key}/{entry.version}" — qwen38 ->
+        # "blackwell/qwen38-27b-fp8", kimi3 ->
+        # "synthetic/hf:moonshotai/Kimi-K3"). The registry is REQUIRED:
+        # without it the derivation is impossible, and a worker_model of
+        # None would be a spawn-time mystery rather than a loud prepare-time
+        # DispatchError.
+        if registry is None:
+            raise DispatchError(
+                f"openalph-exec lane {lane.name!r} requires registry (worker_model is "
+                f"derived from the model entry's oa_provider_key/version — an "
+                "exec lane cannot be prepared without a model registry)"
+            )
+        entry = registry.resolve(lane.model)
+        # `effort` is optional on an openalph-exec lane (charter validation);
+        # the card-native default "none" maps to OA thinking="off" — exactly
+        # the provisioned agent TOML's own default — so an un-effort'd exec
+        # lane runs at the minimum with no implicit surprise.
+        model_cfg = openalph_exec.ModelConfig(
+            model=lane.model,
+            worker_model=f"{entry.oa_provider_key}/{entry.version}",
+            effort=lane.effort or "none",
+            image=image,
+            relay_socket=relay_socket,
+            egress_socket=egress_socket,
+        )
+    else:
+        # "claude-code" (and any other value that charter validation would
+        # have already rejected): today's exact construction, byte-identical.
+        model_cfg = claude_code.ModelConfig(
+            model=lane.model,
+            image=image,
+            relay_base_url=relay_base_url,
+            egress_socket=egress_socket,
+            relay_socket=relay_socket,
+        )
+    # Same claude_code.Budgets type for BOTH drivers (spec §4.2: output_tokens
+    # + driver_turns feed the driver's ceilings / --max-turns identically).
     budgets = claude_code.Budgets(output_tokens=output_tokens, driver_turns=driver_turns)
 
     return DispatchPlan(

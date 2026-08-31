@@ -840,10 +840,23 @@ def test_hardened_passed_unconditionally() -> None:
 
 
 def test_only_oa_critic_imports_openalph() -> None:
-    """AC9 (grep-pinned): the OA-importing module list in src/stigmergy/ is
-    exactly {oa_critic.py} (python sources; build artifacts excluded)."""
+    """AC9 (grep-pinned): the only src/stigmergy module that IMPORTS the
+    openalph PACKAGE is oa_critic.py (python sources; build artifacts
+    excluded).
+
+    Bead .149 revision: the pattern greps actual import statements
+    (``import openalph`` / ``from openalph``), not the bare string. The
+    openalph-exec worker driver (``drivers/openalph_exec.py``) names the
+    ``openalph`` CLI binary as a SUBPROCESS contract but must never import
+    the package — the daemon keeps importing cleanly under system python
+    (see test_imports_succeed_with_oa_absent). The tightened pattern
+    preserves the original invariant (a new OA integration still belongs in
+    the sanctioned lazy adapter) and now ALSO catches a real package import
+    sneaking into the exec driver."""
     hits = subprocess.run(
-        ["grep", "-rln", "openalph", "src/stigmergy", "--include=*.py"],
+        ["grep", "-rln", "-E",
+         "^[[:space:]]*(import|from) openalph",
+         "src/stigmergy", "--include=*.py"],
         capture_output=True,
         text=True,
         check=True,

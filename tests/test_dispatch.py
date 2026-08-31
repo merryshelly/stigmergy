@@ -880,3 +880,285 @@ def test_prepare_dispatch_first_dispatch_uses_entry_lane(tmp_path: Path) -> None
         assert plan.lane.name == "default"
     finally:
         store.close()
+
+
+# ==========================================================================
+# bead .149: per-lane driver selection (openalph-exec branch) + registry
+# threading + LaneSelection.effort
+# ==========================================================================
+
+
+def _exec_lane_model_registry(tmp_path: Path) -> Path:
+    """A models.toml with one `local` model carrying the .143 OA provider
+    wiring (oa_provider_key/oa_type) — the shape the in-cage worker_model
+    mapping `f"{oa_provider_key}/{version}"` is derived from."""
+    registry_path = tmp_path / "models.toml"
+    registry_path.write_text(
+        '[haiku]\n'
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "haiku-3-5-20241022"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 0.8\n'
+        'output_usd_per_mtok = 4.0\n'
+        "\n[sonnet]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "sonnet-4-5-20250514"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 3.0\n'
+        'output_usd_per_mtok = 15.0\n'
+        "\n[opus]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "opus-4-1-20250805"\n'
+        'pricing = "metered"\n'
+        'input_usd_per_mtok = 15.0\n'
+        'output_usd_per_mtok = 75.0\n'
+        'reasoning_usd_per_mtok = 15.0\n'
+        "\n[local-qwen]\n"
+        'provider = "blackwell"\n'
+        'family = "qwen"\n'
+        'version = "qwen38-27b-fp8"\n'
+        'pricing = "local"\n'
+        'marginal_usd = 0.0\n'
+        'approved = true\n'
+        'oa_type = "openai"\n'
+        'oa_base_url = "http://10.0.20.111:8000/v1"\n'
+        "\n[claude-max-sub]\n"
+        'provider = "anthropic"\n'
+        'family = "claude"\n'
+        'version = "claude-code-subscription"\n'
+        'pricing = "subscription"\n'
+        'marginal_usd = 0.0\n'
+        'quota = "5x-plan-weekly-hours"\n'
+    )
+    return registry_path
+
+
+def _exec_lane_charter(tmp_path: Path, *, effort: str | None = "medium") -> Charter:
+    """A fully valid charter whose `default` (fallthrough) lane is an
+    openalph-exec lane — mirrors the .149 dogfood shape (entry lane
+    driver="openalph-exec", model="qwen38"-shaped local entry,
+    effort="medium")."""
+    text = BASE_CHARTER_TOML
+    text = text.replace(
+        '[lanes.cheap]\nselector = { label = "local-ok" }\ndriver = "claude-code"\nmodel = "haiku"',
+        '[lanes.cheap]\nselector = { label = "local-ok" }\ndriver = "claude-code"\nmodel = "haiku"',
+    )
+    text = text.replace(
+        '[lanes.default]\ndriver = "claude-code"\nmodel = "sonnet"',
+        '[lanes.default]\ndriver = "openalph-exec"\nmodel = "local-qwen"'
+        + (f'\neffort = "{effort}"' if effort is not None else ""),
+    )
+    charter_dir = tmp_path / "charter_src"
+    charter_dir.mkdir(exist_ok=True)
+    charter_path = charter_dir / "charter.toml"
+    charter_path.write_text(text)
+    shutil.copy(_exec_lane_model_registry(tmp_path), charter_dir / "models.toml")
+    return load_charter(charter_path, env={})
+
+
+def test_lane_selection_carries_effort(tmp_path: Path) -> None:
+    charter = _exec_lane_charter(tmp_path)
+    ticket_row = {"lane_hint": None}
+    lane = select_lane(charter, ticket_row)
+    assert lane.name == "default"
+    assert lane.driver == "openalph-exec"
+    assert lane.effort == "medium"
+
+
+def test_lane_selection_effort_absent_is_none(tmp_path: Path) -> None:
+    charter = _exec_lane_charter(tmp_path, effort=None)
+    lane = select_lane(charter, {"lane_hint": None})
+    assert lane.driver == "openalph-exec"
+    assert lane.effort is None
+
+
+def test_prepare_dispatch_exec_lane_builds_openalph_model_cfg(tmp_path: Path) -> None:
+    """spec §4.2: registry.resolve(lane.model) ->
+    worker_model = f"{entry.oa_provider_key}/{entry.version}" (spec §2
+    decision 7), effort threaded, the SAME claude_code.Budgets type."""
+    import stigmergy.drivers.openalph_exec as openalph_exec
+    from stigmergy.registry import load_registry
+
+    charter = _exec_lane_charter(tmp_path)
+    rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
+    store = RigStore.create(tmp_path / "tickets.db")
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    clones_root = tmp_path / "clones"
+    prompts_dir = tmp_path / "prompts_dir"
+    prompts_dir.mkdir()
+    (prompts_dir / "code01").write_text("Goal:\n$goal\n")
+
+    ticket_row = {
+        "id": "ticket-1",
+        "title": "Do the thing",
+        "goal": "Implement the feature end to end.",
+        "required_reading": [],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "lane_hint": None,
+    }
+    registry = load_registry(tmp_path / "charter_src" / "models.toml")
+    plan = prepare_dispatch(
+        charter=charter,
+        ticket_row=ticket_row,
+        store=store,
+        capability_store=CapabilityStore(),
+        rig_repo=rig_repo,
+        context_root=context_root,
+        clones_root=clones_root,
+        prompts_dir=prompts_dir,
+        relay_base_url="http://relay.local:9999",
+        image=PINNED_IMAGE,
+        registry=registry,
+    )
+    try:
+        entry = registry.resolve("local-qwen")
+        assert isinstance(plan.model_cfg, openalph_exec.ModelConfig)
+        assert plan.model_cfg.model == "local-qwen"
+        assert plan.model_cfg.worker_model == f"{entry.oa_provider_key}/{entry.version}"
+        assert plan.model_cfg.worker_model == "blackwell/qwen38-27b-fp8"
+        assert plan.model_cfg.effort == "medium"
+        assert plan.model_cfg.image == PINNED_IMAGE
+        # Same claude_code.Budgets type for BOTH drivers (spec §4.2).
+        assert type(plan.budgets) is claude_code.Budgets
+        assert plan.lane.effort == "medium"
+    finally:
+        store.close()
+
+
+def test_prepare_dispatch_exec_lane_registry_none_raises_dispatch_error(tmp_path: Path) -> None:
+    """spec §4.2: an openalph-exec lane WITHOUT a registry cannot derive
+    worker_model — DispatchError, not a None-model mystery at spawn time."""
+    charter = _exec_lane_charter(tmp_path)
+    rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
+    store = RigStore.create(tmp_path / "tickets.db")
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    clones_root = tmp_path / "clones"
+    prompts_dir = tmp_path / "prompts_dir"
+    prompts_dir.mkdir()
+    (prompts_dir / "code01").write_text("Goal:\n$goal\n")
+    ticket_row = {
+        "id": "ticket-1",
+        "title": "Do the thing",
+        "goal": "Implement the feature end to end.",
+        "required_reading": [],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "lane_hint": None,
+    }
+    with pytest.raises(DispatchError, match="registry"):
+        prepare_dispatch(
+            charter=charter,
+            ticket_row=ticket_row,
+            store=store,
+            capability_store=CapabilityStore(),
+            rig_repo=rig_repo,
+            context_root=context_root,
+            clones_root=clones_root,
+            prompts_dir=prompts_dir,
+            relay_base_url="http://relay.local:9999",
+            image=PINNED_IMAGE,
+            registry=None,
+        )
+    store.close()
+
+
+def test_prepare_dispatch_claude_code_lane_unaffected_by_registry_kwarg(tmp_path: Path) -> None:
+    """Regression: the default claude-code lane path stays byte-identical —
+    the registry kwarg is IRRELEVANT to it (no resolution happens)."""
+    from stigmergy.registry import load_registry
+
+    charter = make_full_charter(tmp_path)
+    rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
+    store = RigStore.create(tmp_path / "tickets.db")
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    clones_root = tmp_path / "clones"
+    prompts_dir = tmp_path / "prompts_dir"
+    prompts_dir.mkdir()
+    (prompts_dir / "code01").write_text("Goal:\n$goal\n")
+    ticket_row = {
+        "id": "ticket-1",
+        "title": "Do the thing",
+        "goal": "Implement the feature end to end.",
+        "required_reading": [],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "lane_hint": None,
+    }
+    plan = prepare_dispatch(
+        charter=charter,
+        ticket_row=ticket_row,
+        store=store,
+        capability_store=CapabilityStore(),
+        rig_repo=rig_repo,
+        context_root=context_root,
+        clones_root=clones_root,
+        prompts_dir=prompts_dir,
+        relay_base_url="http://relay.local:9999",
+        image=PINNED_IMAGE,
+        registry=load_registry(MODELS_REGISTRY_PATH),
+    )
+    try:
+        assert type(plan.model_cfg) is claude_code.ModelConfig
+        assert plan.model_cfg.model == "sonnet"
+        assert plan.lane.effort is None
+    finally:
+        store.close()
+
+
+def test_prepare_dispatch_exec_lane_absent_effort_defaults_to_none(tmp_path: Path) -> None:
+    """spec §2 decision 8: `effort` is optional on an openalph-exec lane;
+    absent -> the card-native default "none" (OA thinking="off" — the
+    provisioned agent TOML's own default), so the in-cage --effort flag is
+    never empty/None."""
+    import stigmergy.drivers.openalph_exec as openalph_exec
+
+    charter = _exec_lane_charter(tmp_path, effort=None)
+    rig_repo = make_repo(tmp_path, name="rig_repo", branch="staging")
+    store = RigStore.create(tmp_path / "tickets.db")
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    clones_root = tmp_path / "clones"
+    prompts_dir = tmp_path / "prompts_dir"
+    prompts_dir.mkdir()
+    (prompts_dir / "code01").write_text("Goal:\n$goal\n")
+    ticket_row = {
+        "id": "ticket-1",
+        "title": "Do the thing",
+        "goal": "Implement the feature end to end.",
+        "required_reading": [],
+        "target_scope": ["src/foo.py"],
+        "acceptance_criteria": ["foo() returns 42"],
+        "tier1_checks": {"pytest": "pytest -q"},
+        "lane_hint": None,
+    }
+    from stigmergy.registry import load_registry
+
+    registry = load_registry(tmp_path / "charter_src" / "models.toml")
+    plan = prepare_dispatch(
+        charter=charter,
+        ticket_row=ticket_row,
+        store=store,
+        capability_store=CapabilityStore(),
+        rig_repo=rig_repo,
+        context_root=context_root,
+        clones_root=clones_root,
+        prompts_dir=prompts_dir,
+        relay_base_url="http://relay.local:9999",
+        image=PINNED_IMAGE,
+        registry=registry,
+    )
+    try:
+        assert isinstance(plan.model_cfg, openalph_exec.ModelConfig)
+        assert plan.model_cfg.effort == "none"
+    finally:
+        store.close()

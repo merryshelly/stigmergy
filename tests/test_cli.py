@@ -1937,3 +1937,26 @@ oa_type = "openai"
     assert len(recorded) == 1
     if recorded_daemons:
         recorded_daemons[0]._store.close()
+
+
+# --- bead .149: _build_daemon per-lane driver registry wiring -------------
+
+
+def test_build_daemon_wires_driver_registry(tmp_path: Path) -> None:
+    """spec §4.2: _build_daemon constructs the per-lane driver registry
+    {"claude-code": claude_code.spawn, "openalph-exec": openalph_exec.spawn}
+    and hands it to the Daemon (the daemon then routes each dispatch by
+    plan.lane.driver; no registry -> the claude_code default for everything)."""
+    import stigmergy.drivers.claude_code as claude_code
+    import stigmergy.drivers.openalph_exec as openalph_exec
+
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+    daemon = _build_daemon(resolved)
+    try:
+        assert daemon._driver_registry == {
+            "claude-code": claude_code.spawn,
+            "openalph-exec": openalph_exec.spawn,
+        }
+    finally:
+        daemon._store.close()

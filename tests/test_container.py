@@ -1019,3 +1019,90 @@ def test_dispatch_socket_path_fails_closed_when_runtime_dir_pathologically_long(
     huge_dir = "/" + "a" * 120
     with pytest.raises(ContainerError, match="AF_UNIX"):
         dispatch_socket_path(huge_dir, "egress", "d")
+
+
+# ==========================================================================
+# bead .149: keyword-only `workdir` — `--workdir=<workdir>` emitted right
+# after `--network=...` when set; NOTHING (byte-identical argv) when None.
+# ==========================================================================
+
+
+def _workdir_profile(tmp_path, **overrides):
+    """A minimal profile for the workdir argv tests (this file's own
+    `_profile` helper is unchanged; a fresh minimal one keeps these tests
+    independent of its kwargs surface)."""
+    work = tmp_path / "workdir-work"
+    work.mkdir(parents=True, exist_ok=True)
+    task = tmp_path / "workdir-task"
+    task.mkdir(parents=True, exist_ok=True)
+    kwargs = dict(
+        image=PINNED_IMAGE,
+        work_clone=work,
+        task_pack=task,
+        scratch_size="64m",
+        pids_limit=32,
+        memory="256m",
+        cpus="1",
+        timeout_seconds=120,
+    )
+    kwargs.update(overrides)
+    return ContainerProfile(**kwargs)
+
+
+def test_workdir_none_is_byte_identical_to_pre_change_argv(tmp_path):
+    # Regression guard (spec §4.2): workdir=None (the default) emits NOTHING
+    # — the argv is byte-identical to the pre-.149 argv for the same inputs.
+    profile = _workdir_profile(tmp_path)
+    with_none = build_run_argv(
+        profile,
+        command=["true"],
+        egress_socket=None,
+        relay_socket=None,
+        env={"OPENAI_API_KEY": "cap-tok"},
+        dispatch_id="disp-1",
+        workdir=None,
+    )
+    without_param = build_run_argv(
+        profile,
+        command=["true"],
+        egress_socket=None,
+        relay_socket=None,
+        env={"OPENAI_API_KEY": "cap-tok"},
+        dispatch_id="disp-1",
+    )
+    assert with_none == without_param
+    assert not any(a.startswith("--workdir") for a in with_none)
+
+
+def test_workdir_none_byte_identical_minimal_call(tmp_path):
+    # Same regression guard on the most minimal call shape (no sockets, no
+    # env, no dispatch_id).
+    profile = _workdir_profile(tmp_path)
+    with_none = build_run_argv(profile, command=["true"], workdir=None)
+    without_param = build_run_argv(profile, command=["true"])
+    assert with_none == without_param
+    assert not any(a.startswith("--workdir") for a in with_none)
+
+
+def test_workdir_set_emits_flag_right_after_network(tmp_path):
+    profile = _workdir_profile(tmp_path)
+    argv = build_run_argv(profile, command=["openalph", "exec"], workdir="/work")
+    assert "--workdir=/work" in argv
+    # Frozen position: immediately after the `--network=...` token (and the
+    # dispatch label, when dispatch_id is set — the label owns the first
+    # after-network slot), immediately before the first `--volume=` token.
+    network_index = next(i for i, a in enumerate(argv) if a.startswith("--network="))
+    assert argv[network_index + 1] == "--workdir=/work"
+    assert argv[network_index + 2].startswith("--volume=")
+
+
+def test_workdir_set_with_dispatch_id_sits_after_label_before_volumes(tmp_path):
+    # With dispatch_id set, the frozen after-network order is:
+    # --network=... -> --label=... -> --workdir=... -> --volume=...
+    profile = _workdir_profile(tmp_path)
+    argv = build_run_argv(profile, command=["true"], dispatch_id="disp-9", workdir="/work")
+    network_index = next(i for i, a in enumerate(argv) if a.startswith("--network="))
+    assert argv[network_index + 1] == f"--label={DISPATCH_ID_LABEL_KEY}=disp-9"
+    assert argv[network_index + 2] == "--workdir=/work"
+    assert argv[network_index + 3].startswith("--volume=")
+    assert argv.count("--workdir=/work") == 1

@@ -41,6 +41,7 @@ from stigmergy.charter import Charter, CharterError, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
 from stigmergy.daemon import Daemon, DaemonError
+from stigmergy.drivers import claude_code, openalph_exec
 from stigmergy.filing import file_proposals
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
@@ -502,6 +503,16 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         steering_of=_make_steering_of(store, charter, rig_paths["prompts_dir"]),
         # spawn_fn / run_checks_fn: Daemon's own real defaults (claude_code.spawn /
         # checks.run_checks) -- do not pass explicitly, nothing to override.
+        # bead .149: the per-lane DRIVER registry — plan.lane.driver selects
+        # the spawn callable at the dispatch call site ("claude-code" and
+        # "openalph-exec" are the charter-validated closed set). The
+        # spawn_fn default stays claude_code.spawn (the registry's
+        # claude-code entry is the SAME callable, so no-registry and
+        # claude-code-lane behavior is byte-identical to pre-.149).
+        driver_registry={
+            "claude-code": claude_code.spawn,
+            "openalph-exec": openalph_exec.spawn,
+        },
         # bead .25: egress + relay wired for real (were .22-era placeholders).
         # relay_teardown_fn stays at Daemon's default (RelayHandle.stop).
         egress_setup_fn=egress.setup_dispatch_egress,
