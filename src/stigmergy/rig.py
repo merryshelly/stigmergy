@@ -235,59 +235,6 @@ class RigStore:
                 self._conn.commit()
             self.set_meta("schema_version", "5")
 
-    def _ensure_critic_infra_failures_column(self) -> None:
-        """Self-healing migration (bead .107): add the
-        `critic_infra_failures` column to `tickets` if absent — the
-        per-ticket, PERSISTED consecutive-critic-infra counter behind
-        `decide_critic_infra` (statemachine.py).
-
-        Same guarded-ALTER pattern as `_ensure_functional_summary_column`:
-        idempotent for fresh `.create()` rigs (the column is already in
-        `_SCHEMA_SQL`) and the only migration path for a rig scaffolded
-        before `.107` (schema_version < 5) reopened via plain
-        `RigStore(path)`/`resolve_rig`.
-        """
-        table_exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
-        ).fetchone()
-        if table_exists is None:
-            # Fresh store: `.create()` runs `__init__` BEFORE `_SCHEMA_SQL`
-            # builds `tickets`, and that DDL already carries the column — the
-            # ALTER would only ever fire here on a real pre-.107 rig reopen.
-            return
-        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
-        if "critic_infra_failures" not in cols:
-            self._conn.execute(
-                "ALTER TABLE tickets ADD COLUMN critic_infra_failures INTEGER NOT NULL DEFAULT 0"
-            )
-            self._conn.commit()
-
-    def _ensure_functional_summary_column(self) -> None:
-        """Self-healing migration (bead .42): add the `functional_summary`
-        column to `tickets` if absent (SPEC §6 item 10 / D15 — the 8th
-        steering field).
-
-        A guarded `ALTER TABLE ... ADD COLUMN`, run unconditionally at the end
-        of every `__init__`: idempotent for fresh `.create()` rigs (the column
-        is already in `_SCHEMA_SQL`) and the only migration path for a rig
-        scaffolded before `.42` (schema_version < 4) reopened via plain
-        `RigStore(path)`/`resolve_rig`. Mirrors `_ensure_filed_tickets_table`'s
-        self-heal pattern (a new column can't use `CREATE ... IF NOT EXISTS`,
-        so the presence check is a `PRAGMA table_info` scan).
-        """
-        table_exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tickets'"
-        ).fetchone()
-        if table_exists is None:
-            # Fresh store: `.create()` runs `__init__` BEFORE `_SCHEMA_SQL`
-            # builds `tickets`, and that DDL already carries the column — the
-            # ALTER would only ever fire here on a real pre-.42 rig reopen.
-            return
-        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(tickets)")}
-        if "functional_summary" not in cols:
-            self._conn.execute("ALTER TABLE tickets ADD COLUMN functional_summary TEXT")
-            self._conn.commit()
-
     def _ensure_filed_tickets_table(self) -> None:
         """Self-healing migration (D14): create `filed_tickets` if absent.
 

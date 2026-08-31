@@ -1500,7 +1500,13 @@ def test_oa_worker_toml_template_schema():
     """
     import tomllib
 
-    template = Path(__file__).resolve().parents[1] / "src" / "stigmergy" / "worker_image" / "oa-worker.toml"
+    template = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "stigmergy"
+        / "worker_image"
+        / "oa-worker.toml"
+    )
     data = tomllib.loads(template.read_text(encoding="utf-8"))
 
     agent = data["agent"]
