@@ -898,6 +898,10 @@ def _build_oa_wheelhouse(wheels_dir: Path) -> None:
             tmp_src,
             ignore=shutil.ignore_patterns(
                 ".git", ".venv", "__pycache__", "*.pyc", ".pytest_cache",
+                # .ruff_cache: root-owned cache files in /opt/openalph aborted
+                # the quotagov01 scaffold live (EACCES in copytree, 2026-08-31)
+                # — same class as the .pytest_cache exclusion above.
+                ".ruff_cache",
                 "sessions", "logs", "*.egg-info",
             ),
         )
