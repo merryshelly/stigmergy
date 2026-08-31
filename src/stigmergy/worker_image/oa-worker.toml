@@ -32,10 +32,13 @@ default_model = "blackwell/qwen38-27b-fp8"
 # 8192 (stop_reason=length), the truncated turn was misreported as a
 # clean finish, and the worker exited having committed nothing — empty
 # bundles, integration-conflict loop, escalation (caught live on
-# quotagov01 2026-08-31, bead .159). 32768 gives a big single file
-# emission (~2k lines) comfortable headroom; the per-DISPATCH total
-# stays bounded by the charter's [loop.dispatch_limits] output_tokens.
-max_tokens = 32768
+# quotagov01 2026-08-31, bead .159). 65536 (SB steering: "don't be
+# conservative") covers any legitimate single file emission (~4-5k
+# lines); sized to stay within the narrowest upstream's per-request
+# limit since this TOML also governs future Synthetic ladder rungs
+# (glm53/kimi3). Per-DISPATCH totals remain bounded by the charter's
+# [loop.dispatch_limits] output_tokens.
+max_tokens = 65536
 thinking = "off"
 
 # OA's config schema: the workspace is a TABLE with a `path` key
