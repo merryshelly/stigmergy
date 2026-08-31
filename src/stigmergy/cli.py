@@ -37,13 +37,14 @@ from pathlib import Path
 from typing import Any
 
 from stigmergy import approval, checks, egress, spend, triage
-from stigmergy.charter import Charter, CharterError, resolve_check_resources
+from stigmergy.charter import Charter, CharterError, load_charter, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
 from stigmergy.daemon import Daemon, DaemonError
 from stigmergy.drivers import claude_code, openalph_exec
 from stigmergy.filing import file_proposals
 from stigmergy.keyprovider import make_op_key_provider
+from stigmergy.manifest import validate_manifest
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
 
 # bead .143 (A′): the critic/range-critic now route through OA's
@@ -105,6 +106,8 @@ _USAGE = (
     "  promote <filed-id> --rig <name> [--rigs-root <path>] --spec <path|->\n"
     "  ticket new --rig <name> [--rigs-root <path>] --spec <path|->\n"
     "  intake --rig <name> [--rigs-root <path>] --manifest <path>\n"
+    "  manifest validate --manifest <path> [--repo <path>] [--charter <path>]"
+    " [--rig <name>]\n"
     "  status --rig <name> [--rigs-root <path>]\n"
     "  monitor --rig <name> [--rigs-root <path>] [--tail N]\n"
     "  tickets --rig <name> [--rigs-root <path>]\n"
@@ -220,6 +223,33 @@ def _build_parser() -> argparse.ArgumentParser:
     add_rig_args(intake_parser)
     intake_parser.add_argument(
         "--manifest", required=True, help="Path to a JSON array manifest file."
+    )
+
+    manifest_parser = subparsers.add_parser(
+        "manifest", help="Decomposer manifest tools (read-only)."
+    )
+    manifest_subparsers = manifest_parser.add_subparsers(dest="manifest_command")
+    manifest_validate_parser = manifest_subparsers.add_parser(
+        "validate", help="Validate a decomposer manifest (read-only; exit 1 on any defect)."
+    )
+    manifest_validate_parser.add_argument(
+        "--manifest", required=True, help="Path to a JSON array manifest file."
+    )
+    manifest_validate_parser.add_argument(
+        "--repo", default=None, help="Repo root the target_scope paths are relative to."
+    )
+    manifest_validate_parser.add_argument(
+        "--charter",
+        default=None,
+        help="Charter TOML (enables [checks.*]/[gates]/[lanes.*] cross-checks).",
+    )
+    manifest_validate_parser.add_argument(
+        "--rig", default=None, help="Rig name: resolves repo+charter+store via resolve_rig."
+    )
+    manifest_validate_parser.add_argument(
+        "--rigs-root",
+        default=None,
+        help="Base directory the rig lives under (default: ~/rigs; with --rig).",
     )
 
     range_report_parser = subparsers.add_parser(
@@ -981,6 +1011,61 @@ def _cmd_intake(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
+def _cmd_manifest_validate(args: argparse.Namespace) -> int:
+    """Validate a decomposer manifest (READ-ONLY: never writes).
+
+    Exit 0 iff the manifest is clean; exit 1 on any defect or on a
+    structural failure (missing file, unparseable JSON, manifest not a
+    list, charter load failure, rig resolution failure — the latter two
+    like every other C+D verb). Defects print one greppable line each on
+    STDOUT, followed by a ``N defect(s) across M ticket(s)`` summary.
+    """
+    # --rig resolves repo+charter+store via the shared resolver (it
+    # prints its own `stigmergy: <err>` line and returns rc on failure);
+    # explicit --repo/--charter flags take precedence over the rig.
+    resolved: ResolvedRig | None = None
+    if args.rig:
+        resolved, rc = _resolve_rig_or_none(args)
+        if resolved is None:
+            return rc  # type: ignore[return-value]
+    try:
+        repo: Path | None = Path(args.repo) if args.repo is not None else None
+        charter: Any = None
+        store: Any = None
+        if resolved is not None:
+            repo = resolved.rig_paths["repo_root"]
+            charter = resolved.charter
+            store = resolved.store
+        if args.charter is not None:
+            try:
+                charter = load_charter(args.charter, env={})
+            except (CharterError, OSError) as exc:
+                print(f"stigmergy manifest: {exc}", file=sys.stderr)
+                return 1
+
+        try:
+            manifest_text = Path(args.manifest).read_text(encoding="utf-8")
+            manifest = json.loads(manifest_text)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"stigmergy manifest: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(manifest, list):
+            got = type(manifest).__name__
+            print(f"stigmergy manifest: manifest must be a JSON array (got {got})", file=sys.stderr)
+            return 1
+
+        defects = validate_manifest(
+            manifest, repo=repo, charter=charter, store=store
+        )
+        for defect in defects:
+            print(f"stigmergy manifest: {defect}")
+        print(f"{len(defects)} defect(s) across {len(manifest)} ticket(s)")
+        return 0 if not defects else 1
+    finally:
+        if resolved is not None:
+            resolved.store.close()
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     resolved, rc = _resolve_rig_or_none(args)
     if resolved is None:
@@ -1441,6 +1526,11 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_ticket(args)
     if args.command == "intake":
         return _cmd_intake(args)
+    if args.command == "manifest":
+        if getattr(args, "manifest_command", None) == "validate":
+            return _cmd_manifest_validate(args)
+        print(_USAGE, file=sys.stderr)
+        return 1
     if args.command == "range-report":
         return _cmd_range_report(args)
 
