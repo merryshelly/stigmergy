@@ -1,0 +1,19 @@
+{
+  "id": "dead-migration-helpers-149",
+  "title": "Remove dead _ensure_*_column schema-migration helpers from rig.py",
+  "functional_summary": "Two legacy schema-migration helper methods in src/stigmergy/rig.py — _ensure_critic_infra_failures_column and _ensure_functional_summary_column — have been dead code since the schema-migration-111 refactor centralized migrations into _run_schema_migrations(): nothing anywhere in the repo calls them. Leaving orphaned migration helpers invites drift (a future migration added to one path but not the other). Remove both helpers and nothing else; the live _run_schema_migrations path must be untouched. Provenance: filed by the kimi3 critic during the gatefix05 schema-migration-111 gate review (A/B dogfood, 2026-08-31; see the ab143 report §2.2).",
+  "goal": "Eliminate the two dead _ensure_*_column migration helpers so the live _run_schema_migrations() path is the single, unambiguous schema-migration mechanism.",
+  "acceptance_criteria": [
+    "Both methods `def _ensure_critic_infra_failures_column` and `def _ensure_functional_summary_column` are removed from src/stigmergy/rig.py, including their docstrings and any comment blocks exclusive to them.",
+    "The live migration path is untouched: the diff does not modify _run_schema_migrations, its version guards, its PRAGMA column-presence checks, _SCHEMA_SQL, or any migration ordering logic.",
+    "The removed helper names no longer appear anywhere in the repo (src/ or tests/) — they are verified to have zero call sites today, so a clean removal leaves no stragglers.",
+    "The diff touches src/stigmergy/rig.py only and is a pure removal: no new functions, no behavior changes, at most trivial whitespace/docstring cleanup in the immediate vicinity of the removed methods.",
+    "No instructions addressed to models or agents appear anywhere in the diff."
+  ],
+  "tier1_checks": {
+    "ruff": "cd /work && ruff check .",
+    "tests": "cd /work && TMPDIR=/scratch PYTHONPATH=/work/src PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider"
+  },
+  "target_scope": ["src/stigmergy/rig.py"],
+  "difficulty": "low"
+}

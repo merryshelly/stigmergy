@@ -33,12 +33,14 @@ from stigmergy.cli import main
 from stigmergy.manifest import validate_manifest
 from stigmergy.rig import RigStore, create_rig
 
-# The real one-ticket dogfood fixture (bead .149). Its `difficulty: "low"`
-# is OFF the decomposer vocabulary (trivial|easy|medium|hard|frontier) —
-# that is a DESIGNED test case, not a fixture bug.
-FIXTURE_PATH = Path(
-    "/home/oa-merry/workspace/tmp/bead149-dogfood/ticket-dead-migration-helpers.json"
-)
+# The real one-ticket dogfood fixture (bead .149), vendored into the repo.
+# Its `difficulty: "low"` is OFF the decomposer vocabulary
+# (trivial|easy|medium|hard|frontier) — that is a DESIGNED test case, not a
+# fixture bug. Repo-relative so the suite is HERMETIC: the original absolute
+# path (/home/oa-merry/workspace/tmp/...) passed on the host but made every
+# fresh clone's Tier-1 fail (caught live by the first quotagov01 worker, which
+# filed it through the D14 channel instead of editing out of scope).
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "manifest-happy-path.json"
 
 # The repo's own minimal valid charter fixture (checks {pytest, lint},
 # gates attempt/staging = ["lint", "pytest"], lanes {cheap, default,
