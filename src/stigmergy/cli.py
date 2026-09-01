@@ -35,7 +35,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from stigmergy import approval, checks, decompose, egress, spend, triage
+from stigmergy import approval, checks, egress, spend, triage
 from stigmergy.charter import Charter, CharterError, load_charter, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
@@ -59,7 +59,6 @@ from stigmergy.oa_critic import (
     DEFAULT_MAX_TOKENS,
     CriticOAUnavailableError,
     make_oa_critic_client,
-    make_oa_decompose_critic_client,
     make_oa_range_critic_client,
 )
 from stigmergy.rangereport import (
@@ -1317,68 +1316,26 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
-def _build_decompose_critic(resolved: ResolvedRig) -> decompose.DecomposeCritic:
-    """Production `DecomposeCritic` builder (bead workspace-e2uh.152,
-    Decision 17 — the decomposer band's gate 2 of 2) — in the
-    `_build_range_critic` mold: a monkeypatchable module-level helper,
-    called by plain module-global name at every call site so tests can
-    replace `cli._build_decompose_critic` wholesale.
-
-    Reads the SAME `[roles.critic].model` + `max_tokens` as the
-    staging-gate critic (shared model, separate forced tool —
-    `submit_validation`), resolves the op key ref through
-    `_critic_key_ref_for` (the ref follows the PROVIDER, Decision 3), and
-    reads the `decomposecritic01` prompt artifact (sha256'd by the critic
-    itself for the `prompt_artifact_hash` provenance).
-
-    Fail-closed (Decision 1): `CriticOAUnavailableError` (an OA-less
-    environment) and `CharterError` (a non-Anthropic critic entry with no
-    `STIGMERGY_CRITIC_OA_KEY_REF`) are loud RIG-LAUNCH failures handled by
-    `_cmd_decompose` exactly like `range-report`'s handling — exit 1,
-    stderr, before any decomposer spend.
-    """
-    critic_cfg = resolved.charter.raw["roles"]["critic"]
-    critic_key_provider = make_op_key_provider(
-        _critic_key_ref_for(resolved.registry, critic_cfg["model"])
-    )
-    return decompose.DecomposeCritic.from_prompt_file(
-        resolved.rig_paths["prompts_dir"] / "decomposecritic01",
-        client=make_oa_decompose_critic_client(
-            key_provider=critic_key_provider,
-            registry=resolved.registry,
-            max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
-        ),
-        model=critic_cfg["model"],
-        decoding_params={},
-    )
-
-
 def _cmd_decompose(args: argparse.Namespace) -> int:
     """The `decompose` station command (bead workspace-e2uh.152, Decision
-    17): one command turns the operator spec into a seeded,
-    machine-validated, critic-cleared ticket DAG.
+    17; Decision 18 — the Station Contract): one command turns the
+    operator spec into a seeded, machine-validated, critic-cleared ticket
+    DAG.
 
-    The validation critic is built at LAUNCH (fail-closed — an OA-less
-    environment or a missing key ref is a loud launch failure, exactly like
-    `range-report --critic`), and the built instance is what
-    `decompose.run_decompose` receives as its `critic_factory` (never
-    rebuilt per judgment). The driver's return code IS the command's
-    (0 = seeded / dry-run clean; 1 = escape / non-convergence / phase
-    defect / critic malformed-after-retry; 2 = exec failure after retry);
-    the driver itself prints the one-line stderr reason + run dir on
-    failure.
+    The validation critic is a STATION, not a library call (Decision 18):
+    the driver owns the ephemeral agent's exec invocation (the CLI passes
+    NOTHING critic-related to `decompose.run_decompose` — the critic model
+    resolves from the charter `[roles.critic].model` registry entry inside
+    the driver). The driver's return code IS the command's (0 = seeded /
+    dry-run clean; 1 = escape / non-convergence / phase defect / critic
+    failure after its bounded retry; 2 = decomposer exec failure after
+    retry); the driver itself prints the one-line stderr reason + run dir
+    on failure.
     """
     resolved, rc = _resolve_rig_or_none(args)
     if resolved is None:
         return rc  # type: ignore[return-value]
     try:
-        try:
-            critic = _build_decompose_critic(resolved)
-        except (CriticOAUnavailableError, CharterError) as exc:
-            # Fail-closed at launch — the same handling as `range-report`
-            # (bead .143): a loud exit-1 stderr, never a mid-run trip.
-            print(f"stigmergy decompose: {exc}", file=sys.stderr)
-            return 1
         return run_decompose(
             rig_name=args.rig,
             spec_path=args.spec,
@@ -1388,7 +1345,6 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
             decomposer_effort=args.decomposer_effort,
             dry_run=args.dry_run,
             rigs_root=args.rigs_root,
-            critic_factory=lambda _resolved: critic,
         )
     finally:
         resolved.store.close()

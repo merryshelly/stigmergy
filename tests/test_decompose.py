@@ -15,13 +15,15 @@ Two deliverables under test:
    operator spec into a seeded, machine-validated, critic-cleared ticket DAG
    in ONE command (render task -> `openalph exec` decomposer -> classify
    manifest/phase_plan/escape/failure -> deterministic validator ->
-   in-process validation critic -> bounded repair loop -> per-phase fan-out
-   -> intake + auto-approve -> DECOMPOSE provenance events).
+   validation critic STATION (an ephemeral agent exec, Decision 18) ->
+   bounded edit-in-place repair loop -> per-phase fan-out -> intake +
+   auto-approve -> DECOMPOSE provenance events).
 
-ALL stub-driven: no network, no real `openalph exec`, no real critic calls.
-The seams are the `decompose` module's `_run_exec` subprocess wrapper and
-the injected critic client; rigs are real tmp scaffolds (real git clone,
-real SQLite store) so intake/approval/records run on production code paths.
+ALL stub-driven: no network, no real `openalph exec`, no real critic
+sessions. The seams are the `decompose` module's `_run_exec` (decomposer
+exec) and `_run_critic_exec` (critic station exec) subprocess wrappers;
+rigs are real tmp scaffolds (real git clone, real SQLite store) so
+intake/approval/records run on production code paths.
 """
 
 from __future__ import annotations
@@ -29,7 +31,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,6 @@ import pytest
 import stigmergy.cli as cli
 from stigmergy import decompose
 from stigmergy.intake import ingest_manifest
-from stigmergy.oa_critic import CriticOAUnavailableError
 from stigmergy.rig import RigStore, create_rig, resolve_rig
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -290,6 +290,27 @@ def test_cli_intake_delegates_and_stays_byte_identical(
 # deliverable 2 — the decompose driver
 # ==========================================================================
 
+@pytest.fixture(autouse=True)
+def _hermetic_station(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Decision-18 hermeticity for EVERY test in this module: the agent-TOML
+    preflight is pinned at an existing dummy file and the critic-exec seam
+    carries a DEFAULT accept response — so no test depends on the host's OA
+    config dir or the real `openalph` binary. Tests that need specific
+    critic behavior override the seam via `_critic_exec` (test-level setattr
+    runs after this fixture and wins)."""
+    agent_toml = tmp_path / "hermetic-agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+
+    def _default_critic_exec(
+        argv: list[str], env: dict[str, str], timeout: float
+    ) -> subprocess.CompletedProcess:
+        line = _critic_exec_result()
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(line) + "\n", stderr="")
+
+    monkeypatch.setattr(decompose, "_run_critic_exec", _default_critic_exec)
+
+
 SPEC_TEXT = (
     "Build a CLI decompose station for the shipyard rig. Deliverables: a "
     "rendering module and a runner module."
@@ -352,9 +373,12 @@ def _fake_exec(
     script: list[Any],
     *,
     env_probe: list[dict[str, str]] | None = None,
+    preseed_log: list[tuple[str | None, str | None]] | None = None,
 ) -> list[list[str]]:
-    """Monkeypatch the decompose module's `_run_exec` seam with a scripted
-    fake. Each script item is one of:
+    """Monkeypatch the decompose module's `_run_exec` seam (the DECOMPOSER's
+    exec; the critic STATION's exec is the `_run_critic_exec` seam, faked
+    by `_critic_exec` in the same style) with a scripted fake. Each script
+    item is one of:
 
     - a callable ``(argv, env) -> CompletedProcess``;
     - an Exception instance to raise;
@@ -390,6 +414,18 @@ def _fake_exec(
             result_obj = _exec_result()
         task_idx = argv.index("--task-file") + 1
         scratch = Path(argv[task_idx]).parent
+        # Snapshot the scratch state at EXEC ENTRY (before this round's
+        # writes) — the only observable record of what the driver
+        # pre-seeded (Decision 18 edit-in-place pre-seeding).
+        if preseed_log is not None:
+            m = scratch / "manifest.json"
+            n = scratch / "notes.md"
+            preseed_log.append(
+                (
+                    m.read_text(encoding="utf-8") if m.exists() else None,
+                    n.read_text(encoding="utf-8") if n.exists() else None,
+                )
+            )
         if item.get("manifest") is not None:
             text = item["manifest"]
             (scratch / "manifest.json").write_text(
@@ -406,59 +442,35 @@ def _fake_exec(
     return calls
 
 
-def _accept_response(
+def _critic_exec_result(
     *,
     verdict: str = "accept",
     findings: list[dict] | None = None,
+    evidence_log: list[dict] | None = None,
+    summary: str = "manifest is faithful to the spec",
     usage: dict | None = None,
 ) -> dict[str, Any]:
+    """One critic STATION exec stdout JSON line (Decision 18): a `done`
+    status whose top-level `result` field IS the submit_validation payload
+    (the OA terminal-tool mechanism)."""
     return {
-        "verdict": verdict,
-        "summary": "manifest is faithful to the spec",
-        "findings": findings or [],
+        "status": "done",
+        "content": "critic says done",
         "usage": usage if usage is not None else {"in": 5, "cached": 1, "out": 9, "reasoning": 0},
+        "stop_reason": "end_turn",
+        "ceiling_trip": None,
+        "deny_reason": None,
+        "tool_trace": [],
+        "detail": "",
+        "result": {
+            "verdict": verdict,
+            "summary": summary,
+            "findings": findings if findings is not None else [],
+            "evidence_log": evidence_log if evidence_log is not None else [],
+        },
     }
 
 
-def _critic_factory(
-    script: list[Any],
-    *,
-    template: str = "decomposecritic01 template",
-    model: str = "stub-critic-model",
-) -> tuple[Callable[[Any], decompose.DecomposeCritic], list[str], list[dict[str, Any]]]:
-    """A stub critic factory for `run_decompose(critic_factory=...)`.
-
-    Each client call returns the next item of `script` (a response dict, or
-    an Exception instance to raise; the LAST item repeats if more calls
-    occur than items). Returns `(factory, prompts, calls)` where `prompts`
-    is the list of composed prompts (in call order) and `calls` records
-    each call's kwargs (model/decoding_params) for the call-discipline
-    assertions. The factory ignores its `resolved` argument (the CLI passes
-    it; the stub doesn't need it).
-    """
-    prompts: list[str] = []
-    calls: list[dict[str, Any]] = []
-    cursor = 0
-
-    def client(p: str, *, model: str, **params: Any) -> Any:
-        nonlocal cursor
-        prompts.append(p)
-        calls.append({"model": model, "params": dict(params)})
-        item = script[min(cursor, len(script) - 1)]
-        cursor += 1
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def factory(_resolved: Any) -> decompose.DecomposeCritic:
-        return decompose.DecomposeCritic(
-            client=client,
-            model=model,
-            template=template,
-            decoding_params={},
-        )
-
-    return factory, prompts, calls
 
 
 def _resolve(rigs_root: Path) -> Any:
@@ -479,11 +491,12 @@ def _run(
     critic_script: list[Any] | None = None,
     env_probe: list[dict[str, str]] | None = None,
     **kwargs: Any,
-) -> tuple[int, list[list[str]], list[str], list[dict[str, Any]], Path]:
+) -> tuple[int, list[list[str]], list[list[str]], Path]:
     """Scaffold a rig + spec, stub the exec + critic seams, and call
-    `decompose.run_decompose`. Returns
-    `(rc, exec_calls, critic_prompts, critic_calls, run_dir)` where
-    `run_dir` is the single subdir under the decompose root."""
+    `decompose.run_decompose` (NO critic_factory — Decision 18: the
+    driver owns the critic exec invocation). Returns
+    `(rc, exec_calls, critic_argvs, run_dir)` where `run_dir` is the
+    single subdir under the decompose root."""
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path, kwargs.pop("spec_text", SPEC_TEXT))
     decompose_root = tmp_path / "decompose-root"
@@ -493,18 +506,18 @@ def _run(
     agent_toml = tmp_path / "agent.toml"
     agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
     monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
-    critic_factory, prompts, calls = _critic_factory(critic_script or [_accept_response()])
+    critic_script = critic_script if critic_script is not None else [_critic_exec_result()]
     exec_calls = _fake_exec(monkeypatch, script, env_probe=env_probe)
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script, env_probe=env_probe)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=decompose_root,
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         **kwargs,
     )
     run_dirs = list((decompose_root / "decompose").iterdir())
-    return rc, exec_calls, prompts, calls, run_dirs[0]
+    return rc, exec_calls, critic_argvs, run_dirs[0]
 
 
 def _decompose_events(rigs_root: Path) -> list[dict[str, Any]]:
@@ -537,7 +550,11 @@ def test_render_task_initial_has_required_sections() -> None:
     assert "/tmp/stig-decomposer/ws/abc/notes.md" in text
 
 
-def test_render_task_repair_carries_load_bearing_rules_verbatim() -> None:
+def test_render_task_repair_carries_edit_in_place_rules_verbatim() -> None:
+    """The repair task carries the load-bearing edit-in-place rules pinned
+    VERBATIM (Decision 18) and points at the on-disk previous files (paths
+    — their full text is NOT embedded; the round's scratch dir is
+    pre-seeded by the driver)."""
     text = decompose.render_task(
         mode="repair",
         spec=SPEC_TEXT,
@@ -545,26 +562,31 @@ def test_render_task_repair_carries_load_bearing_rules_verbatim() -> None:
         charter_path="/charter.toml",
         manifest_path="/scratch/manifest.json",
         notes_path="/scratch/notes.md",
-        previous_manifest_text='[{"id": "a"}]',
-        previous_notes_text="prior notes",
-        findings=["1. fidelity: ticket a misses the CLI deliverable"],
+        previous_manifest_path="/scratch/manifest.json",
+        previous_notes_path="/scratch/notes.md",
+        findings=["fidelity: ticket a misses the CLI deliverable"],
         round_no=1,
     )
-    # The three load-bearing repair rules, pinned VERBATIM (bead
-    # workspace-e2uh.152).
+    # The load-bearing edit-in-place repair rules, pinned VERBATIM
+    # (Decision 18).
     assert (
-        "Change only what the findings require. Keep every ticket id stable "
+        "The files already exist in your workspace — edit them in place "
+        "with file_edit/file_patch. Change only what the findings require; "
+        "leave every other byte identical. Keep every ticket id stable "
         "unless a finding demands a rename. Address every finding; do not "
-        "weaken criteria to make findings disappear. Re-emit BOTH complete "
-        "files."
+        "weaken criteria to make findings disappear. After editing, "
+        "file_read your output and verify it. Manifest lines are "
+        "independent JSON objects (JSONL) — a damaged line is fixed "
+        "line-wise."
     ) in text
-    # Previous artifacts + numbered findings ride along.
-    assert '[{"id": "a"}]' in text
-    assert "prior notes" in text
-    assert "fidelity: ticket a misses the CLI deliverable" in text
-    # And the re-emit target paths.
+    # The on-disk previous files are named by PATH; the previous text is
+    # NOT embedded (edit-in-place, not re-emit-both-files).
     assert "/scratch/manifest.json" in text
     assert "/scratch/notes.md" in text
+    assert "[{" not in text
+    # The findings still ride along.
+    assert "fidelity: ticket a misses the CLI deliverable" in text
+
 
 
 def test_render_task_phase_carries_prior_manifests_and_real_ids() -> None:
@@ -843,104 +865,6 @@ def test_run_decomposer_child_env_proxy_unset_and_key_set(
     assert env["STIG_DECOMP_KEY"] == "stub-decomp-key"
 
 
-# --- DecomposeCritic --------------------------------------------------------
-
-
-def test_decompose_critic_prompt_composition_order(tmp_path: Path) -> None:
-    """Prompt order (the decomposecritic01 <input_contract>): artifact text
-    FIRST, then spec, manifest, notes, evidence bundle, validator report —
-    plus the pre-verified-mechanical-checks instruction."""
-    factory, prompts, _ = _critic_factory([_accept_response()])
-    critic = factory(None)
-    critic.review(
-        spec="SPEC-CONTENT",
-        manifest_text='[{"id": "a"}]',
-        notes_text="NOTES-CONTENT",
-        evidence_bundle="EVIDENCE-CONTENT",
-        validator_report=[],
-    )
-    assert len(prompts) == 1
-    prompt = prompts[0]
-    i_template = prompt.find("decomposecritic01 template")
-    i_spec = prompt.find("## Spec\nSPEC-CONTENT")
-    i_manifest = prompt.find("## Manifest (JSON)\n[")
-    i_notes = prompt.find("## Notes\nNOTES-CONTENT")
-    i_bundle = prompt.find("## Evidence bundle\nEVIDENCE-CONTENT")
-    i_report = prompt.find("## Validator report\n")
-    assert -1 < i_template < i_spec < i_manifest < i_notes < i_bundle < i_report
-    assert "pre-verified" in prompt
-    assert "submit_validation" in prompt
-
-
-def test_decompose_critic_from_prompt_file_hashes_raw_bytes(tmp_path: Path) -> None:
-    import hashlib
-
-    template_path = tmp_path / "decomposecritic01"
-    template_path.write_text("critic template bytes\n", encoding="utf-8")
-    critic = decompose.DecomposeCritic.from_prompt_file(
-        template_path, client=lambda *a, **k: {}, model="m"
-    )
-    # SPEC §4: sha256 of the RAW template bytes.
-    assert critic.prompt_artifact_hash == hashlib.sha256(
-        b"critic template bytes\n"
-    ).hexdigest()
-    assert critic.decoding_params == {}
-
-
-def test_decompose_critic_returns_verdict_and_usage() -> None:
-    factory, _, calls = _critic_factory(
-        [_accept_response(verdict="accept", findings=[
-            {"aspect": "sizing", "severity": "minor", "tickets": ["a"],
-             "evidence": "big", "direction": "split"}
-        ], usage={"in": 7, "cached": 1, "out": 3, "reasoning": 0})]
-    )
-    critic = factory(None)
-    result = critic.review(
-        spec="s", manifest_text="m", notes_text="n", evidence_bundle="e",
-        validator_report=["clean"],
-    )
-    assert result["verdict"] == "accept"
-    assert result["summary"]
-    assert result["findings"][0]["aspect"] == "sizing"
-    assert result["usage"] == {"in": 7, "cached": 1, "out": 3, "reasoning": 0}
-    assert result["prompt_artifact_hash"] == critic.prompt_artifact_hash
-    # Call discipline: the model + decoding_params={} (the OA forced-tool
-    # path rejects non-empty decoding params).
-    assert calls[0]["model"] == "stub-critic-model"
-    assert calls[0]["params"] == {}
-
-
-def test_decompose_critic_malformed_one_retry_then_error() -> None:
-    """A malformed response gets exactly ONE retry call, then a
-    DecomposeError (never a third call)."""
-    factory, _, calls = _critic_factory([
-        "not a dict",
-        {"verdict": "banana", "summary": "s", "findings": []},  # bad verdict
-    ])
-    critic = factory(None)
-    with pytest.raises(decompose.DecomposeError, match="malformed after retry"):
-        critic.review(
-            spec="s", manifest_text="m", notes_text="n", evidence_bundle="e",
-            validator_report=[],
-        )
-    assert len(calls) == 2  # exactly one retry
-
-
-def test_decompose_critic_client_exception_one_retry_then_error() -> None:
-    """A client/transport exception is the same one-retry budget: two calls
-    total, then DecomposeError."""
-    factory, _, calls = _critic_factory([
-        RuntimeError("provider down"),
-        RuntimeError("provider down"),
-    ])
-    critic = factory(None)
-    with pytest.raises(decompose.DecomposeError, match="malformed after retry"):
-        critic.review(
-            spec="s", manifest_text="m", notes_text="n", evidence_bundle="e",
-            validator_report=[],
-        )
-    assert len(calls) == 2
-
 
 # --- evidence bundle ---------------------------------------------------------
 
@@ -1010,23 +934,21 @@ def test_run_decompose_happy_path_seeds_and_approves(tmp_path: Path, monkeypatch
         rigs_root_holder["rr"] = rigs_root
         spec = _write_spec(tmp_path)
         decompose_root = tmp_path / "decompose-root"
-        critic_factory, prompts, calls = _critic_factory(
-            [_accept_response(verdict="accept")]
-        )
+        critic_script = [_critic_exec_result(verdict="accept")]
         exec_calls = _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+        critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
         rc = decompose.run_decompose(
             rig_name=RIG,
             spec_path=spec,
             decompose_root=decompose_root,
             rigs_root=rigs_root,
-            critic_factory=critic_factory,
         )
-        return rc, exec_calls, prompts, calls, decompose_root, rigs_root
+        return rc, exec_calls, critic_argvs, decompose_root, rigs_root
 
-    rc, exec_calls, prompts, calls, decompose_root, rigs_root = with_rig(tmp_path, monkeypatch)
+    rc, exec_calls, critic_argvs, decompose_root, rigs_root = with_rig(tmp_path, monkeypatch)
     assert rc == 0
     assert len(exec_calls) == 1  # one decomposer session, no repairs
-    assert len(prompts) == 1  # one critic call
+    assert len(critic_argvs) == 1  # one critic station exec
 
     # The 2-ticket DAG is seeded with the dependency wired.
     t_base = _ticket(rigs_root, "t-base")
@@ -1076,14 +998,16 @@ def test_run_decompose_no_approve_leaves_unapproved(tmp_path: Path, monkeypatch)
     manifest = [_ticket_entry("t-only")]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
     _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+    _critic_exec(monkeypatch, [_critic_exec_result()])
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         no_approve=True,
     )
     assert rc == 0
@@ -1093,17 +1017,14 @@ def test_run_decompose_no_approve_leaves_unapproved(tmp_path: Path, monkeypatch)
 
 
 def test_run_decompose_dry_run_intakes_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
-    manifest = [_ticket_entry("t-dry")]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
-    _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+    _fake_exec(monkeypatch, [{"manifest": [_ticket_entry("t-dry")], "notes": "n"}])
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         dry_run=True,
     )
     assert rc == 0
@@ -1117,23 +1038,23 @@ def test_run_decompose_escape_is_exit_1(tmp_path: Path, monkeypatch, capsys) -> 
     records the diagnosis, and NO ticket is seeded."""
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     exec_calls = _fake_exec(
         monkeypatch, [{"notes": "The spec is contradictory between A and B."}]
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 1
     assert len(exec_calls) == 1  # escape never retried
     err = capsys.readouterr().err
     assert "decompose:" in err
     # No critic call (no manifest to judge).
-    assert len(prompts) == 0
+    assert len(critic_argvs) == 0
     # No tickets seeded.
     assert _resolve(rigs_root).store.list_tickets() == [] or True
     resolved = _resolve(rigs_root)
@@ -1162,7 +1083,7 @@ def test_run_decompose_validator_defect_repairs_without_critic(
     good = [_ticket_entry("t-good")]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, calls = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     _fake_exec(
         monkeypatch,
         [
@@ -1170,37 +1091,40 @@ def test_run_decompose_validator_defect_repairs_without_critic(
             {"manifest": good, "notes": "n2"},  # repair round: clean
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
     assert _ticket(rigs_root, "t-good") is not None
     # The critic was called exactly ONCE — only after the repair produced a
     # validator-clean manifest (never over the schema-broken one).
-    assert len(prompts) == 1
-    assert len(calls) == 1
+    assert len(critic_argvs) == 1
 
 
 def test_run_decompose_clean_manifest_critic_once(tmp_path: Path, monkeypatch) -> None:
     manifest = [_ticket_entry("t-a")]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, calls = _critic_factory([_accept_response()])
-    _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    exec_calls = _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+    critic_argvs, _critic_scratches = _critic_exec(
+        monkeypatch, [_critic_exec_result()]
+    )
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
-    assert len(prompts) == 1  # exactly one critic call
-    assert len(calls) == 1
+    assert len(critic_argvs) == 1  # exactly one critic call
+    assert len(exec_calls) == 1
 
 
 def test_run_decompose_accept_with_minor_proceeds(tmp_path: Path, monkeypatch) -> None:
@@ -1213,20 +1137,20 @@ def test_run_decompose_accept_with_minor_proceeds(tmp_path: Path, monkeypatch) -
     ]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, calls = _critic_factory(
-        [_accept_response(verdict="accept", findings=minor)]
-    )
+    critic_script = [
+        _critic_exec_result(verdict="accept", findings=minor)
+    ]
     exec_calls = _fake_exec(monkeypatch, [{"manifest": manifest, "notes": "n"}])
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
     assert len(exec_calls) == 1  # no repair
-    assert len(prompts) == 1  # one critic call
+    assert len(critic_argvs) == 1  # one critic call
     assert _ticket(rigs_root, "t-a") is not None
 
 
@@ -1245,10 +1169,10 @@ def test_run_decompose_verdict_repair_triggers_second_round(
     ]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, calls = _critic_factory([
-        _accept_response(verdict="repair", findings=major),  # round 0
-        _accept_response(verdict="accept"),  # after repair
-    ])
+    critic_script = [
+        _critic_exec_result(verdict="repair", findings=major),  # round 0
+        _critic_exec_result(verdict="accept"),  # after repair
+    ]
     exec_calls = _fake_exec(
         monkeypatch,
         [
@@ -1256,16 +1180,16 @@ def test_run_decompose_verdict_repair_triggers_second_round(
             {"manifest": good, "notes": "n2"},
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
     assert len(exec_calls) == 2  # initial + one repair
-    assert len(prompts) == 2  # two critic calls (round 0 + after repair)
+    assert len(critic_argvs) == 2  # two critic calls (round 0 + after repair)
     assert _ticket(rigs_root, "t-a") is not None
 
 
@@ -1282,10 +1206,10 @@ def test_run_decompose_non_convergence_fails_loud(
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
     # Round 0: repair with 1 major. After repair: SAME 1 major (flat).
-    critic_factory, prompts, calls = _critic_factory([
-        _accept_response(verdict="repair", findings=major),
-        _accept_response(verdict="repair", findings=major),  # flat -> non-converge
-    ])
+    critic_script = [
+        _critic_exec_result(verdict="repair", findings=major),
+        _critic_exec_result(verdict="repair", findings=major),  # flat -> non-converge
+    ]
     exec_calls = _fake_exec(
         monkeypatch,
         [
@@ -1293,12 +1217,12 @@ def test_run_decompose_non_convergence_fails_loud(
             {"manifest": manifest, "notes": "n2"},
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         max_repairs=2,
     )
     assert rc == 1
@@ -1327,10 +1251,10 @@ def test_run_decompose_budget_exhaustion_carries_findings(
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
     # round 0: 2 major, then round 1: 1 major (strictly decreased, budget gone)
-    critic_factory, prompts, calls = _critic_factory([
-        _accept_response(verdict="repair", findings=two_major),
-        _accept_response(verdict="repair", findings=one_major),
-    ])
+    critic_script = [
+        _critic_exec_result(verdict="repair", findings=two_major),
+        _critic_exec_result(verdict="repair", findings=one_major),
+    ]
     exec_calls = _fake_exec(
         monkeypatch,
         [
@@ -1339,12 +1263,12 @@ def test_run_decompose_budget_exhaustion_carries_findings(
             {"manifest": manifest, "notes": "n3"},
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         max_repairs=1,
     )
     assert rc == 1
@@ -1361,7 +1285,7 @@ def test_run_decompose_exec_failure_after_retry_is_exit_2(
     the escape's exit 1."""
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     exec_calls = _fake_exec(
         monkeypatch,
         [
@@ -1369,18 +1293,18 @@ def test_run_decompose_exec_failure_after_retry_is_exit_2(
             {"result": _exec_result(deny_reason="quota-tokens")},
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 2
     assert len(exec_calls) == 2
     err = capsys.readouterr().err
     assert "exec failed" in err
-    assert len(prompts) == 0  # no critic call
+    assert len(critic_argvs) == 0  # no critic call
 
 
 # --- run_decompose: provenance ----------------------------------------------
@@ -1397,21 +1321,23 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
     spec = _write_spec(tmp_path)
 
     critic_usage = {"in": 4, "cached": 0, "out": 6, "reasoning": 0}
-    critic_factory, prompts, _ = _critic_factory(
-        [_accept_response(usage=critic_usage)],
-        model="claude-max-sub",  # a subscription entry -> computed_usd 0.0
-    )
+    critic_script = [
+        _critic_exec_result(usage=critic_usage),
+    ]
     _fake_exec(
         monkeypatch,
         [{"manifest": manifest, "notes": "n",
           "result": _exec_result(usage=decomp_usage)}],
     )
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
         decomposer_model="claude-max-sub",  # also subscription -> 0.0
     )
     assert rc == 0
@@ -1474,7 +1400,7 @@ def test_run_decompose_failed_exec_emits_no_event(tmp_path: Path, monkeypatch) -
     (nothing invoked successfully) — and no critic event (no manifest)."""
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     _fake_exec(
         monkeypatch,
         [
@@ -1482,16 +1408,16 @@ def test_run_decompose_failed_exec_emits_no_event(tmp_path: Path, monkeypatch) -
             {"result": _exec_result(deny_reason="quota-tokens")},
         ],
     )
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 2
     assert _decompose_events(rigs_root) == []
-    assert len(prompts) == 0
+    assert len(critic_argvs) == 0
 
 
 def test_run_decompose_dispatch_id_phase_and_round_suffixes(
@@ -1509,10 +1435,10 @@ def test_run_decompose_dispatch_id_phase_and_round_suffixes(
     p2_manifest = [_ticket_entry("t-p2", scope=["src/util.py"], blocks=["t-p1"])]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([
-        _accept_response(),  # p1 critic
-        _accept_response(),  # p2 critic
-    ])
+    critic_script = [
+        _critic_exec_result(),  # p1 critic
+        _critic_exec_result(),  # p2 critic
+    ]
     _fake_exec(
         monkeypatch,
         [
@@ -1521,12 +1447,17 @@ def test_run_decompose_dispatch_id_phase_and_round_suffixes(
             {"manifest": p2_manifest, "notes": "n2"},  # phase p2
         ],
     )
+    # Decision 18: the critic is ALSO an exec station — stub its seam +
+    # pin the agent-TOML preflight hermetically.
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
     events = _decompose_events(rigs_root)
@@ -1564,10 +1495,10 @@ def test_phase_fanout_topo_order_and_real_ids(tmp_path: Path, monkeypatch) -> No
     p2_manifest = [_ticket_entry("t-p2", scope=["src/util.py"], blocks=["t-p1"])]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([
-        _accept_response(),  # p1 critic
-        _accept_response(),  # p2 critic
-    ])
+    critic_script = [
+        _critic_exec_result(),  # p1 critic
+        _critic_exec_result(),  # p2 critic
+    ]
     _fake_exec(
         monkeypatch,
         [
@@ -1576,12 +1507,15 @@ def test_phase_fanout_topo_order_and_real_ids(tmp_path: Path, monkeypatch) -> No
             {"manifest": p2_manifest, "notes": "n2"},  # p2 (second)
         ],
     )
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 0
 
@@ -1600,7 +1534,7 @@ def test_phase_fanout_topo_order_and_real_ids(tmp_path: Path, monkeypatch) -> No
     # task (the 3rd exec's task file) cites p1's real ticket id. The task
     # artifacts are in the run dir; the p2 task is the later one.
     run_dir = list((tmp_path / "d" / "decompose").iterdir())[0]
-    tasks = sorted(run_dir.glob("task-*.md"))
+    tasks = sorted(run_dir.glob("task-*.md"), key=lambda p: int(p.stem.split("-")[1]))
     p2_task_text = max(tasks, key=lambda p: int(p.stem.split("-")[1]))
     text = p2_task_text.read_text()
     assert "real-ticket" not in text
@@ -1620,18 +1554,18 @@ def test_phase_fanout_cycle_is_error(tmp_path: Path, monkeypatch, capsys) -> Non
     ]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     _fake_exec(monkeypatch, [{"manifest": plan}])
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 1
     assert "cycle" in capsys.readouterr().err
-    assert len(prompts) == 0  # no critic: the plan defect fails before any phase
+    assert len(critic_argvs) == 0  # no critic: the plan defect fails before any phase
 
 
 def test_phase_fanout_unknown_dep_is_error(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1641,18 +1575,18 @@ def test_phase_fanout_unknown_dep_is_error(tmp_path: Path, monkeypatch, capsys) 
     ]
     rigs_root = scaffold_rig(tmp_path)
     spec = _write_spec(tmp_path)
-    critic_factory, prompts, _ = _critic_factory([_accept_response()])
+    critic_script = [_critic_exec_result()]
     _fake_exec(monkeypatch, [{"manifest": plan}])
+    critic_argvs, _critic_scratches = _critic_exec(monkeypatch, critic_script)
     rc = decompose.run_decompose(
         rig_name=RIG,
         spec_path=spec,
         decompose_root=tmp_path / "d",
         rigs_root=rigs_root,
-        critic_factory=critic_factory,
     )
     assert rc == 1
     assert "unknown phase" in capsys.readouterr().err
-    assert len(prompts) == 0
+    assert len(critic_argvs) == 0
 
 
 # --- CLI wiring ---------------------------------------------------------------
@@ -1684,7 +1618,6 @@ def test_cli_decompose_verb_wired(monkeypatch) -> None:
     monkeypatch.setattr(
         cli, "resolve_rig", lambda name, rigs_root=None: _StubResolved()
     )
-    monkeypatch.setattr(cli, "_build_decompose_critic", lambda resolved: object())
     monkeypatch.setattr(cli, "run_decompose", fake_run_decompose)
     rc = cli.main([
         "decompose",
@@ -1754,7 +1687,6 @@ def test_preflight_agent_toml_missing_fails_loud(tmp_path: Path, monkeypatch, ca
         spec_path=spec,
         decompose_root=tmp_path / "decompose-root",
         rigs_root=rigs_root,
-        critic_factory=lambda resolved: object(),
     )
     assert rc == 1
     err = capsys.readouterr().err
@@ -1780,7 +1712,6 @@ def test_cli_decompose_exit_codes_surfaced(monkeypatch) -> None:
     monkeypatch.setattr(
         cli, "resolve_rig", lambda name, rigs_root=None: _StubResolved()
     )
-    monkeypatch.setattr(cli, "_build_decompose_critic", lambda resolved: object())
     # The stub's return value lives in a stable dict (identity constant,
     # contents mutated per iteration) so the closure is B023-safe: the call
     # is synchronous within each iteration, after the mutation.
@@ -1796,166 +1727,677 @@ def test_cli_decompose_exit_codes_surfaced(monkeypatch) -> None:
         assert rc == code
 
 
-# --- _build_decompose_critic (CLI mold) ---------------------------------------
+# ==========================================================================
+# Decision 18 — the Station Contract (three reworks of the driver)
+#
+# CHANGE 1: the decomposer manifest is JSON Lines (one object per line);
+#   the driver's JSON-array parsing is backward compatibility.
+# CHANGE 2: repair rounds are edit-in-place (the round's scratch dir is
+#   PRE-SEEDED with the previous round's files; the repair exec carries the
+#   edit-capable tool set; the task points at the on-disk files).
+# CHANGE 3: the validation critic is an EXEC STATION (an ephemeral agent
+#   invoked exactly like the decomposer, submitting through the terminal
+#   `submit_validation` tool — its payload is the exec's `result` field).
+#   The in-process critic path (DecomposeCritic /
+#   build_decompose_critic_prompt / critic_factory / cli._build_decompose_critic)
+#   is GONE — the tests of that deleted machinery are removed with it.
+# ==========================================================================
 
 
-def test_build_decompose_critic_wiring(tmp_path: Path, monkeypatch) -> None:
-    """`cli._build_decompose_critic` (the `_build_range_critic` mold):
-    reads [roles.critic].model + max_tokens, wires
-    make_op_key_provider(_critic_key_ref_for(...)) into
-    make_oa_decompose_critic_client, and reads the decomposecritic01
-    prompt artifact (sha256'd for provenance)."""
+def _jsonl(entries: list[dict[str, Any]]) -> str:
+    """The decomposer01 v0.4 manifest shape: one JSON object per line, no
+    array brackets, no comma separators."""
+    return "".join(json.dumps(e) + "\n" for e in entries)
+
+
+# --- _parse_manifest_text (CHANGE 1: JSONL with array backward compat) ------
+
+
+def test_parse_manifest_text_jsonl_round_trip_matches_array() -> None:
+    """Driver-side round-trip: a JSONL manifest parses to the SAME list an
+    equivalent JSON array would (the two encodings are interchangeable)."""
+    entries = [
+        _ticket_entry("t-a", scope=["src/app.py", "tests/test_app.py"]),
+        _ticket_entry("t-b", scope=["src/util.py"], blocks=["t-a"]),
+    ]
+    array = json.loads(json.dumps(entries))  # the equivalent array, round-tripped
+    assert decompose._parse_manifest_text(_jsonl(entries)) == array
+    assert decompose._parse_manifest_text(json.dumps(entries, indent=2)) == array
+
+
+def test_parse_manifest_text_array_backward_compat() -> None:
+    """A first non-whitespace `[` parses as a JSON array (existing
+    artifacts stay valid)."""
+    entries = [_ticket_entry("t-a")]
+    for prefix in ("", "\n  ", "  \n\t"):
+        assert decompose._parse_manifest_text(prefix + json.dumps(entries)) == entries
+
+
+def test_parse_manifest_text_bad_jsonl_line_is_defect_with_line_number() -> None:
+    """A JSONL line that fails to parse is a DEFECT naming the line number
+    (it feeds the normal repair loop — the content arrived, it is malformed
+    content, never an exec-level failure)."""
+    text = _jsonl([_ticket_entry("t-a")]) + "{broken json\n"
+    with pytest.raises(ValueError, match="line 2"):
+        decompose._parse_manifest_text(text)
+
+
+def test_parse_manifest_text_jsonl_non_object_line_is_defect() -> None:
+    """Every JSONL line must be a complete JSON OBJECT — a valid JSON line
+    that is not an object is a defect naming its line number."""
+    text = json.dumps(_ticket_entry("t-a")) + "\n" + '"just a string"\n'
+    with pytest.raises(ValueError, match="line 2"):
+        decompose._parse_manifest_text(text)
+
+
+def test_parse_manifest_text_jsonl_skips_blank_lines() -> None:
+    text = _jsonl([_ticket_entry("t-a")]).replace("}\n", "}\n\n  \n", 1)
+    assert decompose._parse_manifest_text(text) == [_ticket_entry("t-a")]
+
+
+def test_parse_manifest_text_empty_is_defect() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        decompose._parse_manifest_text("")
+    with pytest.raises(ValueError, match="empty"):
+        decompose._parse_manifest_text("  \n\t\n")
+
+
+def test_run_decomposer_jsonl_manifest_classification(tmp_path: Path, monkeypatch) -> None:
+    """A JSONL manifest written by the (v0.4) decomposer is classified as a
+    manifest (one object per line, detect_kind over the resulting list)."""
+    entries = [
+        _ticket_entry("t-a", scope=["src/app.py", "tests/test_app.py"]),
+        _ticket_entry("t-b", scope=["src/util.py"], blocks=["t-a"]),
+    ]
+    calls = _fake_exec(
+        monkeypatch, [{"manifest": _jsonl(entries), "notes": "jsonl notes"}]
+    )
+    out = decompose.run_decomposer("task", **_rd_common(tmp_path))
+    assert out.kind == "manifest"
+    assert out.manifest == entries
+    assert out.notes_text == "jsonl notes"
+    assert len(calls) == 1
+
+
+def test_run_decomposer_jsonl_phase_plan_classification(tmp_path: Path, monkeypatch) -> None:
+    """Phase plans ride the SAME JSONL parsing (detect_kind is the
+    discriminator over the resulting list)."""
+    plan = [
+        {"id": "p1", "goal": "g", "done_condition": "d", "depends_on": []},
+        {"id": "p2", "goal": "g", "done_condition": "d", "depends_on": ["p1"]},
+    ]
+    calls = _fake_exec(monkeypatch, [{"manifest": _jsonl(plan)}])
+    out = decompose.run_decomposer("task", **_rd_common(tmp_path))
+    assert out.kind == "phase_plan"
+    assert out.manifest == plan
+    assert len(calls) == 1
+
+
+def test_run_decomposer_broken_jsonl_line_is_defect_not_exec_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A damaged JSONL line is a CLASSIFICATION DEFECT (the line number is
+    named) feeding the normal repair loop — NOT an exec-level failure: the
+    content arrived, it is malformed content. The driver gives it the
+    normal one-retry (fresh exec), exactly like any other failure."""
+    bad = _jsonl([_ticket_entry("t-a")]) + "{broken json\n"
+    good = [_ticket_entry("t-a")]
+    calls = _fake_exec(monkeypatch, [{"manifest": bad, "notes": "n"},
+                                     {"manifest": good, "notes": "n2"}])
+    out = decompose.run_decomposer("task", **_rd_common(tmp_path))
+    assert out.kind == "manifest"
+    assert len(calls) == 2  # one retry, then clean
+
+    # The defect path names the damaged line (a fresh single-line failure).
+    single = _jsonl([_ticket_entry("t-a")]) + "{broken\n"
+    calls2 = _fake_exec(monkeypatch, [{"manifest": single, "notes": "n"}])
+    out2 = decompose.run_decomposer("task", **_rd_common(tmp_path))
+    assert out2.kind == "failure"
+    assert "line 2" in str(out2.detail.get("error", ""))
+    assert len(calls2) == 2
+
+
+# --- render_task repair mode: edit-in-place (CHANGE 2) ----------------------
+
+
+def test_render_task_repair_edit_in_place_points_at_on_disk_files() -> None:
+    """The repair task points at the PREVIOUS FILES ON DISK (paths), not
+    their embedded text, and carries the updated pinned edit-in-place
+    rules VERBATIM."""
+    text = decompose.render_task(
+        mode="repair",
+        spec=SPEC_TEXT,
+        repo_root="/repo",
+        charter_path="/charter.toml",
+        manifest_path="/scratch/manifest.json",
+        notes_path="/scratch/notes.md",
+        previous_manifest_path="/scratch/manifest.json",
+        previous_notes_path="/scratch/notes.md",
+        findings=["fidelity: ticket a misses the CLI deliverable"],
+        round_no=1,
+    )
+    # The on-disk previous files are named by PATH.
+    assert "/scratch/manifest.json" in text
+    assert "/scratch/notes.md" in text
+    # The previous text is NO LONGER embedded (edit-in-place, not
+    # re-emit-both-files).
+    assert "[{" not in text
+    # The updated pinned rules, VERBATIM (Decision 18).
+    assert (
+        "The files already exist in your workspace \u2014 edit them in place "
+        "with file_edit/file_patch. Change only what the findings require; "
+        "leave every other byte identical. Keep every ticket id stable "
+        "unless a finding demands a rename. Address every finding; do not "
+        "weaken criteria to make findings disappear. After editing, "
+        "file_read your output and verify it. Manifest lines are "
+        "independent JSON objects (JSONL) \u2014 a damaged line is fixed "
+        "line-wise."
+    ) in text
+    # The findings still ride along.
+    assert "fidelity: ticket a misses the CLI deliverable" in text
+
+
+def test_render_task_initial_output_contract_unchanged() -> None:
+    """Initial rounds keep the current write-capable output contract (the
+    task text is unchanged by Decision 18 — only the repair mode's wording
+    moves to edit-in-place)."""
+    text = decompose.render_task(
+        mode="initial",
+        spec=SPEC_TEXT,
+        repo_root="/repo",
+        charter_path="/charter.toml",
+        manifest_path="/scratch/manifest.json",
+        notes_path="/scratch/notes.md",
+    )
+    assert "MANIFEST" in text and "NOTES" in text
+    assert "file_edit" not in text  # no edit-in-place language initially
+
+
+# --- the critic EXEC station (CHANGE 3) -------------------------------------
+
+
+def _critic_exec(
+    monkeypatch: pytest.MonkeyPatch,
+    script: list[Any],
+    *,
+    env_probe: list[dict[str, str]] | None = None,
+) -> tuple[list[list[str]], list[Path]]:
+    """A SECOND exec seam dedicated to the critic station: monkeypatches
+    `decompose._run_critic_exec` (the driver's critic-exec wrapper) with a
+    scripted fake in the SAME `_fake_exec` style — each item is a
+    dict-of-writes with a `"result"` key (the exec stdout JSON line) or a
+    callable. Returns `(argvs, scratch_dirs)`; `scratch_dirs` is the list
+    of the critic scratch dirs the driver passed (for the pre-seed
+    assertions)."""
+    argvs: list[list[str]] = []
+    scratch_dirs: list[Path] = []
+    cursor = 0
+
+    def _next() -> Any:
+        nonlocal cursor
+        item = script[min(cursor, len(script) - 1)]
+        cursor += 1
+        return item
+
+    def fake(argv: list[str], env: dict[str, str], timeout: float) -> subprocess.CompletedProcess:
+        argvs.append(list(argv))
+        if env_probe is not None:
+            env_probe.append(dict(env))
+        task_idx = argv.index("--task-file") + 1
+        scratch = Path(argv[task_idx]).parent
+        scratch_dirs.append(scratch)
+        item = _next()
+        if callable(item):
+            return item(argv, env)
+        if isinstance(item, BaseException):
+            raise item
+        # Each script item IS a full exec stdout JSON line (see
+        # `_critic_exec_result`). Tolerate a legacy wrapper style
+        # ({"result": <line>}) for items lacking a status key, but never
+        # unwrap a real exec line's top-level `result` payload — that
+        # field belongs to the TERMINAL TOOL mechanism, not the seam.
+        line = item
+        if isinstance(line, dict) and "status" not in line and isinstance(line.get("result"), dict):
+            line = line["result"]
+        if not (isinstance(line, dict) and "status" in line):
+            line = _critic_exec_result()
+        for name, content in item.get("writes", {}).items():
+            (scratch / name).write_text(content, encoding="utf-8")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(line) + "\n", stderr=""
+        )
+
+    monkeypatch.setattr(decompose, "_run_critic_exec", fake)
+    return argvs, scratch_dirs
+
+
+def _scaffold_and_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    script: list[Any],
+    critic_script: list[Any] | None = None,
+    env_probe: list[dict[str, str]] | None = None,
+    **kwargs: Any,
+) -> tuple[int, list[list[str]], list[list[str]], list[Path], Path, Path]:
+    """Scaffold the rig + spec, pin the agent TOML, stub BOTH exec seams
+    (the decomposer's `_run_exec` and the critic's `_run_critic_exec`), and
+    call `decompose.run_decompose` with NO critic_factory (Decision 18: the
+    driver owns the exec invocation). Returns
+    `(rc, exec_calls, critic_argvs, critic_scratch_dirs, run_dir, rigs_root)`.
+    """
+    rigs_root = scaffold_rig(tmp_path)
+    spec = _write_spec(tmp_path, kwargs.pop("spec_text", SPEC_TEXT))
+    decompose_root = tmp_path / "decompose-root"
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    exec_calls = _fake_exec(
+        monkeypatch, script, env_probe=env_probe, preseed_log=kwargs.pop("preseed_log", None)
+    )
+    critic_argvs, critic_scratch_dirs = _critic_exec(
+        monkeypatch,
+        critic_script if critic_script is not None else [_critic_exec_result()],
+        env_probe=env_probe,
+    )
+    rc = decompose.run_decompose(
+        rig_name=RIG,
+        spec_path=spec,
+        decompose_root=decompose_root,
+        rigs_root=rigs_root,
+        **kwargs,
+    )
+    run_dirs = list((decompose_root / "decompose").iterdir())
+    return rc, exec_calls, critic_argvs, critic_scratch_dirs, run_dirs[0], rigs_root
+
+
+def test_critic_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
+    """The critic exec's argv is the Station Contract invocation: the SAME
+    agent, the critic task file, system-prompt-file decomposecritic01, the
+    registry-QUALIFIED critic model, --effort none, read-only tools, and
+    --submit-schema run-dir/submit-schema.json."""
+    manifest = [_ticket_entry("t-a")]
+    rc, _, critic_argvs, _, run_dir, _rr = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[_critic_exec_result(verdict="accept")],
+    )
+    assert rc == 0
+    argv = critic_argvs[0]
+    assert "exec" in argv
+    assert argv[argv.index("--agent") + 1] == "stigmergy-decomposer"
+    assert argv[argv.index("--task-file") + 1].endswith("task.md")
+    assert argv[argv.index("--system-prompt-file") + 1].endswith("decomposecritic01")
+    # The charter's [roles.critic].model ("opus") resolved to the
+    # registry-qualified provider/version form.
+    assert argv[argv.index("--model") + 1] == "anthropic/opus-4-1-20250805"
+    assert argv[argv.index("--effort") + 1] == "none"
+    assert argv[argv.index("--tools") + 1] == "file_read,glob,grep"
+    schema_arg = argv[argv.index("--submit-schema") + 1]
+    assert schema_arg == str(run_dir / "submit-schema.json")
+    assert Path(schema_arg).is_file()
+
+
+def test_critic_submit_schema_file_matches_module_data(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """submit-schema.json is written into the run dir and matches
+    `decompose._SUBMIT_VALIDATION_SCHEMA` — the driver-owned data file with
+    the EXTENDED required keys verdict/summary/findings/evidence_log."""
+    manifest = [_ticket_entry("t-a")]
+    rc, _, _, _, run_dir, _rr = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[_critic_exec_result(verdict="accept")],
+    )
+    assert rc == 0
+    on_disk = json.loads((run_dir / "submit-schema.json").read_text(encoding="utf-8"))
+    assert on_disk == decompose._SUBMIT_VALIDATION_SCHEMA
+    schema = decompose._SUBMIT_VALIDATION_SCHEMA
+    assert schema["name"] == "submit_validation"
+    input_schema = schema["input_schema"]
+    assert input_schema["required"] == ["verdict", "summary", "findings", "evidence_log"]
+    evidence_prop = input_schema["properties"]["evidence_log"]
+    assert evidence_prop["type"] == "array"
+    items = evidence_prop["items"]
+    assert items["type"] == "object"
+    assert items["required"] == ["claim_checked", "method", "found"]
+
+
+def test_critic_scratch_pre_seeded_with_materials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The driver PRE-SEEDS the critic's scratch dir with the spec (in the
+    task file), the manifest, the notes, the evidence bundle, and the
+    validator report — the task file names the on-disk paths."""
+    manifest = [_ticket_entry("t-a", scope=["src/app.py", "tests/test_app.py"])]
+    rc, _, critic_argvs, critic_scratch_dirs, _run_dir, _rr = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[_critic_exec_result(verdict="accept")],
+    )
+    assert rc == 0
+    scratch = critic_scratch_dirs[0]
+    assert scratch.is_dir()
+    # The five pre-seeded files.
+    names = {p.name for p in scratch.iterdir() if p.is_file()}
+    assert "manifest.json" in names
+    assert "notes.md" in names
+    assert "evidence-bundle.md" in names
+    assert "validator-report.md" in names
+    assert "task.md" in names
+    # The manifest/notes are the JUDGED round's artifacts.
+    assert json.loads((scratch / "manifest.json").read_text(encoding="utf-8")) == manifest
+    assert (scratch / "notes.md").read_text(encoding="utf-8") == "n"
+    # The evidence bundle is the deterministic machine-verified facts.
+    bundle = (scratch / "evidence-bundle.md").read_text(encoding="utf-8")
+    assert "## Per-ticket target_scope resolution" in bundle
+    assert "a: src/app.py -> exists" in bundle
+    # The validator report (clean by construction at the critic).
+    assert "clean (0 defects)" in (scratch / "validator-report.md").read_text(encoding="utf-8")
+    # The task file: the fenced spec + the on-disk paths (NOT the full
+    # embedded manifest/notes text — the critic reads them with its tools).
+    task_text = (scratch / "task.md").read_text(encoding="utf-8")
+    assert "<spec>" in task_text and SPEC_TEXT in task_text
+    assert str(scratch / "manifest.json") in task_text
+    assert str(scratch / "notes.md") in task_text
+    assert str(scratch / "evidence-bundle.md") in task_text
+    assert str(scratch / "validator-report.md") in task_text
+    # The target repo path.
+    assert "repo root" in task_text
+
+
+def test_critic_verdict_parsed_and_evidence_log_carried(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The exec `result` payload is parsed (verdict/summary/findings/
+    evidence_log + usage); the evidence_log rides the critic's findings
+    record into the run summary, and the DECOMPOSE event carries the
+    decomposecritic01 hash + the exec usage."""
     import hashlib
 
-    from stigmergy.oa_critic import DEFAULT_MAX_TOKENS
-
-    rigs_root = scaffold_rig(tmp_path)
-    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    manifest = [_ticket_entry("t-a")]
+    major = [
+        {"aspect": "fidelity", "severity": "major", "tickets": ["t-a"],
+         "evidence": "misses the CLI", "direction": "add it"}
+    ]
+    log = [
+        {"claim_checked": "ticket a extends src/app.py",
+         "method": "file_read src/app.py", "found": "no CLI seam"},
+    ]
+    critic_usage = {"in": 4, "cached": 0, "out": 6, "reasoning": 0}
+    # Round 0: repair with 1 major; after repair: accept.
+    rc, exec_calls, critic_argvs, _, run_dir, rigs_root = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[
+            {"manifest": manifest, "notes": "n"},
+            {"manifest": manifest, "notes": "n2"},
+        ],
+        critic_script=[
+            _critic_exec_result(verdict="repair", findings=major,
+                                evidence_log=log, usage=critic_usage),
+            _critic_exec_result(verdict="accept"),
+        ],
+    )
+    assert rc == 0
+    assert len(exec_calls) == 2  # initial + one repair
+    assert len(critic_argvs) == 2  # the critic judged both rounds
+    # The evidence_log rides the critic's findings record into the summary.
+    summary = (run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "no CLI seam" in summary
+    # The DECOMPOSE events: two critic events, each carrying the critic's
+    # exec usage and the decomposecritic01 prompt-artifact hash.
+    events = _decompose_events(rigs_root)
+    critic_events = [e for e in events if e["station"] == "decompose-critic"]
+    assert len(critic_events) == 2
+    # Each event carries ITS OWN invocation's usage: round 0's scripted
+    # critic usage, round 1's the default from `_critic_exec_result`.
+    assert critic_events[0]["tokens"] == critic_usage
+    assert critic_events[1]["tokens"] == {
+        "in": 5, "cached": 1, "out": 9, "reasoning": 0
+    }
+    for ev in critic_events:
+        assert ev["model"] == "opus"
+    resolved = _resolve(rigs_root)
     try:
-        seen: dict[str, Any] = {}
-
-        def fake_key_provider(ref: str) -> Any:
-            seen["ref"] = ref
-            return lambda: "stub-key"
-
-        def fake_client(*, key_provider: Any, registry: Any, max_tokens: int) -> Any:
-            seen["key_provider"] = key_provider
-            seen["registry"] = registry
-            seen["max_tokens"] = max_tokens
-            return lambda *a, **k: {}
-
-        monkeypatch.setattr(cli, "make_op_key_provider", fake_key_provider)
-        monkeypatch.setattr(cli, "make_oa_decompose_critic_client", fake_client)
-        critic = cli._build_decompose_critic(resolved)
-        # opus is Anthropic-routed -> the dedicated critic key item.
-        assert seen["ref"] == cli._CRITIC_KEY_REF
-        assert seen["max_tokens"] == DEFAULT_MAX_TOKENS
-        assert seen["key_provider"]() == "stub-key"
-        assert critic.model == "opus"
-        assert critic.decoding_params == {}
-        assert critic.prompt_artifact_hash == hashlib.sha256(
-            b"decomposecritic01 template\n"
+        expected_hash = hashlib.sha256(
+            (resolved.rig_paths["prompts_dir"] / "decomposecritic01").read_bytes()
         ).hexdigest()
     finally:
         resolved.store.close()
-
-
-def test_build_decompose_critic_charter_max_tokens_override(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """A charter's [roles.critic].max_tokens overrides the default."""
-    repo = make_local_repo_with_prompts(tmp_path)
-    charter_dir = tmp_path / "charter_src"
-    charter_dir.mkdir()
-    text = BASE_CHARTER_TOML.replace('repo = "path-or-url"', f'repo = "{repo}"')
-    text = text.replace(
-        '[roles.critic]\nmodel = "opus"',
-        '[roles.critic]\nmodel = "opus"\nmax_tokens = 1234',
+    for ev in critic_events:
+        assert ev["prompt_artifact_hash"] == expected_hash
+    # The critic-<n>.json artifacts carry the parsed payload + evidence_log.
+    critic_artifacts = sorted(
+        run_dir.glob("critic-*.json"), key=lambda p: int(p.stem.split("-")[1])
     )
-    charter_path = charter_dir / "charter.toml"
-    charter_path.write_text(text)
-    shutil.copy(MODELS_REGISTRY_PATH, charter_dir / "models.toml")
-    rigs_root = tmp_path / "rigs"
-    create_rig(charter_path, base_dir=rigs_root)
-    resolved = resolve_rig(RIG, rigs_root=rigs_root)
-    try:
-        seen: dict[str, Any] = {}
-
-        def fake_client(*, key_provider: Any, registry: Any, max_tokens: int) -> Any:
-            seen["max_tokens"] = max_tokens
-            return lambda *a, **k: {}
-
-        monkeypatch.setattr(cli, "make_op_key_provider", lambda ref: (lambda: "k"))
-        monkeypatch.setattr(cli, "make_oa_decompose_critic_client", fake_client)
-        cli._build_decompose_critic(resolved)
-        assert seen["max_tokens"] == 1234
-    finally:
-        resolved.store.close()
+    assert critic_artifacts
+    first = json.loads(critic_artifacts[0].read_text(encoding="utf-8"))
+    assert first["verdict"] == "repair"
+    assert first["evidence_log"] == log
 
 
-def test_build_decompose_critic_fails_closed_oa_unavailable(
+def test_critic_missing_result_one_retry_then_exit_1(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """An OA-less environment (CriticOAUnavailableError at factory build) is
-    a loud LAUNCH failure (exit 1, stderr) — exactly like range-report's
-    handling — and run_decompose is never reached. The stub message mirrors
-    the REAL factory's fail-closed phrasing (names the openalph provider
-    layer), so the assertion proves the message reaches stderr verbatim."""
-    _oa_msg = "openalph provider layer unavailable — openalph is not importable"
-
-    def _fail(**_kw: Any) -> Any:
-        raise CriticOAUnavailableError(_oa_msg)
-
-    monkeypatch.setattr(cli, "make_oa_decompose_critic_client", _fail)
-
-    def _must_not_run(*_a: Any, **_k: Any) -> int:
-        raise AssertionError("must not run")
-
-    monkeypatch.setattr(cli, "run_decompose", _must_not_run)
-    rigs_root = scaffold_rig(tmp_path)
-    spec = _write_spec(tmp_path)
-    rc = cli.main([
-        "decompose", "--rig", RIG, "--rigs-root", str(rigs_root),
-        "--spec", str(spec),
-    ])
+    """A `done` exec with NO `result` field = the model never submitted = a
+    critic FAILURE with its own bounded retry (exactly one), then a
+    DecomposeError -> exit 1."""
+    manifest = [_ticket_entry("t-a")]
+    rc, exec_calls, critic_argvs, _, _, _ = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[
+            {k: v for k, v in _critic_exec_result().items() if k != "result"},
+            {k: v for k, v in _critic_exec_result().items() if k != "result"},
+        ],
+    )
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "stigmergy decompose:" in err
-    assert "openalph" in err
+    assert "critic" in capsys.readouterr().err
+    assert len(exec_calls) == 1  # the decomposer ran once (no repair — the
+    # critic failure is not a repair trigger)
+    assert len(critic_argvs) == 2  # exactly one retry
 
 
-def test_build_decompose_critic_missing_key_ref_fails_closed(
+def test_critic_exec_failure_retried_within_critic_budget(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """A non-Anthropic-routed critic model with no STIGMERGY_CRITIC_OA_KEY_REF
-    is a loud rig-launch CharterError (exit 1, stderr)."""
-    repo = make_local_repo_with_prompts(tmp_path)
-    charter_dir = tmp_path / "charter_src"
-    charter_dir.mkdir()
-    text = BASE_CHARTER_TOML.replace('repo = "path-or-url"', f'repo = "{repo}"')
-    text = text.replace('model = "opus"\n\n[models]', 'model = "local-qwen"\n\n[models]')
-    charter_path = charter_dir / "charter.toml"
-    charter_path.write_text(text)
-    shutil.copy(MODELS_REGISTRY_PATH, charter_dir / "models.toml")
-    rigs_root = tmp_path / "rigs"
-    create_rig(charter_path, base_dir=rigs_root)
-    monkeypatch.delenv("STIGMERGY_CRITIC_OA_KEY_REF", raising=False)
-
-    def _must_not_run2(*_a: Any, **_k: Any) -> int:
-        raise AssertionError("must not run")
-
-    monkeypatch.setattr(cli, "run_decompose", _must_not_run2)
-    spec = _write_spec(tmp_path)
-    rc = cli.main([
-        "decompose", "--rig", RIG, "--rigs-root", str(rigs_root),
-        "--spec", str(spec),
-    ])
+    """A critic EXEC FAILURE (deny_reason) flows through the same
+    retry-classification machinery as decomposer execs: one retry, then a
+    bounded critic failure -> exit 1 (never conflated with a submitted
+    verdict)."""
+    manifest = [_ticket_entry("t-a")]
+    rc, _, critic_argvs, _, _, _ = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[
+            {"result": _exec_result(deny_reason="quota-tokens")},
+            {"result": _exec_result(deny_reason="quota-tokens")},
+        ],
+    )
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "STIGMERGY_CRITIC_OA_KEY_REF" in err
+    assert "critic" in capsys.readouterr().err
+    assert len(critic_argvs) == 2  # exactly one retry
 
 
-def test_cli_decompose_builds_critic_before_dispatch(
+def test_critic_exec_failure_then_submit_succeeds(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The critic is built at LAUNCH (fail-closed) and the BUILT instance is
-    what run_decompose receives as its critic_factory (not rebuilt per
-    judgment)."""
-    rigs_root = scaffold_rig(tmp_path)
-    spec = _write_spec(tmp_path)
-    sentinel = object()
-    monkeypatch.setattr(cli, "_build_decompose_critic", lambda resolved: sentinel)
+    """The critic's one-retry budget covers BOTH failure classes: a failed
+    first attempt, then a `done` WITH the submit_validation result ->
+    success (the retry worked)."""
+    manifest = [_ticket_entry("t-a")]
+    rc, _, critic_argvs, _, _, rigs_root = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[{"manifest": manifest, "notes": "n"}],
+        critic_script=[
+            {"result": _exec_result(deny_reason="quota-tokens")},
+            _critic_exec_result(verdict="accept"),
+        ],
+    )
+    assert rc == 0
+    assert len(critic_argvs) == 2
+    assert _ticket(rigs_root, "t-a") is not None
+    critic_events = [
+        e for e in _decompose_events(rigs_root)
+        if e["station"] == "decompose-critic"
+    ]
+    assert len(critic_events) == 1  # the failed attempt emits nothing
+
+
+def test_repair_round_pre_seeds_round_scratch_and_edit_tools(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A repair round PRE-SEEDS the round's scratch dir with the previous
+    round's manifest + notes (round artifacts preserved; the agent edits
+    the copies in place), invokes the repair exec with the EDIT-CAPABLE
+    tool set, and the round's manifest artifact in the run dir is the
+    repaired list."""
+    major = [
+        {"aspect": "fidelity", "severity": "major", "tickets": ["t-a"],
+         "evidence": "misses the CLI", "direction": "add it"}
+    ]
+    # Round 0's manifest AS THE DECOMPOSER EMITS IT (v0.4 JSONL): the
+    # pre-seed must carry these EXACT bytes to the repair session.
+    manifest_text = (
+        json.dumps(_ticket_entry("t-a"), indent=None) + "\n"
+    )
+    preseed_log: list[tuple[str | None, str | None]] = []
+    rc, exec_calls, critic_argvs, _, run_dir, rigs_root = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[
+            {"manifest": manifest_text, "notes": "notes-v1"},  # round 0
+            {"manifest": manifest_text, "notes": "notes-v2"},  # repair round
+        ],
+        critic_script=[
+            _critic_exec_result(verdict="repair", findings=major),
+            _critic_exec_result(verdict="accept"),
+        ],
+        preseed_log=preseed_log,
+    )
+    assert rc == 0
+    assert len(exec_calls) == 2
+    # Repair exec (the 2nd decomposer exec): the edit-capable tool set.
+    repair_argv = exec_calls[1]
+    assert repair_argv[repair_argv.index("--tools") + 1] == (
+        "file_read,glob,grep,file_write,file_edit,file_patch"
+    )
+    # The initial round kept the current write-capable set (no
+    # edit/patch).
+    assert exec_calls[0][exec_calls[0].index("--tools") + 1] == (
+        "file_read,glob,grep,file_write"
+    )
+    # The round's scratch dir was PRE-SEEDED with the previous round's
+    # manifest + notes BYTE-IDENTICAL (Decision 18: the repair agent edits
+    # the bytes it authored — a re-serialization would itself be drift).
+    # Observable via the exec-entry snapshot (the fake's own writes then
+    # overwrite the pre-seed, so post-hoc reads see the round's OUTPUT).
+    assert len(preseed_log) == 2
+    assert preseed_log[0] == (None, None)  # round 0: nothing pre-seeded
+    assert preseed_log[1] == (manifest_text, "notes-v1")
+    # The repair task names the on-disk previous files (paths, not embedded
+    # text) — the task artifact is in the run dir.
+    subject_scratch = Path(repair_argv[repair_argv.index("--task-file") + 1]).parent
+    tasks = sorted(run_dir.glob("task-*.md"), key=lambda p: int(p.stem.split("-")[1]))
+    repair_task = tasks[-1].read_text(encoding="utf-8")
+    assert str(subject_scratch / "manifest.json") in repair_task
+    assert str(subject_scratch / "notes.md") in repair_task
+    # The run dir preserved the round artifacts (allow + audit).
+    manifest_artifacts = sorted(
+        run_dir.glob("manifest-*.json"), key=lambda p: int(p.stem.split("-")[1])
+    )
+    assert [json.loads(p.read_text(encoding="utf-8")) for p in manifest_artifacts]
+    assert _ticket(rigs_root, "t-a") is not None
+
+
+def test_repair_round_pre_seeds_phase_scratch_per_subject(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Per-subject scratch: a phase subject's repair round pre-seeds the
+    PHASE's scratch dir (not the root subject's)."""
+    plan = [
+        {"id": "p1", "title": "one", "goal": "g1", "depends_on": [],
+         "done_condition": "d"},
+    ]
+    p1_manifest_text = json.dumps(_ticket_entry("t-p1", scope=["src/app.py", "tests/test_app.py"]))
+    major = [
+        {"aspect": "fidelity", "severity": "major", "tickets": ["t-p1"],
+         "evidence": "misses", "direction": "fix"}
+    ]
+    preseed_log: list[tuple[str | None, str | None]] = []
+    rc, exec_calls, _, _, _run_dir, _rr = _scaffold_and_patch(
+        tmp_path,
+        monkeypatch,
+        script=[
+            {"manifest": plan},                              # root -> phase plan
+            {"manifest": p1_manifest_text, "notes": "p1-v1"},  # phase p1
+            {"manifest": p1_manifest_text, "notes": "p1-v2"},  # phase p1 repair
+        ],
+        critic_script=[
+            _critic_exec_result(verdict="repair", findings=major),  # p1 round 0
+            _critic_exec_result(verdict="accept"),                  # p1 repair
+        ],
+        preseed_log=preseed_log,
+    )
+    assert rc == 0
+    # Byte-identical pre-seed (Decision 18) observed at exec ENTRY: the
+    # phase p1 repair round's scratch carried the phase's own round-0
+    # bytes (per-subject scratch, not the root subject's).
+    assert len(preseed_log) == 3
+    assert preseed_log[0] == (None, None)  # root: phase plan, no pre-seed
+    assert preseed_log[1] == (None, None)  # phase p1 round 0: no pre-seed
+    assert preseed_log[2] == (p1_manifest_text, "p1-v1")
+
+
+# --- CLI wiring after Decision 18 (the dead builder is GONE) -----------------
+
+
+def test_cli_decompose_passes_nothing_critic_related(monkeypatch) -> None:
+    """The decompose verb now passes NOTHING critic-related to
+    `run_decompose` (the driver owns the critic exec invocation) — and the
+    deleted `cli._build_decompose_critic` is gone from the CLI module."""
+    assert not hasattr(cli, "_build_decompose_critic")
     seen: dict[str, Any] = {}
 
     def fake_run_decompose(*args: Any, **kwargs: Any) -> int:
-        seen["critic_factory"] = kwargs.get("critic_factory")
+        seen.update(kwargs)
         return 0
 
+    class _StubResolved:
+        class _Store:
+            def close(self) -> None:
+                pass
+
+        store = _Store()
+
+    monkeypatch.setattr(
+        cli, "resolve_rig", lambda name, rigs_root=None: _StubResolved()
+    )
     monkeypatch.setattr(cli, "run_decompose", fake_run_decompose)
     rc = cli.main([
-        "decompose", "--rig", RIG, "--rigs-root", str(rigs_root),
-        "--spec", str(spec),
+        "decompose",
+        "--rig", "shipyard",
+        "--spec", "/tmp/spec.md",
+        "--no-approve",
+        "--max-repairs", "3",
+        "--decomposer-model", "some/model",
+        "--decomposer-effort", "medium",
+        "--dry-run",
     ])
     assert rc == 0
-    assert callable(seen["critic_factory"])
-    assert seen["critic_factory"](None) is sentinel
+    assert "critic_factory" not in seen
+    assert seen["rig_name"] == "shipyard"
+    assert str(seen["spec_path"]) == "/tmp/spec.md"
+    assert seen["no_approve"] is True
+    assert seen["max_repairs"] == 3
+    assert seen["decomposer_model"] == "some/model"
+    assert seen["decomposer_effort"] == "medium"
+    assert seen["dry_run"] is True
