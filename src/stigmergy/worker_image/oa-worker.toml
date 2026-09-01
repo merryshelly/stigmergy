@@ -55,8 +55,20 @@ path = "/scratch"
 type = "openai"
 base_url = "http://127.0.0.1:18081"
 api_key_env = "OPENAI_API_KEY"
+# SB ruling 2026-08-31: reasoning_replay ON for ALL stations on all rigs.
+# Qwen's model card: "preserve_thinking is enabled by default for all
+# workloads" — strip-mode tool loops are outside the vendor envelope and
+# the degeneration signature (mega-completions, re-derivation burn,
+# whole-file-rewrite spikes on long loops) was observed live on
+# quotagov01 (bead .159/.161 lineage). Replay makes reasoning cumulative
+# context — that is the vendor-default trade; context management is the
+# GC's job (kdsn.305), deployed when it is actually a problem.
+quirks = ["reasoning_replay"]
 
 [providers.synthetic]
 type = "openai"
 base_url = "http://127.0.0.1:18081"
 api_key_env = "OPENAI_API_KEY"
+# Same ruling. REQUIRED for Kimi-K3 (passback requirement, kdsn.241
+# lineage) and matches the fleet's host-side synthetic entry.
+quirks = ["reasoning_replay"]
