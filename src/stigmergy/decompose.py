@@ -539,12 +539,14 @@ def _build_child_env() -> dict[str, str]:
     """The child exec's env: `os.environ` with the proxy vars UNSET (the
     decomposer's inference egress must not inherit the host's proxy — the
     same no-proxy-inheritance posture as `oa_critic`'s hardened transport)
-    plus ``STIG_DECOMP_KEY``, fetched LAZILY ONCE per process from
-    ``_DECOMP_KEY_REF`` (never logged)."""
+    plus ``STIG_DECOMP_KEY`` — the KEY STRING fetched from the op-backed
+    provider (``_decomp_key_provider()`` RETURNS the provider; CALL it for
+    the value — caught live 2026-09-01: the provider callable itself landed
+    in the env and posix_spawn rejected it). The value is never logged."""
     env = dict(os.environ)
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(var, None)
-    env["STIG_DECOMP_KEY"] = _decomp_key_provider()
+    env["STIG_DECOMP_KEY"] = _decomp_key_provider()()
     return env
 
 

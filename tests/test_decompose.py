@@ -438,7 +438,13 @@ def _fake_exec(
         )
 
     monkeypatch.setattr(decompose, "_run_exec", fake)
-    monkeypatch.setattr(decompose, "_decomp_key_provider", lambda: "stub-decomp-key")
+    # The seam RETURNS the provider; the provider returns the key STRING
+    # (production shape: make_op_key_provider(ref) is a zero-arg callable).
+    # A string-returning double here masked the env-callable defect caught
+    # live 2026-09-01 — keep the shape honest.
+    monkeypatch.setattr(
+        decompose, "_decomp_key_provider", lambda: (lambda: "stub-decomp-key")
+    )
     return calls
 
 
