@@ -5,7 +5,8 @@ The validator checks a JSON manifest against the decomposer contract
 (the SAME key vocabulary as the triage promotion spec —
 ``triage._REQUIRED_PROMOTION_KEYS`` / ``_OPTIONAL_PROMOTION_KEYS`` —
 deliberately STRicter than `intake`, which does not require
-``tier1_checks``): rules R1-R12 + the unknown-key typo-catcher (R13).
+``tier1_checks``): rules R1-R12 + the unknown-key typo-catcher (R13)
++ R14 (required_reading).
 
 Defect strings are stable and structured: ``"ticket <id-or-index>:
 <rule-id>: <detail>"`` (manifest-level structural problems use
@@ -968,3 +969,366 @@ def make_charter_for_repo(tmp_path: Path, repo: Path) -> Path:
     )
     shutil.copy(fixtures / "models.toml", charter_dir / "models.toml")
     return charter_dir / "charter.toml"
+
+
+# ==========================================================================
+# R14: required_reading (optional; repo:/context: prefix; must already
+# exist — NEVER the ticket's own deliverable)
+# ==========================================================================
+
+
+def _r14_details(defects: list[str], label: str = "alpha-one") -> list[str]:
+    return [
+        parse_rule(d)[2]
+        for d in defects
+        if parse_rule(d)[1] == "R14" and parse_rule(d)[0] == label
+    ]
+
+
+class TestR14RequiredReading:
+    """R14: the optional ``required_reading`` key — mirrors dispatch.py's
+    ``_resolve_required_reading_entry`` prefix contract at validation time
+    (a missing/malformed prefix today costs a whole worker dispatch)."""
+
+    # --- absent / empty: no defect ------------------------------------------
+
+    def test_absent_key_is_clean(self) -> None:
+        entry = base_ticket()
+        assert "required_reading" not in entry
+        assert validate_manifest([entry]) == []
+
+    def test_empty_list_is_clean(self) -> None:
+        assert validate_manifest([base_ticket(required_reading=[])]) == []
+
+    # --- shape defects -------------------------------------------------------
+
+    def test_not_a_list_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading="repo:docs/a.md")])
+        assert _r14_details(defects) == ["required_reading must be an array of strings"]
+
+    def test_non_string_element_is_a_defect_naming_index(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=[3, "repo:docs/a.md"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 0 must be a string (got 3)"
+        ]
+
+    def test_non_string_element_is_the_only_r14_defect(self) -> None:
+        # The well-formed sibling entry still passes (grammar only, no root
+        # given) — exactly one R14 defect, the non-string one.
+        defects = validate_manifest([base_ticket(required_reading=[9, "repo:docs/a.md"])])
+        assert len(defects) == 1
+        assert parse_rule(defects[0]) == (
+            "alpha-one",
+            "R14",
+            "required_reading entry 0 must be a string (got 9)",
+        )
+
+    # --- prefix defects ------------------------------------------------------
+
+    def test_missing_prefix_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=["docs/a.md"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'docs/a.md' has an unrecognized prefix "
+            "(expected 'repo:' or 'context:')"
+        ]
+
+    def test_wrong_prefix_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=["home:notes/a.md"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'home:notes/a.md' has an unrecognized prefix "
+            "(expected 'repo:' or 'context:')"
+        ]
+
+    def test_prefix_with_no_path_is_a_defect(self) -> None:
+        # "repo:" with an empty remainder -> the remainder is not a
+        # non-empty relative path.
+        defects = validate_manifest([base_ticket(required_reading=["repo:"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:' has an empty path after the prefix"
+        ]
+
+    # --- repo: existence (NO new-file carve-out, unlike R8) ------------------
+
+    def test_repo_existing_file_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "guide.md").write_text("guide\n")
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs/guide.md"])], repo=tmp_path
+        )
+        assert _r14_details(defects) == []
+
+    def test_repo_existing_directory_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs"])], repo=tmp_path
+        )
+        assert _r14_details(defects) == []
+
+    def test_repo_missing_file_defects(self, tmp_path: Path) -> None:
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs/ghost.md"])], repo=tmp_path
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:docs/ghost.md' does not exist in the repo "
+            "(required_reading must already exist — never the ticket's own deliverable)"
+        ]
+
+    def test_repo_missing_parent_only_defects(self, tmp_path: Path) -> None:
+        # Contrast with R8's new-file carve-out: even with an existing
+        # parent, a required_reading path that does not exist is a defect.
+        (tmp_path / "docs").mkdir()
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs/new_file.md"])], repo=tmp_path
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:docs/new_file.md' does not exist in the repo "
+            "(required_reading must already exist — never the ticket's own deliverable)"
+        ]
+
+    def test_repo_missing_file_no_defect_without_repo(self) -> None:
+        # repo is None -> grammar + safety checks only, no existence check.
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs/ghost.md"])]
+        )
+        assert defects == []
+
+    def test_repo_existing_file_against_real_repo(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        defects = validate_manifest(
+            [base_ticket(required_reading=[f"repo:{EXISTING_RELPATH}"])], repo=repo
+        )
+        assert _r14_details(defects) == []
+
+    # --- context: existence --------------------------------------------------
+
+    def test_context_existing_file_passes(self, tmp_path: Path) -> None:
+        (tmp_path / "context").mkdir()
+        (tmp_path / "context" / "brief.md").write_text("brief\n")
+        defects = validate_manifest(
+            [base_ticket(required_reading=["context:context/brief.md"])],
+            context=tmp_path,
+        )
+        assert _r14_details(defects) == []
+
+    def test_context_missing_file_defects(self, tmp_path: Path) -> None:
+        defects = validate_manifest(
+            [base_ticket(required_reading=["context:context/ghost.md"])],
+            context=tmp_path,
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'context:context/ghost.md' does not exist in the "
+            "context (required_reading must already exist — never the ticket's own "
+            "deliverable)"
+        ]
+
+    def test_context_missing_file_no_defect_without_context(self) -> None:
+        # context is None -> grammar + safety checks only.
+        defects = validate_manifest(
+            [base_ticket(required_reading=["context:context/ghost.md"])]
+        )
+        assert defects == []
+
+    def test_repo_entry_not_checked_against_context_root(self, tmp_path: Path) -> None:
+        # A `repo:` entry is resolved against the REPO root only. The path
+        # does NOT exist beneath the context root; with repo=None it is
+        # grammar-only -> clean (a wrong implementation that consulted the
+        # context root would defect here).
+        context = tmp_path / "context_root"
+        (context / "ctx").mkdir(parents=True)
+        (context / "ctx" / "b.md").write_text("b\n")
+        defects = validate_manifest(
+            [base_ticket(required_reading=["repo:docs/guide.md"])],
+            context=context,
+        )
+        assert defects == []
+
+    def test_context_entry_not_checked_against_repo_root(self, tmp_path: Path) -> None:
+        # Symmetric guard: the path exists ONLY under the context root, not
+        # under the repo root -> clean (a wrong implementation resolving
+        # `context:` entries against the repo root would defect here).
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "scope.py").write_text("x = 1\n")  # keeps R8 quiet
+        context = tmp_path / "context_root"
+        (context / "ctx").mkdir(parents=True)
+        (context / "ctx" / "b.md").write_text("b\n")
+        defects = validate_manifest(
+            [base_ticket(target_scope=["scope.py"], required_reading=["context:ctx/b.md"])],
+            repo=repo,
+            context=context,
+        )
+        assert defects == []
+
+    # --- grammar: relative, non-empty, no traversal --------------------------
+
+    def test_absolute_path_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=["repo:/etc/passwd"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:/etc/passwd' is an absolute path"
+        ]
+
+    def test_context_absolute_path_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=["context:/etc/passwd"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'context:/etc/passwd' is an absolute path"
+        ]
+
+    def test_dotdot_traversal_is_a_defect(self) -> None:
+        defects = validate_manifest([base_ticket(required_reading=["repo:../sneaky.md"])])
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:../sneaky.md' contains a '..' segment"
+        ]
+
+    def test_dotdot_nested_is_a_defect(self) -> None:
+        defects = validate_manifest(
+            [base_ticket(required_reading=["context:a/b/../../c.md"])]
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'context:a/b/../../c.md' contains a '..' segment"
+        ]
+
+    # --- self-deliverable (always checked, regardless of repo) ---------------
+
+    def test_self_deliverable_is_a_defect(self, tmp_path: Path) -> None:
+        (tmp_path / "src" / "new_module.py").parent.mkdir(parents=True, exist_ok=True)
+        # The path exists AND is in target_scope: the self-deliverable check
+        # fires even though existence would otherwise pass.
+        (tmp_path / "src" / "new_module.py").write_text("x = 1\n")
+        defects = validate_manifest(
+            [
+                base_ticket(
+                    target_scope=["src/new_module.py"],
+                    required_reading=["repo:src/new_module.py"],
+                )
+            ],
+            repo=tmp_path,
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:src/new_module.py' references the ticket's "
+            "own deliverable (also listed in target_scope)"
+        ]
+
+    def test_self_deliverable_checked_without_repo(self) -> None:
+        # String-level: fires even with no repo given (existence unchecked).
+        defects = validate_manifest(
+            [
+                base_ticket(
+                    target_scope=["src/new_module.py"],
+                    required_reading=["repo:src/new_module.py"],
+                )
+            ]
+        )
+        assert _r14_details(defects) == [
+            "required_reading entry 'repo:src/new_module.py' references the ticket's "
+            "own deliverable (also listed in target_scope)"
+        ]
+
+    def test_self_deliverable_does_not_fire_for_context_entries(self) -> None:
+        # `context:` entries live under a different root and never collide
+        # with target_scope (repo-relative) paths.
+        defects = validate_manifest(
+            [
+                base_ticket(
+                    target_scope=["src/new_module.py"],
+                    required_reading=["context:src/new_module.py"],
+                )
+            ]
+        )
+        assert _r14_details(defects) == []
+
+    def test_no_self_deliverable_when_path_differs(self, tmp_path: Path) -> None:
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "guide.md").write_text("g\n")
+        defects = validate_manifest(
+            [
+                base_ticket(
+                    target_scope=["src/new_module.py"],
+                    required_reading=["repo:docs/guide.md"],
+                )
+            ],
+            repo=tmp_path,
+        )
+        assert _r14_details(defects) == []
+
+    # --- determinism (manifest order) ----------------------------------------
+
+    def test_deterministic_ordering_across_entries(self) -> None:
+        # Two bad entries (each also missing a required key so the label is
+        # index-based) report in MANIFEST order, and a json round-trip is
+        # byte-identical.
+        manifest = [
+            base_ticket(id="b-two", required_reading=["nope"]),
+            base_ticket(id="a-one", required_reading=["also/nope"]),
+        ]
+        first = validate_manifest(manifest)
+        r14_first = [d for d in first if parse_rule(d)[1] == "R14"]
+        # b-two (index 0) before a-one (index 1) — manifest order, not id order.
+        assert len(r14_first) == 2
+        assert parse_rule(r14_first[0])[0] == "b-two"
+        assert parse_rule(r14_first[1])[0] == "a-one"
+        second = validate_manifest(json.loads(json.dumps(manifest)))
+        assert first == second
+
+    def test_deterministic_ordering_within_entry(self) -> None:
+        # Within one entry: prefix/safety/empty-path checks run in a fixed
+        # order; two malformed entries in one list keep list order.
+        defects = validate_manifest(
+            [base_ticket(required_reading=["bad-prefix", "context:/abs.md"])]
+        )
+        r14 = _r14_details(defects)
+        assert r14 == [
+            "required_reading entry 'bad-prefix' has an unrecognized prefix "
+            "(expected 'repo:' or 'context:')",
+            "required_reading entry 'context:/abs.md' is an absolute path",
+        ]
+
+    # --- CLI: --context pass-through -----------------------------------------
+
+    def test_cli_context_flag_enables_existence_check(self, tmp_path: Path, capsys) -> None:
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(
+            json.dumps([base_ticket(required_reading=["context:ctx/brief.md"])])
+        )
+
+        # without --context: context: is grammar-only -> clean
+        rc_no_ctx = main(["manifest", "validate", "--manifest", str(manifest_file)])
+        out_no_ctx = capsys.readouterr().out
+        assert rc_no_ctx == 0
+        assert "R14" not in out_no_ctx
+
+        # with --context pointing at an empty dir: missing file -> R14 defect
+        rc_ctx = main(
+            [
+                "manifest",
+                "validate",
+                "--manifest",
+                str(manifest_file),
+                "--context",
+                str(tmp_path),
+            ]
+        )
+        out_ctx = capsys.readouterr().out
+        assert rc_ctx == 1
+        assert "R14" in out_ctx
+        assert "does not exist in the context" in out_ctx
+
+    def test_cli_context_flag_existing_file_is_clean(self, tmp_path: Path, capsys) -> None:
+        (tmp_path / "ctx").mkdir()
+        (tmp_path / "ctx" / "brief.md").write_text("brief\n")
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(
+            json.dumps([base_ticket(required_reading=["context:ctx/brief.md"])])
+        )
+        rc = main(
+            [
+                "manifest",
+                "validate",
+                "--manifest",
+                str(manifest_file),
+                "--context",
+                str(tmp_path),
+            ]
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "0 defect(s) across 1 ticket(s)" in out

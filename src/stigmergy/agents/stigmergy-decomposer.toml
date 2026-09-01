@@ -1,0 +1,26 @@
+# Stigmergy decomposer station agent TOML (host-side, no cage, no relay —
+# Fork B: processes text, executes nothing). Template — install to OA's agent
+# config dir (openalph.config.CONFIG_DIR, default /etc/openalph/agents/) as
+# `stigmergy-decomposer.toml`; `stigmergy decompose` preflights its presence
+# and fails loud with this path if missing. kimi3-on-Synthetic via the real
+# Synthetic endpoint; the real key arrives at invocation via api_key_env
+# (resolved from vault by the driver — same pattern as
+# STIGMERGY_CRITIC_OA_KEY_REF, Decision 17 / bead .152). System prompt
+# delivered per-invocation via `openalph exec --system-prompt-file` (OA
+# fedb371) from the stigmergy repo's prompts/decomposer01 — NOT from
+# workspace files. quirks: reasoning_replay ON for ALL stations (SB ruling,
+# stigmergy 90702ab).
+
+[agent]
+name = "stigmergy-decomposer"
+default_model = "synthetic/hf:moonshotai/Kimi-K3"
+max_tokens = 16384
+
+[workspace]
+path = "/tmp/stig-decomposer/ws"
+
+[providers.synthetic]
+type = "openai"
+base_url = "https://api.synthetic.new/openai/v1"
+api_key_env = "STIG_DECOMP_KEY"
+quirks = ["reasoning_replay"]

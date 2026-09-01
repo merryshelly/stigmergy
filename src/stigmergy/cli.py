@@ -31,18 +31,19 @@ import json
 import os
 import sys
 import time
-from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from stigmergy import approval, checks, egress, spend, triage
+from stigmergy import approval, checks, decompose, egress, spend, triage
 from stigmergy.charter import Charter, CharterError, load_charter, resolve_check_resources
 from stigmergy.container import PodmanContainerReaper
 from stigmergy.critic import Critic
 from stigmergy.daemon import Daemon, DaemonError
+from stigmergy.decompose import run_decompose
 from stigmergy.drivers import claude_code, openalph_exec
 from stigmergy.filing import file_proposals
+from stigmergy.intake import ingest_manifest
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.manifest import validate_manifest
 from stigmergy.notify import NotificationStore, NtfyNotifier, make_ntfy_sender
@@ -58,6 +59,7 @@ from stigmergy.oa_critic import (
     DEFAULT_MAX_TOKENS,
     CriticOAUnavailableError,
     make_oa_critic_client,
+    make_oa_decompose_critic_client,
     make_oa_range_critic_client,
 )
 from stigmergy.rangereport import (
@@ -107,13 +109,17 @@ _USAGE = (
     "  ticket new --rig <name> [--rigs-root <path>] --spec <path|->\n"
     "  intake --rig <name> [--rigs-root <path>] --manifest <path>\n"
     "  manifest validate --manifest <path> [--repo <path>] [--charter <path>]"
-    " [--rig <name>]\n"
+    " [--context <path>] [--rig <name>]\n"
     "  status --rig <name> [--rigs-root <path>]\n"
     "  monitor --rig <name> [--rigs-root <path>] [--tail N]\n"
     "  tickets --rig <name> [--rigs-root <path>]\n"
     "  filed --rig <name> [--rigs-root <path>]\n"
     "  ticket <id> --rig <name> [--rigs-root <path>]\n"
-    "  range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]"
+    "  range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]\n"
+    "  decompose --rig <name> [--rigs-root <path>] --spec <path>"
+    " [--no-approve] [--max-repairs N]"
+    " [--decomposer-model M] [--decomposer-effort {none,low,medium,xhigh}]"
+    " [--dry-run]"
 )
 
 
@@ -239,6 +245,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo", default=None, help="Repo root the target_scope paths are relative to."
     )
     manifest_validate_parser.add_argument(
+        "--context",
+        default=None,
+        help="Context root the required_reading 'context:' entries are relative to.",
+    )
+    manifest_validate_parser.add_argument(
         "--charter",
         default=None,
         help="Charter TOML (enables [checks.*]/[gates]/[lanes.*] cross-checks).",
@@ -261,6 +272,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     range_report_parser.add_argument(
         "--critic", action="store_true", help="Also run a one-shot range-critic review."
+    )
+
+    decompose_parser = subparsers.add_parser(
+        "decompose",
+        help="Decompose an operator spec into a validated, approved ticket DAG.",
+    )
+    decompose_parser.add_argument("--rig", required=True, help="Name of the rig.")
+    decompose_parser.add_argument(
+        "--rigs-root",
+        default=None,
+        help="Base directory the rig lives under (default: ~/rigs).",
+    )
+    decompose_parser.add_argument(
+        "--spec", required=True, help="Path to the operator specification file."
+    )
+    decompose_parser.add_argument(
+        "--no-approve",
+        action="store_true",
+        help="Seed the tickets but leave them unapproved/pool (skip auto-approve).",
+    )
+    decompose_parser.add_argument(
+        "--max-repairs",
+        type=int,
+        default=2,
+        help="Maximum repair rounds per decompose subject (default: 2).",
+    )
+    decompose_parser.add_argument(
+        "--decomposer-model",
+        default="synthetic/hf:moonshotai/Kimi-K3",
+        help="The decomposer station's model (default: synthetic/hf:moonshotai/Kimi-K3).",
+    )
+    decompose_parser.add_argument(
+        "--decomposer-effort",
+        choices=["none", "low", "medium", "xhigh"],
+        default="xhigh",
+        help="The decomposer station's effort (default: xhigh).",
+    )
+    decompose_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run everything except intake + approve; print the would-be-seeded tickets.",
     )
 
     return parser
@@ -910,119 +962,18 @@ def _cmd_intake(args: argparse.Namespace) -> int:
             )
             return 1
 
-        # Collect all ids from the manifest in a first pass
-        required_keys = {
-            "id",
-            "title",
-            "functional_summary",
-            "acceptance_criteria",
-            "target_scope",
-        }
-        optional_keys = {
-            "goal",
-            "required_reading",
-            "tier1_checks",
-            "difficulty",
-            "lane_hint",
-            "rubric_only",
-            "work_product",
-        }
-        # Count occurrences of each id in the manifest (single O(n) pass)
-        id_counts = Counter()
-        for entry in manifest:
-            if isinstance(entry, dict) and "id" in entry:
-                id_counts[entry["id"]] += 1
-        manifest_ids = set(id_counts.keys())
-
-        # Second pass: validate all entries before inserting anything
-        entries_to_insert: list[dict[str, Any]] = []
-
-        for idx, entry in enumerate(manifest):
-            if not isinstance(entry, dict):
-                print(
-                    f"stigmergy intake: manifest entry {idx} must be a JSON object "
-                    f"(got {type(entry).__name__})",
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Check required fields
-            missing = required_keys - set(entry)
-            if missing:
-                entry_id = entry.get("id", f"<index {idx}>")
-                sorted_missing = ", ".join(sorted(missing))
-                print(
-                    f"stigmergy intake: manifest entry {idx} ({entry_id}) "
-                    f"missing required key(s): {sorted_missing}",
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Check functional_summary is a non-empty string
-            functional_summary = entry.get("functional_summary")
-            if not isinstance(functional_summary, str) or not functional_summary.strip():
-                entry_id = entry.get("id", f"<index {idx}>")
-                print(
-                    f"stigmergy intake: manifest entry {idx} ({entry_id}) "
-                    f"'functional_summary' must be a non-empty string "
-                    f"(got {functional_summary!r})",
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Check for duplicate ids within the manifest using pre-computed counts
-            entry_id = entry["id"]
-            if id_counts[entry_id] > 1:
-                print(
-                    f"stigmergy intake: manifest entry {idx} ({entry_id}) has duplicate id",
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Check if this id already exists in the store
-            if resolved.store.get_ticket(entry_id) is not None:
-                print(
-                    f"stigmergy intake: manifest entry {idx} ({entry_id}) ticket id already exists",
-                    file=sys.stderr,
-                )
-                return 1
-
-            # Validate blocks references (all must resolve to either store or manifest entries)
-            blocks = entry.get("blocks", [])
-            for predecessor_id in blocks:
-                store_has_it = resolved.store.get_ticket(predecessor_id) is not None
-                manifest_has_it = predecessor_id in manifest_ids
-                if not store_has_it and not manifest_has_it:
-                    print(
-                        f"stigmergy intake: manifest entry {idx} ({entry_id}) "
-                        f"blocks unresolved predecessor: {predecessor_id}",
-                        file=sys.stderr,
-                    )
-                    return 1
-
-            entries_to_insert.append(entry)
-
-        # Second pass: insert all tickets
-        for entry in entries_to_insert:
-            ticket_fields: dict[str, Any] = {}
-            for key in ["functional_summary", "acceptance_criteria", "target_scope"]:
-                ticket_fields[key] = entry[key]
-            for key in optional_keys:
-                if key in entry:
-                    ticket_fields[key] = entry[key]
-
-            resolved.store.add_ticket(id=entry["id"], title=entry["title"], **ticket_fields)
-
-        # Third pass: wire all dependencies
-        for entry in entries_to_insert:
-            blocks = entry.get("blocks", [])
-            for predecessor_id in blocks:
-                resolved.store.add_dep(entry["id"], predecessor_id)
-
-        # Print one result line per entry
-        for entry in entries_to_insert:
-            print(f"{entry['id']}")
-
+        # The validation + insertion core lives in `intake.ingest_manifest`
+        # (bead workspace-e2uh.152: extracted so the decompose station driver
+        # seeds through the identical read-only-first pass). This command is
+        # a thin prefix-wrapping delegate: same stdout (one id line per
+        # entry), same stderr (`stigmergy intake: ` + the returned error),
+        # same exit codes — its existing tests pass unmodified.
+        inserted, errors = ingest_manifest(resolved.store, manifest)
+        if errors:
+            print(f"stigmergy intake: {errors[0]}", file=sys.stderr)
+            return 1
+        for ticket_id in inserted:
+            print(ticket_id)
         return 0
     finally:
         resolved.store.close()
@@ -1047,6 +998,7 @@ def _cmd_manifest_validate(args: argparse.Namespace) -> int:
             return rc  # type: ignore[return-value]
     try:
         repo: Path | None = Path(args.repo) if args.repo is not None else None
+        context: Path | None = Path(args.context) if args.context is not None else None
         charter: Any = None
         store: Any = None
         if resolved is not None:
@@ -1072,7 +1024,7 @@ def _cmd_manifest_validate(args: argparse.Namespace) -> int:
             return 1
 
         defects = validate_manifest(
-            manifest, repo=repo, charter=charter, store=store
+            manifest, repo=repo, charter=charter, store=store, context=context
         )
         for defect in defects:
             print(f"stigmergy manifest: {defect}")
@@ -1365,6 +1317,83 @@ def _cmd_range_report(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
+def _build_decompose_critic(resolved: ResolvedRig) -> decompose.DecomposeCritic:
+    """Production `DecomposeCritic` builder (bead workspace-e2uh.152,
+    Decision 17 — the decomposer band's gate 2 of 2) — in the
+    `_build_range_critic` mold: a monkeypatchable module-level helper,
+    called by plain module-global name at every call site so tests can
+    replace `cli._build_decompose_critic` wholesale.
+
+    Reads the SAME `[roles.critic].model` + `max_tokens` as the
+    staging-gate critic (shared model, separate forced tool —
+    `submit_validation`), resolves the op key ref through
+    `_critic_key_ref_for` (the ref follows the PROVIDER, Decision 3), and
+    reads the `decomposecritic01` prompt artifact (sha256'd by the critic
+    itself for the `prompt_artifact_hash` provenance).
+
+    Fail-closed (Decision 1): `CriticOAUnavailableError` (an OA-less
+    environment) and `CharterError` (a non-Anthropic critic entry with no
+    `STIGMERGY_CRITIC_OA_KEY_REF`) are loud RIG-LAUNCH failures handled by
+    `_cmd_decompose` exactly like `range-report`'s handling — exit 1,
+    stderr, before any decomposer spend.
+    """
+    critic_cfg = resolved.charter.raw["roles"]["critic"]
+    critic_key_provider = make_op_key_provider(
+        _critic_key_ref_for(resolved.registry, critic_cfg["model"])
+    )
+    return decompose.DecomposeCritic.from_prompt_file(
+        resolved.rig_paths["prompts_dir"] / "decomposecritic01",
+        client=make_oa_decompose_critic_client(
+            key_provider=critic_key_provider,
+            registry=resolved.registry,
+            max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
+        ),
+        model=critic_cfg["model"],
+        decoding_params={},
+    )
+
+
+def _cmd_decompose(args: argparse.Namespace) -> int:
+    """The `decompose` station command (bead workspace-e2uh.152, Decision
+    17): one command turns the operator spec into a seeded,
+    machine-validated, critic-cleared ticket DAG.
+
+    The validation critic is built at LAUNCH (fail-closed — an OA-less
+    environment or a missing key ref is a loud launch failure, exactly like
+    `range-report --critic`), and the built instance is what
+    `decompose.run_decompose` receives as its `critic_factory` (never
+    rebuilt per judgment). The driver's return code IS the command's
+    (0 = seeded / dry-run clean; 1 = escape / non-convergence / phase
+    defect / critic malformed-after-retry; 2 = exec failure after retry);
+    the driver itself prints the one-line stderr reason + run dir on
+    failure.
+    """
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        try:
+            critic = _build_decompose_critic(resolved)
+        except (CriticOAUnavailableError, CharterError) as exc:
+            # Fail-closed at launch — the same handling as `range-report`
+            # (bead .143): a loud exit-1 stderr, never a mid-run trip.
+            print(f"stigmergy decompose: {exc}", file=sys.stderr)
+            return 1
+        return run_decompose(
+            rig_name=args.rig,
+            spec_path=args.spec,
+            no_approve=args.no_approve,
+            max_repairs=args.max_repairs,
+            decomposer_model=args.decomposer_model,
+            decomposer_effort=args.decomposer_effort,
+            dry_run=args.dry_run,
+            rigs_root=args.rigs_root,
+            critic_factory=lambda _resolved: critic,
+        )
+    finally:
+        resolved.store.close()
+
+
 # The dedicated dogfood 1Password item for the critic's real Anthropic key
 # (item id `oknaudituuajtuw3cnv4dra7s4`, field `credential`) -- per bead .31's
 # comment, do NOT source the critic key from any other vault item.
@@ -1550,6 +1579,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "range-report":
         return _cmd_range_report(args)
+    if args.command == "decompose":
+        return _cmd_decompose(args)
 
     print(_USAGE)
     return 0

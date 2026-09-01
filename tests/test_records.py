@@ -180,6 +180,13 @@ def test_attempt_kinds_matches_spec_enumeration() -> None:
             # outcome from a dispatch-side infra-retry or a ladder-exhausted
             # escalation (same precedent as 'report' and 'critic-infra').
             "spec-failure",
+            # bead .152 (Decision 17): a decompose-band invocation (the
+            # decomposer exec run or the decomposition validation critic) is
+            # rig-level, not a ticket attempt; reusing 'report' (or any
+            # ticket-adjacent value) would be a recorded lie (same precedent as
+            # 'report' and 'critic-infra'). SPEC §9 enumeration gains this
+            # member too — follow-up note for SB.
+            "decompose",
         }
     )
 
@@ -586,12 +593,15 @@ def _triage_fields(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_D1r_triage_event_types_exist_and_enum_has_twelve_members() -> None:
+def test_D1r_triage_event_types_exist_and_enum_has_thirteen_members() -> None:
     assert EventType.APPROVAL.value == "approval"
     assert EventType.UNAPPROVAL.value == "unapproval"
     assert EventType.TRIAGE_REJECTED.value == "triage-rejected"
     assert EventType.RESUME.value == "resume"
-    assert len(list(EventType)) == 12
+    # bead .152 (Decision 17): DECOMPOSE joins as the 13th member — the
+    # decomposer band's LLM invocations (rig-level, no ticket, same
+    # precedent as REPORT/TICKET_FILED).
+    assert len(list(EventType)) == 13
 
 
 @pytest.mark.parametrize(
@@ -677,3 +687,81 @@ def test_D5r_report_event_with_report_attempt_kind_validates() -> None:
     ev = make_event(EventType.REPORT, **fields)
     assert ev.payload["attempt_kind"] == "report"
     assert ev.payload["prompt_artifact_hash"] == "rangecrit01-hashxyz"
+
+
+# --- bead .152: decompose-band event (EventType.DECOMPOSE) -----------------
+# The decomposer station's LLM invocations (the decomposer exec run + the
+# decomposition validation critic) are rig-level, no ticket — the same
+# justification precedent as `report` and `ticket-filed` (Decision 17 / bead
+# workspace-e2uh.152). They are LLM invocations, so they carry a
+# hash-bearing prompt_artifact_hash; they are NOT gate events, so they do
+# NOT require decoding_params.
+
+VALID_DECOMPOSE_HASH = "decomp01-hashabc"
+
+
+def _decompose_fields(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid decompose-band event field set: the full
+    dispatch-shaped common-field set (ticket/worker/rung/rung=None and
+    attempt=0 are legal rig-level values, per cli._emit_report_event) plus
+    attempt_kind="decompose" and a hash-bearing prompt_artifact_hash."""
+    base = common_fields(
+        ticket=None,
+        dispatch_id="decompose-0001",
+        attempt=0,
+        attempt_kind="decompose",
+        rung=None,
+        worker=None,
+        image_digest=None,
+        model_version=None,
+        prompt_artifact_hash=VALID_DECOMPOSE_HASH,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_D152_decompose_event_type_is_the_thirteenth_member() -> None:
+    assert EventType.DECOMPOSE.value == "decompose"
+    assert len(list(EventType)) == 13
+    # DECOMPOSE is an LLM-invocation event (SPEC §4 prompt-artifact invariant).
+    from stigmergy.records import _LLM_INVOCATION_TYPES
+
+    assert EventType.DECOMPOSE in _LLM_INVOCATION_TYPES
+
+
+def test_D152_decompose_attempt_kind_is_accepted() -> None:
+    assert "decompose" in ATTEMPT_KINDS
+
+
+def test_D152_valid_decompose_event_validates() -> None:
+    """A valid DECOMPOSE event with all common fields + attempt_kind=
+    "decompose" + prompt_artifact_hash validates."""
+    ev = make_event(EventType.DECOMPOSE, **_decompose_fields())
+    assert ev.payload["event_type"] == "decompose"
+    assert ev.payload["attempt_kind"] == "decompose"
+    assert ev.payload["ticket"] is None
+    assert ev.payload["worker"] is None
+    assert ev.payload["rung"] is None
+    assert ev.payload["attempt"] == 0
+    assert ev.payload["prompt_artifact_hash"] == VALID_DECOMPOSE_HASH
+    # decompose is NOT a gate event -> no decoding_params required or carried.
+    assert "decoding_params" not in ev.payload
+
+
+def test_D152_decompose_missing_prompt_artifact_hash_raises() -> None:
+    fields = _decompose_fields()
+    del fields["prompt_artifact_hash"]
+    with pytest.raises(RecordError):
+        make_event(EventType.DECOMPOSE, **fields)
+
+
+def test_D152_decompose_does_not_require_decoding_params() -> None:
+    """A 'decompose' event does NOT require decoding_params; a GATE event
+    WITHOUT decoding_params must still raise (the existing gate rule holds)."""
+    # (a) decompose is valid with NO decoding_params at all.
+    make_event(EventType.DECOMPOSE, **_decompose_fields())  # must NOT raise
+    # (b) the gate rule is unchanged: a GATE event missing decoding_params
+    # still raises, even though the decompose field set above is valid.
+    gate_fields = common_fields(prompt_artifact_hash="critic01-hashdef")
+    with pytest.raises(RecordError):
+        make_event(EventType.GATE, **gate_fields)

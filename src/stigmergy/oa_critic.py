@@ -103,6 +103,11 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_RANGE_MAX_TOKENS = 4096
 VERDICT_TOOL_NAME = "submit_verdict"
 RANGE_REVIEW_TOOL_NAME = "submit_range_review"
+# bead .152 (Decision 17): the decomposer band's validation critic — the
+# structured decomposer-manifest validation verdict (gate 2 of 2 of the
+# decomposer station). Rig-level, no ticket (same precedent as `report` /
+# `ticket-filed`); its record-plane event is `EventType.DECOMPOSE`.
+DECOMPOSE_VALIDATION_TOOL_NAME = "submit_validation"
 
 # §3.2.1: a forced-tool verdict is a few-KB response, but spike .142
 # observed 1661 pre-tool reasoning tokens and up to 18.1 s latency on
@@ -250,6 +255,113 @@ def build_range_review_tool() -> dict[str, Any]:
                 },
             },
             "required": ["findings"],
+        },
+    }
+
+
+def build_validation_tool() -> dict[str, Any]:
+    """The synthetic tool definition that forces the decomposer-station
+    validation critic to return exactly one structured validation verdict
+    for the decomposer manifest under review (bead workspace-e2uh.152,
+    Decision 17 — the decomposer band's gate 2 of 2, the LLM half of the
+    two-gate decomposer station). Mirrors the house style of
+    :func:`build_verdict_tool` / :func:`build_range_review_tool`:
+    `strict: True` + `additionalProperties: False` on every object, so the
+    forced-tool grammar constrains sampling server-side (a `required` field
+    cannot be omitted).
+
+    The schema is only a HINT to the model — the decomposer station's
+    manifest validator / repair-round driver remains the sole authority we
+    actually trust; this module never re-validates `verdict` / `findings`
+    semantics (mirrors the split where `critic.py` owns verdict parsing and
+    `rangereport.py` owns range-review semantics).
+
+    `verdict` is `accept` (the manifest may enter the ticket pool — minor
+    findings ride along recorded) or `repair` (the findings must be
+    addressed by a repair round). Each `findings` item is advisory: an
+    `aspect` (judgment dimension), a `severity`, the `tickets` it touches
+    (empty array for manifest-level findings), the `evidence` it rests on,
+    and an advisory `direction` for a repair round — `direction` is
+    deliberately NOT in the item's `required` list (a finding with no
+    repair direction is still well-formed).
+    """
+    return {
+        "name": DECOMPOSE_VALIDATION_TOOL_NAME,
+        "strict": True,
+        "description": (
+            "Submit the structured validation verdict for the decomposer "
+            "manifest under review. Call this exactly once with your judgment."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["accept", "repair"],
+                    "description": (
+                        "accept = the manifest may enter the ticket pool (minor "
+                        "findings ride along recorded); repair = the findings "
+                        "must be addressed by a repair round."
+                    ),
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Non-empty human-readable overall judgment.",
+                },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "aspect": {
+                                "type": "string",
+                                "enum": [
+                                    "fidelity",
+                                    "coverage",
+                                    "sizing",
+                                    "rubric_quality",
+                                    "hedges",
+                                    "notes",
+                                    "other",
+                                ],
+                                "description": (
+                                    "Which judgment dimension the finding belongs to."
+                                ),
+                            },
+                            "severity": {
+                                "type": "string",
+                                "enum": ["critical", "major", "minor"],
+                            },
+                            "tickets": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Manifest ticket ids the finding touches; "
+                                    "empty array for manifest-level findings."
+                                ),
+                            },
+                            "evidence": {
+                                "type": "string",
+                                "description": (
+                                    "The specific spec clause, manifest field, "
+                                    "or quote the finding rests on."
+                                ),
+                            },
+                            "direction": {
+                                "type": "string",
+                                "description": (
+                                    "What a repair round should do about it "
+                                    "(advisory)."
+                                ),
+                            },
+                        },
+                        "required": ["aspect", "severity", "tickets", "evidence"],
+                    },
+                },
+            },
+            "required": ["verdict", "summary", "findings"],
         },
     }
 
@@ -669,3 +781,64 @@ def make_oa_range_critic_client(
         station="range-critic",
     )
     return _make_oa_client(state, is_range=True)
+
+
+def make_oa_decompose_critic_client(
+    *,
+    key_provider: Callable[[], str],
+    registry: Registry,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    complete_fn: Callable[..., Awaitable[Any]] | None = None,
+    loop_runner: Callable[[Awaitable[Any]], Any] | None = None,
+) -> Callable[..., dict[str, Any]]:
+    """Build the OA-layer decomposer-station validation critic client
+    (bead workspace-e2uh.152, Decision 17 — the decomposer band's gate 2 of
+    2, the LLM decomposition-validation critic). Same signature and
+    fail-closed build as :func:`make_oa_critic_client`, forcing
+    `submit_validation` instead and naming the station `decompose-critic`.
+
+    The client returns the RAW `submit_validation` tool-input dict VERBATIM
+    plus an ADDITIVE `usage` key — no semantic parsing here; the decomposer
+    station's manifest validator / repair-round driver owns the judgment
+    semantics, exactly as `Critic.judge` owns verdict parsing and
+    `RangeCritic.review` owns range-review semantics.
+
+    Rig-level, no ticket (Decision 17): the decomposer band's LLM
+    invocations — the decomposer exec run and this validation critic — have
+    no parent ticket, the same justification precedent as `report` and
+    `ticket-filed`; their record-plane events land under
+    `EventType.DECOMPOSE` (bead .152), which carries a hash-bearing
+    `prompt_artifact_hash` (SPEC §4).
+
+    Factory build is FAIL-CLOSED (Decision 1): `_import_oa_provider()` runs
+    HERE, so an OA-less environment raises `CriticOAUnavailableError` at
+    rig launch — never at the first validation call. The build performs NO
+    registry lookup and NO key fetch (both are per-call / lazy).
+
+    `complete_fn` / `loop_runner` are test seams: production resolves
+    `complete` via the OA import and the ONE persistent per-process event
+    loop; tests substitute a stub `async def` complete and a synchronous
+    runner (no production thread in unit tests).
+    """
+    try:
+        provider, tooldef_cls, provider_config_cls, agent_config_cls = _import_oa_provider()
+    except ImportError as exc:
+        raise CriticOAUnavailableError(
+            f"openalph provider layer unavailable — {exc!s}; the critic clients "
+            "route through OA's provider layer (bead workspace-e2uh.143, A′); "
+            "install openalph or the rig cannot start"
+        ) from exc
+    state = _FactoryState(
+        key_provider=key_provider,
+        registry=registry,
+        max_tokens=max_tokens,
+        complete_fn=complete_fn if complete_fn is not None else provider.complete,
+        loop_runner=loop_runner if loop_runner is not None else _default_loop_runner,
+        tooldef_cls=tooldef_cls,
+        provider_config_cls=provider_config_cls,
+        agent_config_cls=agent_config_cls,
+        tool_name=DECOMPOSE_VALIDATION_TOOL_NAME,
+        tool_dict=build_validation_tool(),
+        station="decompose-critic",
+    )
+    return _make_oa_client(state, is_range=False)

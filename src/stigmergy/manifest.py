@@ -45,6 +45,16 @@ Rule table (the rule id is the second field of every defect string):
          [lanes.*] section
     R12  rubric_only (when present): must be a bool
     R13  unknown key (typo-catcher): any key outside the §6 vocabulary
+    R14  required_reading (when present): array of strings, each with a
+         literal ``repo:`` or ``context:`` prefix (mirrors dispatch.py's
+         ``_REPO_PREFIX``/``_CONTEXT_PREFIX`` — dispatch fails loud on a
+         missing prefix, costing a whole worker dispatch); the remainder
+         is a non-empty relative path (absolute -> defect; any ``..``
+         segment -> defect); with the matching root given, the path must
+         EXIST (file or directory) beneath it — unlike R8 there is NO
+         new-file carve-out; a ``repo:`` path also defects when it
+         string-equals any entry's own ``target_scope`` (the ticket's
+         own deliverable)
 
 Defect strings are stable and structured::
 
@@ -87,6 +97,11 @@ _KEBAB_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # R8: a path segment that attempts directory traversal.
 _TRAVERSAL_SEGMENT = ".."
 
+# R14: required_reading entry prefixes (mirrors dispatch.py's
+# _CONTEXT_PREFIX/_REPO_PREFIX — dispatch.py is NOT modified).
+_CONTEXT_PREFIX = "context:"
+_REPO_PREFIX = "repo:"
+
 # R5: the [gates] sub-keys whose named checks must be covered by tier1_checks.
 _GATES_CHECK_KEYS = ("attempt", "staging")
 
@@ -97,16 +112,20 @@ def validate_manifest(
     repo: Path | None = None,
     charter: object | None = None,
     store: object | None = None,
+    context: Path | None = None,
 ) -> list[str]:
     """Validate a decomposer manifest; return a list of defect strings.
 
     ``manifest`` is the parsed JSON (expected: a list of ticket
     work-order objects). ``repo`` (when given) enables R8's existence
-    checks against that directory; ``charter`` (a
+    checks against that directory and R14's ``repo:``-prefixed
+    existence checks; ``charter`` (a
     :class:`~stigmergy.charter.Charter` or a plain resolved-charter dict)
     enables R5's [checks.*]/[gates] cross-checks and R11's [lanes.*]
     check; ``store`` (anything with ``get_ticket``/``list_tickets``)
-    enables R6's collision check and R7's store-id resolution.
+    enables R6's collision check and R7's store-id resolution;
+    ``context`` (when given) enables R14's ``context:``-prefixed
+    existence checks against that directory.
 
     Returns ``[]`` for a clean manifest. Output is deterministic for a
     given input: entries are visited in manifest order, cross-ticket
@@ -115,6 +134,8 @@ def validate_manifest(
     """
     if repo is not None:
         repo = Path(repo)
+    if context is not None:
+        context = Path(context)
 
     # Pre-resolve the charter cross-check data once (read-only).
     check_names: set[str] = set()
@@ -175,6 +196,7 @@ def validate_manifest(
         _check_blocks(entry, label, defects)
         _check_unresolved_blocks(entry, label, defects, manifest_ids, store_ids)
         _check_target_scope(entry, label, defects, repo=repo)
+        _check_required_reading(entry, label, defects, repo=repo, context=context)
         _check_difficulty(entry, label, defects)
         _check_lane_hint(entry, label, defects, charter_given=charter is not None,
                          lane_names=lane_names)
@@ -447,6 +469,90 @@ def _check_target_scope(
 
 def _has_traversal_segment(path: str) -> bool:
     return _TRAVERSAL_SEGMENT in path.split("/")
+
+
+def _check_required_reading(
+    entry: Mapping[str, Any],
+    label: str,
+    defects: list[str],
+    *,
+    repo: Path | None,
+    context: Path | None,
+) -> None:
+    """R14: the optional ``required_reading`` key — an array of strings,
+    each carrying a literal ``repo:`` or ``context:`` prefix (dispatch.py
+    ``_resolve_required_reading_entry`` requires it and fails loud
+    otherwise — R14 catches the authoring bug at validation time). The
+    remainder must be a non-empty relative path. With the matching root
+    given, the path must EXIST beneath it (file or directory) — NO
+    new-file carve-out (unlike R8): a required_reading entry pointing at
+    a file the ticket itself will create is precisely the defect class.
+    A ``repo:`` path that string-equals an entry in the SAME entry's
+    ``target_scope`` (its own deliverable) is always a defect, with or
+    without a repo. ``context:`` entries never collide with
+    target_scope (different root)."""
+    if "required_reading" not in entry:
+        return
+    value = entry.get("required_reading")
+    if not isinstance(value, list):
+        defects.append(f"ticket {label}: R14: required_reading must be an array of strings")
+        return
+    scope_paths: set[str] = set()
+    raw_scope = entry.get("target_scope")
+    if isinstance(raw_scope, list):
+        scope_paths = {p for p in raw_scope if isinstance(p, str)}
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {i} must be a string "
+                f"(got {item!r})"
+            )
+            continue
+        if item.startswith(_CONTEXT_PREFIX):
+            rel = item[len(_CONTEXT_PREFIX) :]
+            root, root_name = context, "context"
+        elif item.startswith(_REPO_PREFIX):
+            rel = item[len(_REPO_PREFIX) :]
+            root, root_name = repo, "repo"
+        else:
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} has an "
+                "unrecognized prefix (expected 'repo:' or 'context:')"
+            )
+            continue
+        if not rel:
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} "
+                "has an empty path after the prefix"
+            )
+            continue
+        if os.path.isabs(rel):
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} is an absolute path"
+            )
+            continue
+        if _has_traversal_segment(rel):
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} contains a '..' segment"
+            )
+            continue
+        # Self-deliverable: string-level, ALWAYS checked (with or without a
+        # repo) — required_reading must never name a file this ticket will
+        # create. `context:` entries live under a different root and never
+        # collide with target_scope.
+        if root_name == "repo" and rel in scope_paths:
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} references "
+                "the ticket's own deliverable (also listed in target_scope)"
+            )
+        if root is None:
+            continue  # no root given -> grammar + safety checks only
+        if not (root / rel).exists():
+            defects.append(
+                f"ticket {label}: R14: required_reading entry {item!r} does not exist "
+                f"in the {root_name} (required_reading must already exist — "
+                "never the ticket's own deliverable)"
+            )
 
 
 def _check_difficulty(entry: Mapping[str, Any], label: str, defects: list[str]) -> None:

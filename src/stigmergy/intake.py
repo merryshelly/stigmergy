@@ -27,6 +27,7 @@ ticket a discount on its retry budget.
 from __future__ import annotations
 
 import copy
+from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
@@ -38,6 +39,128 @@ from stigmergy.checks import CheckOutcome
 # in-flight, parked, gated, landed, rejected mid-transition, escalated,
 # done) is not directly claimable here.
 _CLAIMABLE_STATES = frozenset({"pool", "eligible"})
+
+# The §6 ticket key vocabulary `intake` accepts (bead workspace-e2uh.152):
+# the required five + the optional extras that ride straight into the
+# ticket columns. `blocks` is a manifest-level wiring key consumed to build
+# dependency edges — legal in a manifest entry but NOT a ticket column
+# (mirrors `manifest.py`'s KNOWN_KEYS split).
+_REQUIRED_INTAKE_KEYS = frozenset(
+    {"id", "title", "functional_summary", "acceptance_criteria", "target_scope"}
+)
+_OPTIONAL_INTAKE_KEYS = frozenset(
+    {"goal", "required_reading", "tier1_checks", "difficulty", "lane_hint",
+     "rubric_only", "work_product"}
+)
+
+
+def ingest_manifest(store: Any, manifest: list) -> tuple[list[str], list[str]]:
+    """Validate + insert a parsed manifest array (list of ticket dicts).
+
+    Extracted verbatim from `cli._cmd_intake` (bead workspace-e2uh.152) so
+    the decompose station driver can seed tickets through the SAME
+    read-only-first validation the CLI uses — the CLI is now a thin
+    prefix-wrapping delegate around this function, and its observable
+    behavior (stdout/stderr/exit code) is byte-identical.
+
+    Returns ``(inserted_ticket_ids, error_strings)``:
+
+    - ``([], [])``-shape success: every entry validated and inserted
+      (tickets inserted, `blocks` deps wired), ids in manifest order.
+    - ``([], [err, ...])`` on ANY entry-level error: the function is
+      READ-ONLY until the first insertion — a full first pass validates
+      every entry (required keys, non-empty functional_summary, duplicate
+      ids via the single O(n) id-count pass, store collisions, blocks
+      resolution against store-or-manifest ids) BEFORE any insert. The
+      first failing entry's message is returned and nothing is inserted
+      (existing CLI behavior — one bad entry fails the whole manifest).
+
+    The error strings are the CLI message bodies verbatim (no `stigmergy
+    intake:` prefix, which the CLI adds when printing them to stderr).
+    """
+    # First pass: count each id's occurrences (single O(n) pass) and collect
+    # the manifest id set for blocks resolution.
+    id_counts = Counter()
+    for entry in manifest:
+        if isinstance(entry, dict) and "id" in entry:
+            id_counts[entry["id"]] += 1
+    manifest_ids = set(id_counts.keys())
+
+    # Second pass: validate all entries before inserting anything.
+    entries_to_insert: list[dict[str, Any]] = []
+
+    for idx, entry in enumerate(manifest):
+        if not isinstance(entry, dict):
+            return [], [
+                f"manifest entry {idx} must be a JSON object "
+                f"(got {type(entry).__name__})"
+            ]
+
+        # Check required fields
+        missing = _REQUIRED_INTAKE_KEYS - set(entry)
+        if missing:
+            entry_id = entry.get("id", f"<index {idx}>")
+            sorted_missing = ", ".join(sorted(missing))
+            return [], [
+                f"manifest entry {idx} ({entry_id}) "
+                f"missing required key(s): {sorted_missing}"
+            ]
+
+        # Check functional_summary is a non-empty string
+        functional_summary = entry.get("functional_summary")
+        if not isinstance(functional_summary, str) or not functional_summary.strip():
+            entry_id = entry.get("id", f"<index {idx}>")
+            return [], [
+                f"manifest entry {idx} ({entry_id}) "
+                f"'functional_summary' must be a non-empty string "
+                f"(got {functional_summary!r})"
+            ]
+
+        # Check for duplicate ids within the manifest using pre-computed counts
+        entry_id = entry["id"]
+        if id_counts[entry_id] > 1:
+            return [], [
+                f"manifest entry {idx} ({entry_id}) has duplicate id"
+            ]
+
+        # Check if this id already exists in the store
+        if store.get_ticket(entry_id) is not None:
+            return [], [
+                f"manifest entry {idx} ({entry_id}) ticket id already exists"
+            ]
+
+        # Validate blocks references (all must resolve to either store or
+        # manifest entries)
+        blocks = entry.get("blocks", [])
+        for predecessor_id in blocks:
+            store_has_it = store.get_ticket(predecessor_id) is not None
+            manifest_has_it = predecessor_id in manifest_ids
+            if not store_has_it and not manifest_has_it:
+                return [], [
+                    f"manifest entry {idx} ({entry_id}) "
+                    f"blocks unresolved predecessor: {predecessor_id}"
+                ]
+
+        entries_to_insert.append(entry)
+
+    # All entries validated — the write phase may begin.
+    for entry in entries_to_insert:
+        ticket_fields: dict[str, Any] = {}
+        for key in ["functional_summary", "acceptance_criteria", "target_scope"]:
+            ticket_fields[key] = entry[key]
+        for key in _OPTIONAL_INTAKE_KEYS:
+            if key in entry:
+                ticket_fields[key] = entry[key]
+
+        store.add_ticket(id=entry["id"], title=entry["title"], **ticket_fields)
+
+    # Wire all dependencies
+    for entry in entries_to_insert:
+        blocks = entry.get("blocks", [])
+        for predecessor_id in blocks:
+            store.add_dep(entry["id"], predecessor_id)
+
+    return [entry["id"] for entry in entries_to_insert], []
 
 
 class LeaseError(Exception):

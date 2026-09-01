@@ -109,8 +109,15 @@ Optional fields, used when they earn their place:
 - "goal": the technical objective in one or two sentences — the worker's
   north star. The acceptance criteria, not the goal, are normative; never
   let the goal promise something the criteria do not pin down.
-- "required_reading": JSON array of repo paths (or spec section refs) the
-  worker must read before coding. Keep it short — paths only.
+- "required_reading": JSON array of paths the worker must read before
+  coding, each prefixed with its root: "repo:<path-from-repo-root>" for
+  repository files, "context:<path-from-rig-context-root>" for curated
+  rig context. Every entry MUST carry a prefix (the dispatcher fails
+  loud without one, costing a whole dispatch), must point at a path
+  that ALREADY EXISTS (verify with your file tools — a required_reading
+  entry has no new-file carve-out), and must never be a file this
+  ticket itself creates or modifies (never list the ticket's own
+  deliverable as its required reading). Keep it short — paths only.
 - "difficulty": exactly one of "trivial", "easy", "medium", "hard",
   "frontier" (words, never numerals, never synonyms like "low"/"small" —
   this is recorded data for model-routing).
@@ -349,6 +356,8 @@ Before writing the manifest, verify every ticket against this list:
   present as criteria; intent criterion present.
 - Behavior-change tickets: affected test files enumerated in target_scope,
   with a criterion covering their update.
+- required_reading: every entry prefixed repo:/context:, pointing at a
+  path you verified exists, never the ticket's own deliverable.
 - tier1_checks: dict of the [gates]-named checks, verbatim from this
   charter.
 - target_scope: every path verified to exist or declared as this ticket's

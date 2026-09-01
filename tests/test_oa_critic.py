@@ -1095,3 +1095,210 @@ def test_factory_build_does_not_resolve_registry_or_fetch_key() -> None:
     assert callable(client)
     assert kp.calls["n"] == 0
     assert calls["n"] == 0
+
+
+# ==========================================================================
+# Bead .152 (Decision 17) — decomposer-station validation critic client
+# ==========================================================================
+# A THIRD forced-tool factory: `make_oa_decompose_critic_client` — an EXACT
+# structural mirror of `make_oa_critic_client` (same fail-closed lazy OA
+# import at build, same `_FactoryState` wiring, `_make_oa_client(is_range=
+# False)`), forcing `submit_validation` instead of `submit_verdict` and
+# naming the station `decompose-critic`. The client returns the raw
+# tool-input dict plus the ADDITIVE `usage` key — no semantic parsing here
+# (the decomposer station owns it).
+
+
+VALID_VALIDATION_INPUT = {
+    "verdict": "accept",
+    "summary": "the manifest may enter the ticket pool",
+    "findings": [
+        {
+            "aspect": "sizing",
+            "severity": "minor",
+            "tickets": [],
+            "evidence": "workspace-e2uh.152 is within the size cap",
+        }
+    ],
+}
+
+
+def _make_decompose_client(script: list[Any], **factory_kw: Any):
+    from stigmergy.oa_critic import make_oa_decompose_critic_client
+
+    stub = StubComplete(script)
+    client = make_oa_decompose_critic_client(
+        key_provider=_key_provider(),
+        registry=_registry_with_oa_fields(),
+        complete_fn=stub,
+        loop_runner=sync_loop_runner,
+        **factory_kw,
+    )
+    return client, stub
+
+
+def _validation_response(
+    input: Any = VALID_VALIDATION_INPUT, **kwargs: Any
+) -> ResponseLike:
+    return ResponseLike(
+        tool_calls=[
+            ToolCallLike("submit_validation", input, id="submit_validation:0")
+        ],
+        **kwargs,
+    )
+
+
+def test_decompose_factory_builds_without_network() -> None:
+    """Factory build with a stub complete_fn performs no network / key /
+    registry work — the fail-closed lazy OA import is the only build-time
+    side effect (same as the verdict client)."""
+    from stigmergy.oa_critic import make_oa_decompose_critic_client
+
+    kp = _key_provider()
+    calls = {"n": 0}
+
+    def exploding_registry(name):
+        calls["n"] += 1
+        raise AssertionError("factory build must not resolve the registry")
+
+    registry = _registry_with_oa_fields()
+    registry.resolve = exploding_registry  # type: ignore[method-assign]
+    client = make_oa_decompose_critic_client(
+        key_provider=kp,
+        registry=registry,
+        complete_fn=StubComplete([]),
+        loop_runner=sync_loop_runner,
+    )
+    assert callable(client)
+    assert kp.calls["n"] == 0
+    assert calls["n"] == 0
+
+
+def test_decompose_fails_closed_when_oa_unavailable(monkeypatch) -> None:
+    """`openalph` unimportable -> the decompose factory raises
+    `CriticOAUnavailableError` AT BUILD TIME, naming `openalph`
+    (Decision 1; same as the verdict/range factories)."""
+    from stigmergy import oa_critic
+
+    def _boom():
+        raise ImportError("No module named 'openalph'")
+
+    monkeypatch.setattr(oa_critic, "_import_oa_provider", _boom)
+    with pytest.raises(oa_critic.CriticOAUnavailableError) as ei:
+        oa_critic.make_oa_decompose_critic_client(
+            key_provider=_key_provider(), registry=_registry_with_oa_fields()
+        )
+    assert "openalph" in str(ei.value)
+
+
+def test_decompose_forced_tool_name_is_submit_validation() -> None:
+    client, stub = _make_decompose_client([_validation_response()])
+    client(PROMPT, model="opus")
+    assert stub.calls[0]["tool_choice"] == "submit_validation"
+    assert stub.calls[0]["strict"] is True
+    assert stub.calls[0]["hardened"] is True
+
+
+def test_decompose_returns_tool_input_plus_usage() -> None:
+    payload = {
+        "verdict": "repair",
+        "summary": "the findings must be addressed by a repair round",
+        "findings": [
+            {
+                "aspect": "sizing",
+                "severity": "major",
+                "tickets": ["workspace-e2uh.152"],
+                "evidence": "one ticket exceeds the size cap",
+                "direction": "split the largest ticket",
+            }
+        ],
+    }
+    client, _ = _make_decompose_client(
+        [
+            _validation_response(
+                input=payload,
+                usage=UsageLike(input_tokens=120, output_tokens=80, cache_read_tokens=15),
+            )
+        ]
+    )
+    result = client(PROMPT, model="opus")
+    # raw tool input VERBATIM + the ADDITIVE usage channel (no semantic
+    # parsing here; the decomposer station owns it).
+    assert {k: v for k, v in result.items() if k != "usage"} == payload
+    assert set(result) == set(payload) | {"usage"}
+    assert result["usage"] == {"in": 120, "cached": 15, "out": 80, "reasoning": 0}
+
+
+def test_decompose_decoding_params_must_be_empty() -> None:
+    client, stub = _make_decompose_client([_validation_response()])
+    with pytest.raises(Exception) as ei:
+        client(PROMPT, model="opus", temperature=0.2)
+    assert type(ei.value).__name__ == "CriticClientError"
+    assert "decoding_params" in str(ei.value)
+    assert stub.calls == []  # fail BEFORE any provider call
+
+
+def test_decompose_stop_reason_and_arity_gates() -> None:
+    """The stop_reason / arity / name / dict-input guards behave like the
+    verdict client's: truncation -> CriticClientError naming
+    roles.critic.max_tokens; refusal -> a station-specific message (naming
+    `decompose-critic`); arity/name/dict violations -> CriticClientError."""
+    for reason in ("length", "max_tokens"):
+        client, _ = _make_decompose_client([_validation_response(stop_reason=reason)])
+        with pytest.raises(Exception) as ei:
+            client(PROMPT, model="opus")
+        assert type(ei.value).__name__ == "CriticClientError"
+        assert "roles.critic.max_tokens" in str(ei.value)
+    # refusal names the station (station="decompose-critic")
+    client, _ = _make_decompose_client([_validation_response(stop_reason="refusal")])
+    with pytest.raises(Exception) as ei:
+        client(PROMPT, model="opus")
+    assert type(ei.value).__name__ == "CriticClientError"
+    assert "decompose-critic" in str(ei.value)
+    # arity / wrong-name / non-dict-input / None-input
+    for script in (
+        [ResponseLike()],  # zero tool calls
+        [ResponseLike(tool_calls=[ToolCallLike("submit_verdict", {"a": 1})])],  # wrong name
+        [_validation_response(input="not-a-dict")],  # non-dict input
+        [_validation_response(input=None)],  # None input
+    ):
+        client, _ = _make_decompose_client(script)
+        with pytest.raises(Exception) as ei:
+            client(PROMPT, model="opus")
+        assert type(ei.value).__name__ == "CriticClientError"
+
+
+def test_decompose_validation_tool_schema_shape() -> None:
+    from stigmergy.oa_critic import (
+        DECOMPOSE_VALIDATION_TOOL_NAME,
+        build_validation_tool,
+    )
+
+    assert DECOMPOSE_VALIDATION_TOOL_NAME == "submit_validation"
+    tool = build_validation_tool()
+    assert tool["name"] == "submit_validation"
+    assert tool["strict"] is True
+    schema = tool["input_schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"verdict", "summary", "findings"}
+    props = schema["properties"]
+    # verdict enum
+    assert props["verdict"]["type"] == "string"
+    assert props["verdict"]["enum"] == ["accept", "repair"]
+    # findings is an array of objects, additionalProperties False
+    findings = props["findings"]
+    assert findings["type"] == "array"
+    item = findings["items"]
+    assert item["type"] == "object"
+    assert item["additionalProperties"] is False
+    # findings item required fields (direction is advisory/optional)
+    assert set(item["required"]) == {"aspect", "severity", "tickets", "evidence"}
+    # aspect / severity enums
+    assert set(item["properties"]["aspect"]["enum"]) == {
+        "fidelity", "coverage", "sizing", "rubric_quality", "hedges", "notes", "other"
+    }
+    assert set(item["properties"]["severity"]["enum"]) == {"critical", "major", "minor"}
+    # tickets is an array of strings
+    assert item["properties"]["tickets"]["type"] == "array"
+    assert item["properties"]["tickets"]["items"]["type"] == "string"

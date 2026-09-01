@@ -42,7 +42,13 @@ operator session, agent-asserted in v0). They are the ONE-log audit line
 D1 locates in the event plane, and are **exempt from the dispatch-shaped
 common-field set** (human acts, not dispatches): they validate against
 `_REQUIRED_TRIAGE_FIELDS` only. Bead `.102c` adds `RESUME` — another
-operator-authority triage re-entry act. Twelve members total.
+operator-authority triage re-entry act. Bead `.152` (Decision 17) adds a
+thirteenth member, `DECOMPOSE`, for the decomposer band's LLM invocations
+(the decomposer exec run and the decomposition validation critic) —
+rig-level, no ticket, the same justification precedent as `report` and
+`ticket-filed`. It IS an LLM-invocation event (carries a hash-bearing
+`prompt_artifact_hash`, SPEC §4) but is NOT a gate event (no
+`decoding_params`). Thirteen members total.
 """
 
 from __future__ import annotations
@@ -71,7 +77,7 @@ class RecordError(Exception):
 class EventType(enum.Enum):
     """Event-plane discriminant (SPEC.md §8).
 
-    Twelve members. `dispatch`, `check`, `gate`, `integration`,
+    Thirteen members. `dispatch`, `check`, `gate`, `integration`,
     `disposition`, `notify` are SPEC §8's prose list; `report` is added
     per SPEC §4 (prompt-artifact invariant: "every LLM-invoked role... the
     prompt hash is logged in every event that invocation produces") and
@@ -82,7 +88,11 @@ class EventType(enum.Enum):
     `approval`/`unapproval`/`triage-rejected`/`resume` (bead .42, D1/D15,
     and bead .102c) are the human triage attribution events — exempt from
     the dispatch-shaped common-field set (see `_REQUIRED_TRIAGE_FIELDS` and
-    `_validate_payload`).
+    `_validate_payload`). `decompose` (bead .152, Decision 17) is the
+    decomposer band's LLM-invocation event — rig-level, no ticket (same
+    precedent as `report`/`ticket-filed`); it carries a hash-bearing
+    `prompt_artifact_hash` (SPEC §4) but is NOT a gate event (no
+    `decoding_params`).
     """
 
     DISPATCH = "dispatch"
@@ -105,11 +115,22 @@ class EventType(enum.Enum):
     UNAPPROVAL = "unapproval"
     TRIAGE_REJECTED = "triage-rejected"
     RESUME = "resume"
+    # Decompose-band LLM invocations (bead .152, Decision 17): the decomposer
+    # exec run and the decomposition validation critic. Rig-level, no ticket —
+    # the same justification precedent as REPORT and TICKET_FILED (reusing an
+    # existing member would be a recorded lie). It IS an LLM-invocation event
+    # (carries a hash-bearing prompt_artifact_hash, SPEC §4) but is NOT a gate
+    # event (no decoding_params).
+    DECOMPOSE = "decompose"
 
 
 # LLM-invocation events (SPEC §4 prompt-artifact invariant): must carry the
 # versioned prompt hash that produced them (code01/critic01/rangecrit01).
-_LLM_INVOCATION_TYPES = frozenset({EventType.DISPATCH, EventType.GATE, EventType.REPORT})
+# `decompose` (bead .152, Decision 17) joins DISPATCH/GATE/REPORT — the
+# decomposer band's LLM invocations need hash-bearing provenance.
+_LLM_INVOCATION_TYPES = frozenset(
+    {EventType.DISPATCH, EventType.GATE, EventType.REPORT, EventType.DECOMPOSE}
+)
 
 # SPEC.md §9 "Retry semantics" attempt_kind enumeration — the exhaustive set.
 # `report` (bead .42): a `range-report --critic` REPORT event is rig-level, not
@@ -127,6 +148,12 @@ _LLM_INVOCATION_TYPES = frozenset({EventType.DISPATCH, EventType.GATE, EventType
 # a dispatch-side infra-retry or a ladder-exhausted escalation — reusing an
 # existing attempt_kind would be a recorded lie in an audit log (same
 # precedent as `report` and `critic-infra` above).
+# `decompose` (bead .152, Decision 17): a decompose-band invocation (the
+# decomposer exec run or the decomposition validation critic) is rig-level,
+# not a ticket attempt; reusing `report` (or any ticket-adjacent value)
+# would be a recorded lie in an audit log (same precedent as `report` and
+# `critic-infra` above). SPEC §9's enumeration gains this member — a tracked
+# follow-up note for SB's next review.
 ATTEMPT_KINDS: frozenset[str] = frozenset(
     {
         "initial",
@@ -139,6 +166,7 @@ ATTEMPT_KINDS: frozenset[str] = frozenset(
         "report",
         "critic-infra",
         "spec-failure",
+        "decompose",
     }
 )
 
