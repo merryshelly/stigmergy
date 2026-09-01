@@ -20,6 +20,7 @@ match TOML key casing. Examples::
 
     SG_LOOP__BUDGETS__USD=10.0            -> loop.budgets.usd = 10.0
     SG_LOOP__TIMERS__POLL_SECONDS=30      -> loop.timers.poll_seconds = 30
+    SG_LOOP__GOVERNOR__RELAY_FEED=...     -> loop.governor.relay_feed = "..."
 
 Override values are parsed to match the *existing* (post file+defaults)
 value's type at that path (bool/int/float/str, checked in that order so
@@ -104,6 +105,19 @@ DEFAULT_CHARTER: dict[str, Any] = {
             "poll_seconds": 15,
             "dispatch_timeout_seconds": 3600,
             "lease_ttl_seconds": 4500,
+            # The park-escalation ceiling: a parked ticket may wait at most
+            # 8h (28800s) for a quota-governor release before the loop
+            # escalates it to the human floor. `_validate_timers` applies
+            # its usual positive-int rule to this key.
+            "park_escalation_seconds": 28800,
+        },
+        # The quota governor's feed location: the glob (relative to the
+        # rig's clones root) matching the relay JSONL logs the governor
+        # tails for its usage/quota captures. Relative only — the daemon
+        # wiring resolves it against `clones_root`; a literal path here
+        # would hard-code a per-rig location into the charter surface.
+        "governor": {
+            "relay_feed": "_relay_runtime/relay-*.jsonl",
         },
     },
 }
@@ -143,7 +157,9 @@ _KNOWN_LOOP_KEYS = {
     "cadences",
     "timers",
     "check_resources",
+    "governor",
 }
+_KNOWN_GOVERNOR_KEYS = {"relay_feed"}
 _KNOWN_CONCURRENCY_KEYS = {"workers"}
 _KNOWN_BUDGETS_KEYS = {"dispatches", "usd", "gate_calls"}
 _KNOWN_DISPATCH_LIMITS_KEYS = {
@@ -691,9 +707,37 @@ def _validate_loop(loop_cfg: Any) -> None:
     timers = loop_cfg.get("timers", {})
     _validate_timers(timers)
 
+    governor = loop_cfg.get("governor", {})
+    _validate_keys(governor, _KNOWN_GOVERNOR_KEYS, "loop.governor")
+    _validate_governor(governor)
+
     check_resources = loop_cfg.get("check_resources", {})
     _validate_keys(check_resources, _RESOURCE_KEYS, "loop.check_resources")
     _validate_check_resources(check_resources, "loop.check_resources")
+
+
+def _validate_governor(governor_cfg: dict[str, Any]) -> None:
+    """Validate the `[loop.governor]` VALUE checks (the key-set check is
+    ``_validate_keys`` in :func:`_validate_loop`).
+
+    ``relay_feed`` (when present) must be a non-empty, relative path or
+    glob string — the quota-governor feed location the daemon wiring
+    resolves against the rig's clones root. Absolute paths are rejected:
+    a per-rig location must never be hard-coded into the charter surface
+    (a literal path string for any relay JSONL location exists ONLY as a
+    configurable value, never in code)."""
+    feed = governor_cfg.get("relay_feed")
+    if feed is None:
+        return
+    if not isinstance(feed, str) or not feed:
+        raise CharterError(
+            f"loop.governor.relay_feed must be a non-empty relative path string (got {feed!r})"
+        )
+    if Path(feed).is_absolute():
+        raise CharterError(
+            f"loop.governor.relay_feed must be relative to the rig's clones root "
+            f"(got absolute path {feed!r})"
+        )
 
 
 def _validate_workers(concurrency_cfg: dict[str, Any]) -> None:

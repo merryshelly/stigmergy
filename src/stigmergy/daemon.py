@@ -173,9 +173,10 @@ from stigmergy.egress import EgressHandle
 from stigmergy.filing import harvest_worker_filings
 from stigmergy.intake import LeaseError
 from stigmergy.notify import NotificationStore, NtfyNotifier
+from stigmergy.quotagov import GovernorDecision, QuotaGovernor, decide, read_feed
 from stigmergy.records import EventType, RecordPlane, make_event
 from stigmergy.recover import ContainerReaper, RecoveryReport
-from stigmergy.registry import Registry
+from stigmergy.registry import PricingClass, Registry
 from stigmergy.relay import Capability, CapabilityStore, build_redactor, derive_relay_profile
 from stigmergy.relay_transport import RelayHandle
 from stigmergy.rig import RigStore
@@ -333,6 +334,7 @@ class Daemon:
         egress_teardown_fn: Callable[[EgressHandle], None] = egress.teardown,
         relay_setup_fn: Callable[..., RelayHandle] | None = None,
         relay_profile_cell: dict | None = None,
+        relay_feed_cell: dict | None = None,
         relay_teardown_fn: Callable[[RelayHandle], None] = _default_relay_teardown,
         secrets_for_capability: Callable[[Capability], frozenset[str]] | None = None,
         now_fn: Callable[[], float] = time.time,
@@ -384,6 +386,42 @@ class Daemon:
         # behaviour holds (existing stubs + the .25 wiring test keep
         # working untouched).
         self._relay_profile_cell: dict | None = relay_profile_cell
+        # The per-dispatch RELAY FEED side-channel (the "no hardcoded paths"
+        # wiring): the cli's `relay_setup_fn` closure records the exact relay
+        # JSONL log path it derives (the `relay-<dispatch_id>.jsonl` file it
+        # passes to `start_relay`) here keyed by the dispatch id, and
+        # `_setup_relay` reads it back AFTER the setup call — the daemon
+        # learns the feed location from the same place the relay writes it.
+        # Precedence for the stored result: the charter/env
+        # `loop.governor.relay_feed` key is the explicit override (charter
+        # validation keeps it relative; the daemon resolves it against the
+        # rig's clones root); otherwise the cell's learned path; otherwise
+        # the per-rig relay runtime dir derived from `rig_paths`. The stored
+        # `_relay_feed_path` is for LATER governor use only — no park
+        # decision and no governor call happen in this ticket. Default
+        # `None` -> every existing stub/test keeps today's behaviour.
+        self._relay_feed_cell: dict | None = relay_feed_cell
+        self._relay_feed_path: Path | None = None
+        # The quota governor's live state (quotagov module): the
+        # per-provider QuotaState map folded across polls from the relay
+        # JSONL feed, the byte offset last read from each feed file, and the
+        # park-episode escalation bookkeeping (one notification per park
+        # episode — keyed by the episode's park_until deadline). With no
+        # feed path resolvable, or a feed carrying no quota records, the
+        # governor stays empty and every new branch here is inert.
+        self._governor = QuotaGovernor()
+        self._feed_offsets: dict[str, int] = {}
+        # Park-episode bookkeeping: when each ticket's lane first became
+        # parked (episode start) and which episodes have already had their
+        # single escalation notification. One notification per park episode.
+        self._park_started_at: dict[str, float] = {}
+        self._park_escalation_notified: set[str] = set()
+        # The charter-configured park-escalation ceiling
+        # (loop.timers.park_escalation_seconds): the park wait beyond which
+        # a parked lane carries exactly-once escalation notification.
+        self._park_escalation_seconds = float(
+            charter.raw["loop"]["timers"]["park_escalation_seconds"]
+        )
         self._relay_teardown_fn = relay_teardown_fn
         self._secrets_for_capability = (
             secrets_for_capability
@@ -577,6 +615,22 @@ class Daemon:
         if not eligible_ids:
             return set(), set(), False
 
+        # Quota-governor claim filter (bead quotagov park): tickets whose
+        # SELECTED lane is subscription-priced AND whose provider shows
+        # quota-exhausted evidence in the governor state are skipped for
+        # this poll — quota exhaustion parks the lane, it never climbs the
+        # retry ladder and never trips the circuit breaker. The filter is
+        # keyed on the lane's pricing class: metered/local lanes can never
+        # be filtered (see _lane_governor_decision). With no feed path or
+        # no quota records the governor is empty and this is inert.
+        parked = self._governor_parked_decisions(eligible_ids, now=now)
+        self._record_park_escalations(parked, now=now)
+        if parked:
+            parked_ids = set(parked)
+            eligible_ids = [t for t in eligible_ids if t not in parked_ids]
+            if not eligible_ids:
+                return set(), set(), False
+
         dispatched: set[str] = set()
         statuses: set[str] = set()
         any_infra = False
@@ -655,6 +709,16 @@ class Daemon:
             )
             if not eligible_ids:
                 return None
+            # Same quota-governor claim filter as _dispatch_bounded_pool:
+            # subscription-priced lanes whose provider shows quota-exhausted
+            # evidence are skipped (metered/local lanes can never be).
+            parked = self._governor_parked_decisions(eligible_ids, now=now)
+            self._record_park_escalations(parked, now=now)
+            if parked:
+                parked_ids = set(parked)
+                eligible_ids = [t for t in eligible_ids if t not in parked_ids]
+                if not eligible_ids:
+                    return None
             ticket_id = eligible_ids[0]
         ticket_row = self._store.get_ticket(ticket_id)
         steering = self._steering_of(ticket_id)
@@ -803,7 +867,189 @@ class Daemon:
             )
             self._relay_profile_cell[dispatch_id] = profile
         runtime_dir = Path(self._rig_paths["clones_root"]) / "_relay_runtime"
-        return self._relay_setup_fn(dispatch_id, runtime_dir)
+        handle = self._relay_setup_fn(dispatch_id, runtime_dir)
+        # Read the feed path back AFTER the setup call: the closure records
+        # the exact log path it derived into the feed cell before `start_relay`
+        # runs, so by now the cell entry is authoritative.
+        self._relay_feed_path = self._resolve_relay_feed_path(dispatch_id, runtime_dir)
+        return handle
+
+    def _resolve_relay_feed_path(self, dispatch_id: str, runtime_dir: Path) -> Path:
+        """The resolved relay JSONL feed location, stored for later governor
+        use (no park decision, no governor call — this ticket is plumbing).
+
+        Precedence: the charter/env ``loop.governor.relay_feed`` key (the
+        explicit override; charter validation rejects absolute paths, so it
+        is resolved against the rig's clones root — a per-rig location is
+        never hard-coded here) first; otherwise the per-dispatch log path the
+        relay closure actually recorded in the feed side-channel cell (the
+        learned location — the daemon and the relay author can never
+        disagree about the file); and when neither is available (no cell
+        wired — every pre-existing stub), the per-rig relay runtime dir
+        derived from ``rig_paths`` with the relay's own
+        ``relay-<dispatch_id>.jsonl`` naming. (A daemon without a charter —
+        only possible in seam-level tests that build `Daemon.__new__` — is
+        treated as having no feed key and falls through to the cell /
+        per-rig fallback; production daemons always carry a charter.)"""
+        charter = getattr(self, "_charter", None)
+        governor_cfg = (((charter.raw.get("loop") or {}) if charter is not None
+                         else {}).get("governor") or {})
+        feed = governor_cfg.get("relay_feed")
+        if feed:
+            return Path(self._rig_paths["clones_root"]) / feed
+        learned = getattr(self, "_relay_feed_cell", None)
+        if learned is not None:
+            learned = learned.get(dispatch_id)
+        if learned is not None:
+            return Path(learned)
+        return runtime_dir / f"relay-{dispatch_id}.jsonl"
+
+    # -- quota governor (quotagov park integration) ------------------------------
+
+    def _governor_feed_paths(self) -> list[Path] | None:
+        """The feed-configured path(s) to consult this poll, or ``None``
+        when none is resolvable (the new branches stay inert).
+
+        Precedence is the prior ticket's: the charter/env
+        ``loop.governor.relay_feed`` key (relative to the rig's clones root;
+        a glob pattern is expanded against it — the shipped default
+        ``_relay_runtime/relay-*.jsonl`` matches the relay's per-dispatch
+        logs) wins; otherwise the feed path learned from the relay
+        side-channel during the last relay setup; otherwise ``None``."""
+        feed = self._charter.raw.get("loop", {}).get("governor", {}).get("relay_feed")
+        if feed:
+            root = Path(self._rig_paths["clones_root"])
+            if any(ch in feed for ch in "*?["):
+                return sorted(root.glob(feed))
+            return [root / feed]
+        if self._relay_feed_path is not None:
+            return [self._relay_feed_path]
+        return None
+
+    def _refresh_governor(self) -> None:
+        """Fold the new relay-feed lines into the persistent governor state.
+
+        Offset-based per feed file (only appended bytes are read, ever);
+        merging is latest-record-wins per provider. Never raises: the
+        reader's own total tolerance plus this loop's empty/``None`` guards
+        keep a quota-signal gap from ever blocking a dispatch."""
+        paths = self._governor_feed_paths()
+        if not paths:
+            return
+        for path in paths:
+            key = str(path)
+            governor, next_offset = read_feed(path, self._feed_offsets.get(key, 0))
+            self._feed_offsets[key] = next_offset
+            for provider, state in governor.providers.items():
+                prev = self._governor.providers.get(provider)
+                if prev is None:
+                    self._governor.providers[provider] = state
+                    continue
+                prev_updated = prev.updated_at if prev.updated_at is not None else float("-inf")
+                state_updated = state.updated_at if state.updated_at is not None else float("-inf")
+                if state_updated >= prev_updated:
+                    self._governor.providers[provider] = state
+
+    def _lane_governor_decision(self, lane: Any, *, now: float) -> GovernorDecision:
+        """The governor's decision for ONE dispatch's selected lane.
+
+        Keyed on the lane's PRICING CLASS: only a subscription-priced lane
+        can ever park; metered/local lanes return ``dispatch`` regardless of
+        any quota state (decide() enforces the same invariant, and the
+        explicit class check here keeps the filter visibly class-keyed).
+        """
+        entry = self._registry.resolve(lane.model)
+        if entry.pricing is not PricingClass.SUBSCRIPTION:
+            return GovernorDecision(decision="dispatch")
+        provider = entry.oa_provider_key or entry.provider
+        return decide(
+            entry,
+            self._governor.providers.get(provider),
+            now=now,
+            escalation_ceiling_s=self._park_escalation_seconds,
+        )
+
+    def _governor_parked_decisions(
+        self, ticket_ids: list[str], *, now: float
+    ) -> dict[str, GovernorDecision]:
+        """Which of ``ticket_ids`` are quota-parked this poll: the ticket's
+        SELECTED lane (same resolution the claim itself uses, current rung
+        included) is subscription-priced AND the governor shows quota-
+        exhausted evidence for its provider. A consult that cannot resolve
+        (registry miss, lane error) never filters — a signal gap must not
+        silently drop dispatchable work."""
+        self._refresh_governor()
+        if not self._governor.providers:
+            return {}
+        parked: dict[str, GovernorDecision] = {}
+        for ticket_id in ticket_ids:
+            try:
+                row = self._store.get_ticket(ticket_id)
+                lane = select_lane(self._charter, row, rung=row.get("current_rung"))
+                decision = self._lane_governor_decision(lane, now=now)
+            except Exception:  # noqa: BLE001 - a governor consult must never block a claim
+                continue
+            if decision.decision != "dispatch":
+                parked[ticket_id] = decision
+        return parked
+
+    def _record_park_escalations(
+        self, parked: dict[str, GovernorDecision], *, now: float
+    ) -> None:
+        """Exactly-once-per-park-episode escalation notification: when a
+        park has lasted longer than the charter-configured ceiling
+        (``loop.timers.park_escalation_seconds``), ONE ``park-escalation``
+        notification intent is recorded for that park episode — advancing
+        the clock further, or re-polling while the ticket stays parked,
+        never duplicates it. A NEW park episode (the lane was released and
+        parked again) starts a fresh episode and may notify again."""
+        for ticket_id, decision in parked.items():
+            episode_start = self._park_started_at.setdefault(ticket_id, now)
+            if now - episode_start <= self._park_escalation_seconds:
+                continue
+            if ticket_id in self._park_escalation_notified:
+                continue  # already notified once for this park episode
+            self._persist_park_escalation_notification(ticket_id, decision, now=now)
+            self._park_escalation_notified.add(ticket_id)
+        for ticket_id in [t for t in self._park_started_at if t not in parked]:
+            del self._park_started_at[ticket_id]
+            self._park_escalation_notified.discard(ticket_id)
+
+    def _persist_park_escalation_notification(
+        self, ticket_id: str, decision: GovernorDecision, *, now: float
+    ) -> None:
+        """The quota-park counterpart to `_persist_escalation_notification`:
+        the ticket's lane stays PARKED (never escalated on the ladder), but
+        the human floor is notified once per park episode that the wait has
+        crossed `loop.timers.park_escalation_seconds`."""
+        self._notification_store.record_intent(
+            ticket=ticket_id,
+            kind="park-escalation",
+            title=f"ticket {ticket_id} quota-parked past the escalation ceiling",
+            message=(
+                f"subscription quota exhaustion parked the lane for longer than "
+                f"loop.timers.park_escalation_seconds ({int(self._park_escalation_seconds)}s); "
+                f"park_until={decision.park_until}"
+            ),
+            now=now,
+        )
+
+    def _dispatch_quota_parked(self, plan: DispatchPlan) -> bool:
+        """True iff this dispatch's selected lane is subscription-priced AND
+        the governor's CURRENT state shows quota-exhausted evidence for its
+        provider (the `limited` flag or an upstream 429 record — a relay
+        capability-deny marker is structurally never evidence). The feed is
+        re-read first so evidence that landed between the claim-time
+        snapshot and this outcome is still honored. Non-subscription lanes
+        can never satisfy this, regardless of quota state."""
+        self._refresh_governor()
+        if not self._governor.providers:
+            return False
+        try:
+            decision = self._lane_governor_decision(plan.lane, now=self._now_fn())
+        except Exception:  # noqa: BLE001 - a governor consult must never change a failure path
+            return False
+        return decision.decision != "dispatch"
 
     def _driver_for(self, lane: Any) -> Callable[..., DispatchResult]:
         """bead .149: the spawn callable for ``lane.driver``. With a
@@ -969,6 +1215,24 @@ class Daemon:
         status = result.status
 
         if status is DispatchStatus.INFRA:
+            # Quota-governor park branch: an INFRA result on a lane whose
+            # governor state shows subscription quota EXHAUSTION (the
+            # provider's `limited` flag or an upstream 429 capture — never
+            # a relay capability-deny marker, which sets neither) parks the
+            # lane instead of climbing the ladder or tripping the breaker:
+            # the IN_FLIGHT->POOL transition happens exactly as the INFRA
+            # fast path below (same transition, no lease/attempt bookkeeping
+            # beyond it), but the recorded disposition is the distinct park
+            # value and the infra-trip counter is NOT bumped.
+            if self._dispatch_quota_parked(plan):
+                transition(self._store, ticket_id, POOL, expected_from=IN_FLIGHT)
+                record_disposition(
+                    self._record_plane,
+                    ctx=ctx,
+                    disposition="quota-parked",
+                    attempt_kind="infra-retry",
+                )
+                return False
             # §1.1 INFRA fast path — see module docstring deviation 1: we
             # never call decide_retry/apply_decision here (would raise
             # IllegalTransition on POOL->POOL); attempt_kind is already the

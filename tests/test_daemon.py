@@ -18,8 +18,10 @@ Case numbering below matches the bead .22 build spec's frozen case list
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -462,6 +464,7 @@ def add_dispatchable_ticket(
     current_rung: str | None = None,
     integration_failures: int = 0,
     tier1_checks: list[str] | None = None,
+    lane_hint: str | None = None,
 ) -> None:
     """Add + approve a ticket eligible for claim+dispatch (the dispatch-side
     tests, cases 1-10, 14-19)."""
@@ -475,7 +478,7 @@ def add_dispatchable_ticket(
         target_scope=["src/foo.py"],
         acceptance_criteria=["foo() returns 42"],
         tier1_checks=tier1_checks if tier1_checks is not None else [],
-        lane_hint=None,
+        lane_hint=lane_hint,
         attempts_used=attempts_used,
         current_rung=current_rung,
         integration_failures=integration_failures,
@@ -619,6 +622,7 @@ def make_daemon(
     now_fn: Any = None,
     min_disk_bytes: int = 0,
     relay_setup_fn: Any = None,
+    relay_feed_cell: Any = None,
     relay_teardown_fn: Any = None,
     egress_setup_fn: Any = None,
     egress_teardown_fn: Any = None,
@@ -636,6 +640,8 @@ def make_daemon(
     extra: dict[str, Any] = {}
     if relay_setup_fn is not None:
         extra["relay_setup_fn"] = relay_setup_fn
+    if relay_feed_cell is not None:
+        extra["relay_feed_cell"] = relay_feed_cell
     if relay_teardown_fn is not None:
         extra["relay_teardown_fn"] = relay_teardown_fn
     if egress_setup_fn is not None:
@@ -1647,6 +1653,94 @@ def test_relay_egress_dispatch_id_consistent_across_logs(env: Env) -> None:
     assert egress_setup.calls[0][0] == real_dispatch_id
 
 
+def test_relay_no_cell_no_charter_key_falls_back_to_rig_runtime_dir(
+    env: Env,
+) -> None:
+    """No feed cell wired, no `loop.governor.relay_feed` key -> the daemon
+    falls back to the per-rig relay runtime dir derived from `rig_paths`,
+    using the relay's own `relay-<dispatch_id>.jsonl` naming. No hardcoded
+    absolute path is involved. The in-code default `loop.governor.relay_feed`
+    key is removed first: the fallback is only reached when the charter/env
+    feed key is ABSENT."""
+    del env.charter.raw["loop"]["governor"]["relay_feed"]
+    add_dispatchable_ticket(env, "t-feed-fallback")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+    relay_setup = FakeSetup("relay")
+    daemon = make_daemon(env, spawn_fn=spawn, relay_setup_fn=relay_setup)
+
+    daemon.poll_once()
+
+    real_dispatch_id = dispatch_events(env)[0]["dispatch_id"]
+    runtime_dir = Path(env.rig_paths["clones_root"]) / "_relay_runtime"
+    assert daemon._relay_feed_path == runtime_dir / f"relay-{real_dispatch_id}.jsonl"
+
+
+def test_relay_cell_provides_learned_feed_path(
+    env: Env,
+) -> None:
+    """When a feed cell IS wired and the setup closure records a learned log
+    path, the daemon stores THAT exact path (learned location — the daemon
+    and relay author agree on the file). The learned path wins over the
+    fallback, and is stored for later governor use (no park decision, no
+    governor call — this ticket is plumbing only). The charter/env feed key
+    is absent here (the in-code default is removed) so the learned cell path
+    is what wins."""
+    del env.charter.raw["loop"]["governor"]["relay_feed"]
+    add_dispatchable_ticket(env, "t-feed-learned")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+
+    feed_cell: dict[str, Path] = {}
+
+    def relay_setup_fn(pid, runtime_dir):
+        # The closure records the exact log path it derives, before starting.
+        feed_cell[pid] = Path(runtime_dir) / f"relay-{pid}.jsonl"
+        return FakeHandle(Path(runtime_dir) / f"{pid}.sock")
+
+    daemon = make_daemon(
+        env, spawn_fn=spawn, relay_setup_fn=relay_setup_fn, relay_feed_cell=feed_cell
+    )
+
+    daemon.poll_once()
+
+    real_dispatch_id = dispatch_events(env)[0]["dispatch_id"]
+    runtime_dir = Path(env.rig_paths["clones_root"]) / "_relay_runtime"
+    assert feed_cell[real_dispatch_id] == runtime_dir / f"relay-{real_dispatch_id}.jsonl"
+    # The daemon stored the learned (cell-provided) path, not the fallback.
+    assert daemon._relay_feed_path == runtime_dir / f"relay-{real_dispatch_id}.jsonl"
+
+
+def test_relay_charter_relay_feed_key_overrides_cell(
+    env: Env,
+) -> None:
+    """The charter/env `loop.governor.relay_feed` key is the explicit
+    override: when present (a relative path, resolved against the rig's
+    clones root) it wins over the learned cell path. The daemon stores the
+    resolved location for later governor use."""
+    add_dispatchable_ticket(env, "t-feed-charter")
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE)])
+
+    # A custom, relative feed location distinct from the fallback naming.
+    env.charter.raw["loop"]["governor"]["relay_feed"] = "custom_feeds/relay-*.jsonl"
+
+    feed_cell: dict[str, Path] = {}
+
+    def relay_setup_fn(pid, runtime_dir):
+        feed_cell[pid] = Path(runtime_dir) / f"relay-{pid}.jsonl"
+        return FakeHandle(Path(runtime_dir) / f"{pid}.sock")
+
+    daemon = make_daemon(
+        env, spawn_fn=spawn, relay_setup_fn=relay_setup_fn, relay_feed_cell=feed_cell
+    )
+
+    daemon.poll_once()
+
+    # The charter key (resolved against clones_root) wins over the learned cell.
+    assert (
+        daemon._relay_feed_path
+        == Path(env.rig_paths["clones_root"]) / "custom_feeds/relay-*.jsonl"
+    )
+
+
 # ==========================================================================
 # case 17: transcript sealed with the capability token redacted
 # (prove-can-fail priority)
@@ -2321,3 +2415,400 @@ def test_poll_no_registry_exec_lane_still_uses_default_spawn_fn(exec_env: Env) -
 
     assert len(default_spawn.calls) == 1
     assert exec_env.store.get_ticket("t-legacy")["state"] == PARKED
+
+
+# ==========================================================================
+# quota governor park integration (subscription quota exhaustion parks the
+# lane; capability denies never park; other lanes untouched)
+# ==========================================================================
+
+# The registry fixture's subscription entry routes to the "anthropic" OA
+# provider key (registry convention: non-Anthropic overrides aside, an
+# Anthropic provider entry defaults oa_provider_key="anthropic").
+SUB_PROVIDER = "anthropic"
+SUB_MODEL = "claude-max-sub"
+SUB_LANE_LABEL = "sub-ok"
+
+
+class ManualClock:
+    """A deterministic clock the test moves explicitly between polls."""
+
+    def __init__(self, start: float = 1_000_000.0):
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def add_subscription_lane(env: Env) -> None:
+    """Add a subscription-priced entry lane to the loaded charter raw."""
+    env.charter.raw["lanes"]["sub"] = {
+        "selector": {"label": SUB_LANE_LABEL},
+        "driver": "claude-code",
+        "model": SUB_MODEL,
+        "prompt": "code01",
+        "egress": ["inference", "registries"],
+    }
+
+
+def configure_feed(env: Env) -> Path:
+    """Point `loop.governor.relay_feed` at an exact relative feed file under
+    the clones root and return its absolute path."""
+    env.charter.raw["loop"]["governor"]["relay_feed"] = "feeds/relay.jsonl"
+    return env.clones_root / "feeds" / "relay.jsonl"
+
+
+def append_feed_line(env: Env, feed_path: Path, record: dict[str, Any]) -> None:
+    feed_path.parent.mkdir(parents=True, exist_ok=True)
+    with feed_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat()
+
+
+def limited_quota_record(ts: float, next_tick_at: float, provider: str = SUB_PROVIDER) -> dict:
+    """A relay feed record carrying upstream quota-exhaustion evidence: the
+    synthetic-quotas header with `limited: true`."""
+    return {
+        "provider": provider,
+        "ts": ts,
+        "synthetic_quotas": json.dumps(
+            {
+                "rollingFiveHourLimit": {
+                    "remaining": 0,
+                    "max": 100,
+                    "limited": True,
+                    "nextTickAt": iso(next_tick_at),
+                }
+            }
+        ),
+    }
+
+
+def relay_deny_record(ts: float, provider: str = SUB_PROVIDER) -> dict:
+    """A relay capability-deny record (bead .147 §1E marker): status 429 but
+    POLICY, never upstream quota evidence."""
+    return {
+        "provider": provider,
+        "ts": ts,
+        "status": 429,
+        "x-stigmergy-deny-reason": "quota-calls",
+    }
+
+
+def park_intents(env: Env, ticket_id: str | None = None) -> list:
+    intents = [i for i in env.notification_store.all_intents() if i.kind == "park-escalation"]
+    if ticket_id is not None:
+        intents = [i for i in intents if i.ticket == ticket_id]
+    return intents
+
+
+def test_governor_no_feed_no_records_is_inert_subscription_lane_dispatches(env: Env) -> None:
+    """AC (inertness): with the shipped default feed glob matching no files
+    (no relay logs yet, no quota records), the governor is empty and every
+    new branch is inert — a subscription-priced ticket dispatches exactly
+    as before the governor existed."""
+    add_subscription_lane(env)
+    add_dispatchable_ticket(env, "t-sub-inert", lane_hint=SUB_LANE_LABEL)
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle")])
+    daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
+        [pass_result("lint"), pass_result("pytest")]
+    ))
+
+    summary = daemon.poll_once()
+
+    assert summary.dispatched_tickets == {"t-sub-inert"}
+    assert summary.should_halt is False
+    assert summary.consecutive_infra_trips == 0
+    assert env.store.get_ticket("t-sub-inert")["state"] == PARKED
+    assert park_intents(env) == []
+
+
+def test_governor_deny_only_feed_never_parks(env: Env) -> None:
+    """A feed carrying ONLY a relay capability-deny record (the bead .147
+    marker) is policy evidence, never quota-exhaustion evidence: the
+    subscription lane still dispatches normally."""
+    add_subscription_lane(env)
+    feed = configure_feed(env)
+    append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
+    add_dispatchable_ticket(env, "t-sub-deny", lane_hint=SUB_LANE_LABEL)
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle")])
+    daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
+        [pass_result("lint"), pass_result("pytest")]
+    ))
+
+    summary = daemon.poll_once()
+
+    assert summary.dispatched_tickets == {"t-sub-deny"}
+    assert env.store.get_ticket("t-sub-deny")["state"] == PARKED
+    assert park_intents(env) == []
+
+
+def test_governor_parks_subscription_lane_at_claim_other_lanes_dispatch(env: Env) -> None:
+    """AC (claim filter): with upstream quota-exhaustion evidence for the
+    subscription provider in the feed, the subscription-priced ticket is
+    skipped for the poll (never claimed, no dispatch, no disposition) while
+    a metered-lane ticket on the SAME provider dispatches normally — the
+    filter is keyed on the lane's pricing class."""
+    add_subscription_lane(env)
+    feed = configure_feed(env)
+    append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
+    add_dispatchable_ticket(env, "t-sub-park", lane_hint=SUB_LANE_LABEL)
+    add_dispatchable_ticket(env, "t-metered")  # default lane -> sonnet (metered)
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/m.bundle")])
+    daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
+        [pass_result("lint"), pass_result("pytest")]
+    ))
+
+    summary = daemon.poll_once()
+
+    # The metered ticket dispatched; the subscription ticket was skipped.
+    assert summary.dispatched_tickets == {"t-metered"}
+    assert len(spawn.calls) == 1
+    assert env.store.get_ticket("t-metered")["state"] == PARKED
+    assert env.store.get_ticket("t-sub-park")["state"] == POOL
+    assert [e for e in disposition_events(env, "t-sub-park")] == []
+    assert summary.should_halt is False
+    assert summary.consecutive_infra_trips == 0
+    # Parked under the ceiling: no escalation intent yet.
+    assert park_intents(env, "t-sub-park") == []
+
+
+def test_governor_infra_outcome_on_exhausted_subscription_lane_parks_never_trips(
+    env: Env,
+) -> None:
+    """AC (park branch): an INFRA result on a subscription lane whose
+    governor state (re-read at outcome time) shows quota exhaustion takes
+    the park branch — same IN_FLIGHT->POOL transition and lease handling as
+    the INFRA fast path, but the disposition is the distinct park value and
+    the infra-trip counter is never bumped."""
+    add_subscription_lane(env)
+    feed = configure_feed(env)
+    add_dispatchable_ticket(env, "t-sub-infra", lane_hint=SUB_LANE_LABEL)
+
+    def evidence_then_infra(task_pack, work_clone, model_cfg, capability, budgets):
+        # The upstream 429/limited evidence lands mid-poll, after the
+        # claim-time snapshot: the outcome handler must still honor it.
+        append_feed_line(
+            env, feed, limited_quota_record(ts=clock.t, next_tick_at=clock.t + 7200.0)
+        )
+        return make_result(DispatchStatus.INFRA, usage=zero_tokens(), detail="upstream 429")
+
+    clock = ManualClock()
+    daemon = make_daemon(env, spawn_fn=evidence_then_infra, now_fn=clock)
+
+    summary = daemon.poll_once()
+
+    assert summary.dispatched_tickets == {"t-sub-infra"}
+    dispositions = disposition_events(env, "t-sub-infra")
+    assert [d["disposition"] for d in dispositions] == ["quota-parked"]
+    assert env.store.get_ticket("t-sub-infra")["state"] == POOL
+    assert env.store.get_ticket("t-sub-infra")["attempts_used"] == 0
+    assert summary.consecutive_infra_trips == 0
+    assert summary.should_halt is False
+
+
+def test_governor_relay_deny_keeps_old_infra_fast_path(env: Env) -> None:
+    """An INFRA result correlated only with a relay capability-deny marker
+    (not upstream quota evidence) keeps the OLD INFRA disposition
+    ("infra-retry") and still bumps the trip counter — deny records never
+    enter the park branch."""
+    add_subscription_lane(env)
+    feed = configure_feed(env)
+    append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
+    add_dispatchable_ticket(env, "t-sub-deny-infra", lane_hint=SUB_LANE_LABEL)
+    spawn = AlwaysInfraSpawn()
+    daemon = make_daemon(env, spawn_fn=spawn)
+
+    summary = daemon.poll_once()
+
+    assert [d["disposition"] for d in disposition_events(env, "t-sub-deny-infra")] == [
+        "infra-retry"
+    ]
+    assert summary.consecutive_infra_trips == 1
+    assert env.store.get_ticket("t-sub-deny-infra")["state"] == POOL
+
+
+def test_governor_failed_result_with_deny_keeps_failed_handling(env: Env) -> None:
+    """A FAILED result on a subscription lane with only deny evidence in the
+    feed keeps the existing FAILED/retry-ladder handling untouched — the
+    ticket re-enters the pool via pool-reentry, never the park branch."""
+    add_subscription_lane(env)
+    feed = configure_feed(env)
+    append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
+    add_dispatchable_ticket(env, "t-sub-deny-fail", lane_hint=SUB_LANE_LABEL)
+    spawn = ScriptedSpawn([make_result(DispatchStatus.FAILED)])
+    daemon = make_daemon(env, spawn_fn=spawn)
+
+    daemon.poll_once()
+
+    assert [d["disposition"] for d in disposition_events(env, "t-sub-deny-fail")] == [
+        "pool-reentry"
+    ]
+    assert env.store.get_ticket("t-sub-deny-fail")["state"] == POOL
+    assert env.store.get_ticket("t-sub-deny-fail")["attempts_used"] == 1
+    assert park_intents(env, "t-sub-deny-fail") == []
+
+
+def test_governor_park_escalation_exactly_once_per_episode(env: Env) -> None:
+    """AC (escalation notification): a park crossing the charter-configured
+    escalation ceiling records exactly ONE new notification intent (kind
+    'park-escalation', distinct from halt/escalation) per park episode;
+    advancing the clock past the ceiling produces it once, repeated polls
+    never duplicate it while the ticket stays parked, and a NEW episode
+    (release + re-park) may notify once more."""
+    add_subscription_lane(env)
+    env.charter.raw["loop"]["timers"]["park_escalation_seconds"] = 600
+    feed = configure_feed(env)
+    append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
+    add_dispatchable_ticket(env, "t-sub-esc", lane_hint=SUB_LANE_LABEL)
+    clock = ManualClock()
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/esc.bundle")])
+    daemon = make_daemon(env, spawn_fn=spawn, now_fn=clock)
+
+    # Poll 1: parked; episode starts now (t=1_000_000); under the ceiling.
+    daemon.poll_once()
+    assert park_intents(env, "t-sub-esc") == []
+
+    # Advance past the ceiling (600s) and poll: exactly one intent.
+    clock.advance(700)
+    daemon.poll_once()
+    assert len(park_intents(env, "t-sub-esc")) == 1
+    assert park_intents(env, "t-sub-esc")[0].kind == "park-escalation"
+
+    # Repeated polls while still parked: no duplicates.
+    clock.advance(500)
+    daemon.poll_once()
+    clock.advance(5000)
+    daemon.poll_once()
+    assert len(park_intents(env, "t-sub-esc")) == 1
+
+    # The quota clears (limited=false at a later ts): the lane releases.
+    append_feed_line(
+        env,
+        feed,
+        {
+            "provider": SUB_PROVIDER,
+            "ts": clock.t,
+            "synthetic_quotas": json.dumps(
+                {
+                    "rollingFiveHourLimit": {
+                        "remaining": 50,
+                        "max": 100,
+                        "limited": False,
+                        "nextTickAt": iso(clock.t + 3600.0),
+                    }
+                }
+            ),
+        },
+    )
+    clock.advance(1)
+    daemon.poll_once()
+    # The lane released: the ticket is dispatched again (DONE + green checks
+    # -> PARKED); put it back in the pool (lease expired) for the re-park
+    # half of the test.
+    assert spawn.calls  # the release poll dispatched the ticket
+    clock.advance(5000)  # past the release dispatch's lease TTL
+    env.store.update_ticket("t-sub-esc", state=POOL, lease_expires_at=None)
+    assert len(park_intents(env, "t-sub-esc")) == 1  # released: no NEW intent
+
+    # Quota exhausts again: a NEW park episode, which may notify once more
+    # once IT crosses the ceiling.
+    append_feed_line(
+        env, feed, limited_quota_record(ts=clock.t, next_tick_at=clock.t + 3600.0)
+    )
+    clock.advance(1)
+    daemon.poll_once()
+    assert len(park_intents(env, "t-sub-esc")) == 1  # new episode, still under ceiling
+    clock.advance(700)
+    daemon.poll_once()
+    assert len(park_intents(env, "t-sub-esc")) == 2  # one per episode, never duplicated
+
+
+def test_governor_exhaustion_across_many_polls_never_halts_and_other_lane_dispatches(
+    env: Env,
+) -> None:
+    """AC (daemon-integration, the spec's core behavior): repeated
+    quota-exhaustion evidence on a subscription lane across more than
+    _CIRCUIT_BREAKER_THRESHOLD (5) polls never trips the breaker —
+    should_halt stays False and the consecutive-infra-trip count stays 0 —
+    while a ticket on a non-parked (metered) lane is still dispatched in
+    those same polls."""
+    add_subscription_lane(env)
+    env.charter.raw["loop"]["retries"]["attempts_per_rung"] = 20
+    feed = configure_feed(env)
+    append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
+    add_dispatchable_ticket(env, "t-sub-storm", lane_hint=SUB_LANE_LABEL)
+    add_dispatchable_ticket(env, "t-metered-storm")  # default lane -> sonnet (metered)
+    spawn = ScriptedSpawn(
+        [make_result(DispatchStatus.DONE) for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 2)]
+    )
+    daemon = make_daemon(
+        env,
+        spawn_fn=spawn,
+        run_checks_fn=ScriptedChecks([fail_result("lint")]),  # keeps the metered ticket in POOL
+    )
+
+    for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 2):
+        summary = daemon.poll_once()
+        assert summary.should_halt is False
+        assert summary.consecutive_infra_trips == 0
+        # The parked-lane ticket is skipped every poll; the metered-lane
+        # ticket is dispatched in those same polls.
+        assert "t-sub-storm" not in summary.dispatched_tickets
+        assert "t-metered-storm" in summary.dispatched_tickets
+
+    assert len(spawn.calls) == _CIRCUIT_BREAKER_THRESHOLD + 2
+    assert daemon._consecutive_infra_trips == 0
+    assert env.store.get_ticket("t-sub-storm")["state"] == POOL
+    assert env.store.get_ticket("t-sub-storm")["attempts_used"] == 0
+    # No quota-park escalation fired (the park never crossed the ceiling)
+    # and no halt/escalation intents either.
+    assert park_intents(env, "t-sub-storm") == []
+    assert [i.kind for i in env.notification_store.all_intents()] == []
+
+
+def test_governor_learned_feed_cell_path_used_when_charter_key_absent(env: Env) -> None:
+    """With no charter feed key, the governor consults the feed path learned
+    from the relay side-channel cell (the prior ticket's precedence): a
+    learned feed carrying exhaustion evidence parks the subscription lane."""
+    del env.charter.raw["loop"]["governor"]["relay_feed"]
+    add_subscription_lane(env)
+    feed_cell: dict[str, Path] = {}
+
+    def relay_setup_fn(pid, runtime_dir):
+        feed_cell[pid] = Path(runtime_dir) / f"relay-{pid}.jsonl"
+        return FakeHandle(Path(runtime_dir) / f"{pid}.sock")
+
+    add_dispatchable_ticket(env, "t-sub-cell", lane_hint=SUB_LANE_LABEL)
+    spawn = ScriptedSpawn([])  # never called: the learned evidence parks the lane
+    daemon = make_daemon(
+        env, spawn_fn=spawn, relay_setup_fn=relay_setup_fn, relay_feed_cell=feed_cell
+    )
+
+    # Poll 1: no feed yet — the ticket dispatches normally, and the relay
+    # setup call teaches the daemon the feed location.
+    spawn._results = [make_result(DispatchStatus.DONE, bundle_ref="/tmp/cell.bundle")]
+    daemon.poll_once()
+    learned_dispatch_id = dispatch_events(env)[0]["dispatch_id"]
+    assert daemon._relay_feed_path == feed_cell[learned_dispatch_id]
+    assert env.store.get_ticket("t-sub-cell")["state"] == PARKED
+
+    # The learned feed then reports exhaustion: the ticket is parked at the
+    # claim filter (the ticket is back at POOL, lease cleared — eligible but
+    # skipped by the governor).
+    env.store.update_ticket("t-sub-cell", state=POOL, lease_expires_at=None)
+    append_feed_line(
+        env,
+        daemon._relay_feed_path,
+        limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0),
+    )
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == frozenset()
+    assert env.store.get_ticket("t-sub-cell")["state"] == POOL
+    assert len(spawn.calls) == 1

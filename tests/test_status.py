@@ -21,12 +21,21 @@ from typing import Any
 import pytest
 
 from stigmergy.notify import NotificationStore
+from stigmergy.quotagov import (
+    QuotaGovernor,
+    QuotaState,
+    RollingWindow,
+    decide,
+)
 from stigmergy.records import EventType, RecordPlane, make_event
+from stigmergy.registry import ModelEntry, PricingClass, Registry
 from stigmergy.rig import RigStore
 from stigmergy.statemachine import STATES
 from stigmergy.status import (
+    gather_lane_parks,
     gather_status,
     reconstruct_spend,
+    render_status,
     render_ticket_detail,
     render_ticket_list,
 )
@@ -573,3 +582,337 @@ def test_render_daemon_liveness_dead_process(tmp_path: Path) -> None:
     result = render_daemon_liveness(rig_root)
     assert "DAEMON EXITED" in result
     assert str(fake_pid) in result
+
+
+# --- governor park state per lane (quotagov park integration) ---------------
+#
+# The park-half of the spend/leash status reporting: `Status.lane_parks`
+# carries one entry per charter lane sourced from the quota governor's
+# state (the same `quotagov.decide` API the daemon parks claims on).
+#
+# CHARTER_RESOLVED has no [lanes] table (its AC12 cases predate lane
+# governance), so the park-state cases below use a lane-bearing charter of
+# their own.
+
+LANE_CHARTER: dict[str, Any] = {
+    "loop": {"budgets": {"dispatches": 50, "usd": 25.0, "gate_calls": 30}},
+    "lanes": {
+        "default": {"driver": "claude-code", "model": "metered-m"},
+        "sub": {"driver": "openalph-exec", "model": "sub-m"},
+    },
+}
+
+
+def _lane_registry() -> Registry:
+    """A registry with one metered and one subscription model.
+
+    The subscription entry deliberately sets NO ``oa_provider_key`` so the
+    status path's ``oa_provider_key or provider`` fallback (mirroring the
+    daemon's lane-governor lookup) is what actually keys the governor
+    state — a provider-key shortcut would silently miss the park."""
+    return Registry(
+        entries={
+            "metered-m": ModelEntry(
+                name="metered-m",
+                provider="p",
+                family="f",
+                version="1",
+                pricing=PricingClass.METERED,
+                input_usd_per_mtok=1.0,
+                output_usd_per_mtok=2.0,
+            ),
+            "sub-m": ModelEntry(
+                name="sub-m",
+                provider="prov-sub",
+                family="f",
+                version="1",
+                pricing=PricingClass.SUBSCRIPTION,
+                marginal_usd=0.0,
+            ),
+        },
+        version_hash="lane-reg-hash",
+    )
+
+
+def _governor_parking_provider(*, next_tick_at: str, limited: bool = True) -> QuotaGovernor:
+    """A governor whose folded state shows quota-exhausted evidence
+    (``limited`` + an upstream 429) for ``"prov-sub"`` only."""
+    governor = QuotaGovernor()
+    governor.providers["prov-sub"] = QuotaState(
+        provider="prov-sub",
+        rolling=RollingWindow(remaining=0.0, max=100.0, limited=limited, next_tick_at=next_tick_at),
+        limited=limited,
+        next_tick_at=next_tick_at,
+        last_429_at=100.0,
+        updated_at=200.0,
+    )
+    return governor
+
+
+def test_lane_parks_parked_lane_renders_until_timestamp(
+    store: RigStore, plane: RecordPlane, notification_store: NotificationStore
+) -> None:
+    """A parked subscription lane renders parked=yes with its until
+    timestamp; the metered lane is explicitly not-parked and a provider
+    with no quota state stays not-parked."""
+    now = 1_000_000.0
+    tick = 1_003_600.0  # +1h from now -> below the 8h escalation ceiling
+    governor = _governor_parking_provider(next_tick_at=_iso_utc(tick))
+
+    status = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+        registry=_lane_registry(),
+        governor=governor,
+    )
+
+    assert set(status.lane_parks) == {"default", "sub"}
+    assert status.lane_parks["sub"] == {
+        "parked": True,
+        "parked_until": tick,
+        "escalation_fired": False,
+    }
+    # The metered lane can never park, regardless of quota state.
+    assert status.lane_parks["default"] == {
+        "parked": False,
+        "parked_until": None,
+        "escalation_fired": False,
+    }
+
+    text = render_status(status)
+    assert "sub: parked=yes  parked_until=1003600  escalation_fired=no" in text
+    assert "default: parked=no  parked_until=-  escalation_fired=no" in text
+
+
+def test_lane_parks_escalated_park_renders_escalation_fired(
+    store: RigStore, plane: RecordPlane, notification_store: NotificationStore
+) -> None:
+    """A park whose wait exceeds the escalation ceiling renders the
+    escalation-fired marker; the park itself (and its until-timestamp) is
+    unchanged — escalation never clears the park."""
+    now = 1_000_000.0
+    tick = now + 9 * 3600.0  # 9h wait > 8h default ceiling
+    governor = _governor_parking_provider(next_tick_at=_iso_utc(tick))
+
+    status = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+        registry=_lane_registry(),
+        governor=governor,
+    )
+
+    assert status.lane_parks["sub"] == {
+        "parked": True,
+        "parked_until": tick,
+        "escalation_fired": True,
+    }
+
+    text = render_status(status)
+    assert f"sub: parked=yes  parked_until={tick:.0f}  escalation_fired=yes" in text
+
+
+def _iso_utc(epoch_s: float) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(epoch_s, tz=UTC).isoformat()
+
+
+def test_lane_parks_no_feed_configured_all_lanes_not_parked(
+    store: RigStore, plane: RecordPlane, notification_store: NotificationStore
+) -> None:
+    """No ``governor`` argument (no feed configured) OR a governor with no
+    folded state (no quota evidence) -> every lane is explicitly
+    not-parked/None/not-escalated, never a missing key; the metered lane
+    never parks even with a fully exhausted governor."""
+    now = 1_000_000.0
+
+    status_no_governor = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+    )
+    expected_empty = {
+        name: {"parked": False, "parked_until": None, "escalation_fired": False}
+        for name in ("default", "sub")
+    }
+    assert status_no_governor.lane_parks == expected_empty
+
+    status_empty_governor = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+        registry=_lane_registry(),
+        governor=QuotaGovernor(),  # fresh: no feed lines folded
+    )
+    assert status_empty_governor.lane_parks == expected_empty
+
+    # A governor that only has quota state for ANOTHER provider also parks
+    # nothing (no evidence for this lane's provider).
+    other = QuotaGovernor()
+    other.providers["other-prov"] = QuotaState(
+        provider="other-prov", limited=True, last_429_at=1.0, updated_at=2.0
+    )
+    status_other = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+        registry=_lane_registry(),
+        governor=other,
+    )
+    assert status_other.lane_parks == expected_empty
+
+    # A registry miss (the metered lane's model absent) is not-parked for
+    # that lane, never an error — and the miss must not suppress the park
+    # of the OTHER lane, whose model still resolves.
+    miss_registry = Registry(
+        entries={
+            "sub-m": ModelEntry(
+                name="sub-m",
+                provider="prov-sub",
+                family="f",
+                version="1",
+                pricing=PricingClass.SUBSCRIPTION,
+                marginal_usd=0.0,
+            ),
+        },
+        version_hash="h",
+    )
+    governor = _governor_parking_provider(next_tick_at=_iso_utc(now + 3600))
+    status_miss = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=LANE_CHARTER,
+        disk_path=str(store.db_path.parent),
+        now=now,
+        registry=miss_registry,
+        governor=governor,
+    )
+    # The metered lane's model is missing from the registry -> not-parked
+    # (explicit), but the sub lane's park still shows through the miss.
+    assert status_miss.lane_parks["default"] == {
+        "parked": False,
+        "parked_until": None,
+        "escalation_fired": False,
+    }
+    assert status_miss.lane_parks["sub"] == {
+        "parked": True,
+        "parked_until": now + 3600,
+        "escalation_fired": False,
+    }
+
+    text = render_status(status_no_governor)
+    assert "default: parked=no  parked_until=-  escalation_fired=no" in text
+    assert "sub: parked=no  parked_until=-  escalation_fired=no" in text
+
+
+def test_lane_parks_absent_leaves_preexisting_status_fields_unchanged(
+    store: RigStore, plane: RecordPlane, notification_store: NotificationStore
+) -> None:
+    """A rig with no quota evidence renders every pre-existing AC12 field
+    exactly as before the park-state addition: same state counts, spend
+    totals, heartbeat/queue/escalation/disk fields, and the old render
+    lines all present in the same order (the new === quota parks === block
+    slots between spend and health)."""
+    now = time.time()
+
+    add_ticket(store, "t-pool", state="pool")
+    add_ticket(store, "t-parked", state="parked")
+    plane.append(make_dispatch_event(dispatch_id="dispatch-0001"))
+    plane.append(make_gate_event(dispatch_id="dispatch-0001"))
+    store.set_meta("daemon_heartbeat_at", str(now - 5))
+    notification_store.record_intent(
+        ticket="t-parked", kind="escalation", title="e", message="m", now=now
+    )
+
+    # Same rig, no quota inputs at all (the standalone status run shape).
+    status = gather_status(
+        store=store,
+        record_plane=plane,
+        notification_store=notification_store,
+        charter_resolved=CHARTER_RESOLVED,  # no [lanes] table
+        disk_path=str(store.db_path.parent),
+        now=now,
+    )
+
+    # Every pre-existing field still populated exactly as before.
+    assert status.state_counts["pool"] == 1
+    assert status.state_counts["parked"] == 1
+    assert set(status.state_counts) == set(STATES)
+    assert status.spend["dispatches_used"] == 1
+    assert status.spend["gate_calls_used"] == 1
+    assert status.spend["usd_cap"] == 25.0
+    assert status.daemon_heartbeat_age == pytest.approx(5.0, abs=1.0)
+    assert status.escalated_unnotified >= 1
+    assert status.disk_free_bytes > 0
+    assert status.disk_ok is True
+
+    # No lanes in the charter -> no per-lane entries (nothing invented),
+    # but the block still renders explicitly.
+    assert status.lane_parks == {}
+
+    text = render_status(status)
+    # All pre-existing rendered lines survive, in order.
+    for line in (
+        "=== spend vs budgets ===",
+        "=== quota parks ===",
+        "  (no lanes)",
+        "=== health ===",
+        "  usd: 0.0246 / cap 25.0",
+        "  dispatches: 1 / cap 50",
+        "  gate_calls: 1 / cap 30",
+        "  unbudgetable_events: 0",
+        "  daemon_heartbeat_age: ",
+        "  queue_age: ",
+        "  escalated_unnotified: 1",
+        "  disk_free_bytes: ",
+    ):
+        assert line in text
+    assert (
+        text.index("=== spend vs budgets ===")
+        < text.index("=== quota parks ===")
+        < text.index("=== health ===")
+    )
+
+
+def test_gather_lane_parks_pure_function_matches_governor_decide() -> None:
+    """`gather_lane_parks` is the same evidence rule as `decide`: a park
+    with no computable next-tick deadline is still parked (until unknown,
+    escalation never due)."""
+    now = 500.0
+    governor = QuotaGovernor()
+    governor.providers["prov-sub"] = QuotaState(
+        provider="prov-sub", limited=True, last_429_at=1.0, updated_at=2.0
+    )
+    parks = gather_lane_parks(
+        charter_resolved=LANE_CHARTER,
+        registry=_lane_registry(),
+        governor=governor,
+        now=now,
+    )
+    assert parks["sub"]["parked"] is True
+    assert parks["sub"]["parked_until"] is None
+    assert parks["sub"]["escalation_fired"] is False
+    assert parks["default"]["parked"] is False
+
+    # And the non-park branch matches decide() outcome-for-outcome.
+    entry = _lane_registry().resolve("sub-m")
+    d = decide(entry, governor.providers.get("prov-sub"), now=now)
+    assert (d.decision != "dispatch") == parks["sub"]["parked"]

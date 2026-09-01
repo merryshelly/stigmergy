@@ -196,6 +196,9 @@ def test_build_daemon_wiring(tmp_path: Path) -> None:
         assert daemon._egress_setup_fn is cli.egress.setup_dispatch_egress
         assert daemon._relay_setup_fn is not None
         assert daemon._relay_teardown_fn is not None
+        # The "no hardcoded paths" feed side-channel: the cli wires a feed
+        # cell the closure writes into and the daemon reads back.
+        assert daemon._relay_feed_cell is not None
     finally:
         daemon._store.close()
 
@@ -365,6 +368,57 @@ def test_build_daemon_relay_wiring(tmp_path: Path, monkeypatch) -> None:
         secret_set = daemon._secrets_for_capability(cap)
         assert "cap-tok-xyz" in secret_set
         assert "sk-fake-not-real" in secret_set  # the (monkeypatched) real key
+    finally:
+        daemon._store.close()
+
+
+def test_build_daemon_relay_feed_cell_records_derived_log_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The "no hardcoded paths" wiring: the relay-setup closure records the
+    exact relay JSONL log path it derives (the `relay-<dispatch-id>.jsonl`
+    file it passes to `start_relay`) into the feed side-channel cell keyed
+    by the dispatch id, so the daemon can learn the feed location from the
+    same place the relay writes it (with the charter/env
+    `loop.governor.relay_feed` key as the explicit override)."""
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig("shipyard", rigs_root=rigs_root)
+
+    monkeypatch.setattr(
+        cli, "make_op_key_provider",
+        lambda ref: (lambda: "sk-fake-not-real"),
+    )
+    monkeypatch.setattr(
+        cli, "make_urllib_forwarder",
+        lambda *, base_url, **kw: "FAKE_FORWARDER",
+    )
+
+    captured: dict = {}
+
+    def fake_start_relay(provisional_id, runtime_dir, relay, *, forwarder, log_path):
+        captured["provisional_id"] = provisional_id
+        captured["log_path"] = log_path
+        return object()  # stand-in RelayHandle
+
+    monkeypatch.setattr(cli, "start_relay", fake_start_relay)
+
+    daemon = _build_daemon(resolved)
+    try:
+        # The cell is the object the daemon reads back after _setup_relay.
+        feed_cell = daemon._relay_feed_cell
+        assert feed_cell is not None
+        # Before any setup call: nothing recorded yet.
+        assert feed_cell == {}
+
+        runtime_dir = tmp_path / "some-runtime-dir"
+        daemon._relay_setup_fn("dispatch-42", runtime_dir)
+
+        # The closure recorded the EXACT log path it passed to start_relay
+        # into the cell, keyed by the dispatch id — the same file the relay
+        # writes.
+        expected_log_path = runtime_dir / "relay-dispatch-42.jsonl"
+        assert captured["log_path"] == expected_log_path
+        assert feed_cell["dispatch-42"] == expected_log_path
     finally:
         daemon._store.close()
 

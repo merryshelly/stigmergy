@@ -400,6 +400,16 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # signature stays 2-arg (ten+ test stubs pin it); the profile travels
     # through the cell, not the callback.
     relay_profile_cell: dict[str, RelayProfile] = {}
+    # The per-dispatch RELAY FEED side-channel (the "no hardcoded paths"
+    # wiring): the `relay_setup_fn` closure below records the EXACT relay
+    # JSONL log path it derives (the `relay-<dispatch-id>.jsonl` file it
+    # passes to `start_relay`) here, keyed by the dispatch id; the daemon
+    # reads it back after `_setup_relay` — it learns the feed location from
+    # the same place the relay writes it, with the charter/env
+    # `loop.governor.relay_feed` key as the explicit override. Same
+    # cell-style channel as the .147 profile one: the `relay_setup_fn`
+    # signature stays 2-arg.
+    relay_feed_cell: dict[str, Path] = {}
     # Per-profile resources, constructed LAZILY once per (upstream_base_url,
     # auth) and cached: the op-backed key provider is fetch-once per process
     # (one `op read` per profile's key ref), the forwarder is stateless. The
@@ -508,6 +518,10 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
             relay_kwargs["upstream_header_allowlist"] = _RELAY_UPSTREAM_HEADER_ALLOWLIST
         relay = CredentialRelay(**relay_kwargs)
         log_path = Path(runtime_dir) / f"relay-{provisional_id}.jsonl"
+        # Record the derived feed path BEFORE the relay starts serving: the
+        # daemon reads it back after `_setup_relay` returns, so the entry
+        # must already be here by then.
+        relay_feed_cell[provisional_id] = log_path
         return start_relay(
             provisional_id,
             runtime_dir,
@@ -550,6 +564,9 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
         # bead .147 §1F: the profile side-channel (daemon derives per lane,
         # closure reads; default None elsewhere = today's behaviour).
         relay_profile_cell=relay_profile_cell,
+        # The relay feed side-channel (daemon stores the resolved feed
+        # location for the later governor use).
+        relay_feed_cell=relay_feed_cell,
         secrets_for_capability=secrets_for_capability,
     )
 

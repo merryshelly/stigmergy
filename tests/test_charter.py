@@ -12,6 +12,7 @@ import pytest
 
 from stigmergy.charter import (
     CIRCUIT_BREAKER_THRESHOLD,
+    DEFAULT_CHARTER,
     Charter,
     CharterError,
     classify_diff,
@@ -368,6 +369,117 @@ def test_critic_infra_env_override_at_threshold_rejected(tmp_path: Path) -> None
     charter_path = make_charter(tmp_path, BASE_CHARTER_TOML)
     with pytest.raises(CharterError):
         load_charter(charter_path, env={"SG_LOOP__RETRIES__CRITIC_INFRA": "5"})
+
+
+# ==========================================================================
+# quota-governor wiring surface: loop.governor.relay_feed +
+# loop.timers.park_escalation_seconds
+# ==========================================================================
+
+
+def test_governor_relay_feed_default_loads(tmp_path: Path) -> None:
+    """The base fixture declares no [loop.governor] -> the in-code default
+    (the relay JSONL feed glob, RELATIVE to the rig's clones root) is
+    merged in and validated clean."""
+    charter = load_charter(make_charter(tmp_path, BASE_CHARTER_TOML), env={})
+    assert charter.raw["loop"]["governor"]["relay_feed"] == "_relay_runtime/relay-*.jsonl"
+
+
+def test_governor_relay_feed_explicit_relative_loads(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[loop.governor]\nrelay_feed = "feeds/relay-*.jsonl"\n'
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["loop"]["governor"]["relay_feed"] == "feeds/relay-*.jsonl"
+
+
+def test_governor_relay_feed_env_override_loads(tmp_path: Path) -> None:
+    """`SG_LOOP__GOVERNOR__RELAY_FEED` overrides the feed location through
+    the standard `SG_` env-override machinery (a str leaf, like every other
+    string-valued key)."""
+    charter_path = make_charter(tmp_path, BASE_CHARTER_TOML)
+    charter = load_charter(
+        charter_path, env={"SG_LOOP__GOVERNOR__RELAY_FEED": "alt/relay-*.jsonl"}
+    )
+    assert charter.raw["loop"]["governor"]["relay_feed"] == "alt/relay-*.jsonl"
+
+
+def test_governor_relay_feed_absolute_rejected(tmp_path: Path) -> None:
+    """A literal per-rig path must never live in the charter: absolute feed
+    locations are a charter-load error (the value is resolved against the
+    rig's clones root by the daemon wiring)."""
+    content = BASE_CHARTER_TOML + '\n[loop.governor]\nrelay_feed = "/abs/relay.jsonl"\n'
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_governor_relay_feed_empty_string_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + '\n[loop.governor]\nrelay_feed = ""\n'
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_governor_relay_feed_non_string_rejected(tmp_path: Path) -> None:
+    content = BASE_CHARTER_TOML + "\n[loop.governor]\nrelay_feed = 5\n"
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_governor_unknown_key_still_rejected(tmp_path: Path) -> None:
+    # Adding `relay_feed` to the known set must NOT open the section to
+    # arbitrary keys.
+    content = BASE_CHARTER_TOML + "\n[loop.governor]\nbogus_knob = 1\n"
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
+def test_no_literal_relay_jsonl_path_in_charter_module() -> None:
+    """AC1 hard guarantee: the configurable default is the ONLY relay JSONL
+    location string in charter.py — no hardcoded path literal anywhere else
+    in the module (comments included)."""
+    src = Path(__file__).resolve().parent.parent / "src" / "stigmergy" / "charter.py"
+    lines = src.read_text(encoding="utf-8").splitlines()
+    hits = [line for line in lines if "relay-" in line and ".jsonl" in line.lower()]
+    assert len(hits) == 1
+    # the sole occurrence is the configurable default value itself, not a
+    # hardcoded path in code or comments.
+    assert DEFAULT_CHARTER["loop"]["governor"]["relay_feed"] in hits[0]
+
+
+def test_park_escalation_timer_default_loads(tmp_path: Path) -> None:
+    """The base fixture declares no `park_escalation_seconds` -> the in-code
+    default (28800s = 8h) is merged in and satisfies `_validate_timers`'
+    positive-int rule as-is."""
+    charter = load_charter(make_charter(tmp_path, BASE_CHARTER_TOML), env={})
+    assert charter.raw["loop"]["timers"]["park_escalation_seconds"] == 28800
+
+
+def test_park_escalation_timer_explicit_loads(tmp_path: Path) -> None:
+    content = mutate(
+        "poll_seconds = 15\ndispatch_timeout_seconds = 3600\nlease_ttl_seconds = 4500\n",
+        "poll_seconds = 15\ndispatch_timeout_seconds = 3600\nlease_ttl_seconds = 4500\n"
+        "park_escalation_seconds = 3600\n",
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["loop"]["timers"]["park_escalation_seconds"] == 3600
+
+
+def test_park_escalation_timer_env_override_loads(tmp_path: Path) -> None:
+    charter_path = make_charter(tmp_path, BASE_CHARTER_TOML)
+    charter = load_charter(charter_path, env={"SG_LOOP__TIMERS__PARK_ESCALATION_SECONDS": "7200"})
+    assert charter.raw["loop"]["timers"]["park_escalation_seconds"] == 7200
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "true", '""', "1.5"])
+def test_park_escalation_timer_bad_value_rejected(tmp_path: Path, bad: str) -> None:
+    # `_validate_timers`' existing rule (any `_seconds` key: positive int)
+    # applies to the new key with no loosening — non-positive, bool, string,
+    # and float values are all load errors.
+    content = mutate(
+        "poll_seconds = 15\ndispatch_timeout_seconds = 3600\nlease_ttl_seconds = 4500\n",
+        f"poll_seconds = 15\ndispatch_timeout_seconds = 3600\nlease_ttl_seconds = 4500\n"
+        f"park_escalation_seconds = {bad}\n",
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
 
 
 # --- env overrides -----------------------------------------------------------

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from stigmergy import statemachine
+from stigmergy import quotagov, statemachine
 
 # Cap on how many recent DISPOSITION events `gather_status` surfaces in
 # `last_verdicts` (SPEC §2 frozen interface: "last N (=5)").
@@ -48,6 +48,7 @@ class Status:
     state_counts: dict[str, int]
     last_verdicts: list[dict[str, Any]]
     spend: dict[str, Any]
+    lane_parks: dict[str, dict[str, Any]]
     daemon_heartbeat_age: float | None
     queue_age: float | None
     escalated_unnotified: int
@@ -124,6 +125,74 @@ def _budgets_from_charter(charter_resolved: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _empty_lane_parks(lane_names: list[str]) -> dict[str, dict[str, Any]]:
+    """The not-parked, no-evidence shape for a set of lanes: one entry per
+    lane, every field explicitly empty (a lane whose governance inputs are
+    absent is not-parked, never a missing key)."""
+    return {
+        name: {"parked": False, "parked_until": None, "escalation_fired": False}
+        for name in lane_names
+    }
+
+
+def gather_lane_parks(
+    *,
+    charter_resolved: dict[str, Any],
+    registry: Any = None,
+    governor: quotagov.QuotaGovernor | None = None,
+    escalation_ceiling_s: float = quotagov.DEFAULT_ESCALATION_CEILING_S,
+    now: float,
+) -> dict[str, dict[str, Any]]:
+    """The governor's park state per charter lane — the park-half of the
+    spend/leash status reporting (quotagov governor-state integration).
+
+    Mirrors the daemon's claim filter exactly: each lane's model is resolved
+    through the registry, and the governor's decision for the lane's
+    provider quota state is taken from :func:`quotagov.decide` (the same
+    pure API the daemon parks on). Every lane named in the charter gets an
+    entry: ``parked`` (bool), ``parked_until`` (the epoch-seconds park
+    deadline, or ``None``), and ``escalation_fired`` (bool — the governor's
+    escalation-due signal for this park). Lanes whose pricing class is not
+    subscription, whose model is missing from the registry, and the whole
+    mapping when ``governor`` is ``None`` (no feed configured) or its
+    provider map is empty (no quota state yet), are all
+    not-parked/``None``/not-escalated — explicitly empty, never a missing
+    key, and never a park without evidence.
+
+    ``registry`` and ``governor`` default to ``None``: a standalone
+    ``status`` run has no live feed state to fold (a ``QuotaGovernor`` is
+    built and folded only in the daemon's in-memory process, exactly like
+    ``SpendLeash``), so standalone runs report every lane as not-parked.
+    """
+    lanes_cfg = charter_resolved.get("lanes") or {}
+    lane_names = sorted(lanes_cfg)
+    parks = _empty_lane_parks(lane_names)
+    if governor is None or not governor.providers or registry is None:
+        return parks
+    for name in lane_names:
+        cfg = lanes_cfg.get(name)
+        if not isinstance(cfg, dict):
+            continue
+        try:
+            entry = registry.resolve(cfg.get("model"))
+        except Exception:  # noqa: BLE001 - a resolve miss is not-parked, never a crash
+            continue
+        provider = entry.oa_provider_key or entry.provider
+        decision = quotagov.decide(
+            entry,
+            governor.providers.get(provider),
+            now=now,
+            escalation_ceiling_s=escalation_ceiling_s,
+        )
+        if decision.decision != "dispatch":
+            parks[name] = {
+                "parked": True,
+                "parked_until": decision.park_until,
+                "escalation_fired": decision.escalation_due,
+            }
+    return parks
+
+
 def gather_status(
     *,
     store: Any,
@@ -133,9 +202,17 @@ def gather_status(
     disk_path: str,
     min_disk_bytes: int | None = None,
     now: float,
+    registry: Any = None,
+    governor: quotagov.QuotaGovernor | None = None,
+    escalation_ceiling_s: float = quotagov.DEFAULT_ESCALATION_CEILING_S,
 ) -> Status:
     """Assemble the full AC12 :class:`Status` snapshot from the rig's
-    stores (SPEC §2 frozen interface)."""
+    stores (SPEC §2 frozen interface).
+
+    ``registry``/``governor`` (optional) feed :func:`gather_lane_parks` —
+    the per-lane governor park state reported alongside the spend/leash
+    totals. Both default to ``None`` (standalone status run: no live
+    quota-state source), in which case every lane reports not-parked."""
     state_counts = {s: len(store.list_tickets(state=s)) for s in statemachine.STATES}
 
     disposition_events = [
@@ -162,6 +239,13 @@ def gather_status(
         dispatches_cap=caps["dispatches"],
         gate_calls_cap=caps["gate_calls"],
     )
+    lane_parks = gather_lane_parks(
+        charter_resolved=charter_resolved,
+        registry=registry,
+        governor=governor,
+        escalation_ceiling_s=escalation_ceiling_s,
+        now=now,
+    )
 
     heartbeat_raw = store.get_meta("daemon_heartbeat_at")
     daemon_heartbeat_age = None if heartbeat_raw is None else now - float(heartbeat_raw)
@@ -185,6 +269,7 @@ def gather_status(
         state_counts=state_counts,
         last_verdicts=last_verdicts,
         spend=spend,
+        lane_parks=lane_parks,
         daemon_heartbeat_age=daemon_heartbeat_age,
         queue_age=queue_age,
         escalated_unnotified=escalated_unnotified,
@@ -221,6 +306,28 @@ def render_status(status: Status) -> str:
         f"  gate_calls: {spend['gate_calls_used']} / cap {spend['gate_calls_cap']}"
     )
     lines.append(f"  unbudgetable_events: {spend['unbudgetable_events']}")
+
+    lines.append("")
+    lines.append("=== quota parks ===")
+    if status.lane_parks:
+        for lane in sorted(status.lane_parks):
+            park = status.lane_parks[lane]
+            if not park["parked"]:
+                lines.append(
+                    f"  {lane}: parked=no  parked_until=-  escalation_fired=no"
+                )
+                continue
+            until = (
+                f"{park['parked_until']:.0f}"
+                if park["parked_until"] is not None
+                else "-"
+            )
+            fired = "yes" if park["escalation_fired"] else "no"
+            lines.append(
+                f"  {lane}: parked=yes  parked_until={until}  escalation_fired={fired}"
+            )
+    else:
+        lines.append("  (no lanes)")
 
     lines.append("")
     lines.append("=== health ===")
