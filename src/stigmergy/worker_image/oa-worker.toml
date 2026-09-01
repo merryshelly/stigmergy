@@ -32,13 +32,16 @@ default_model = "blackwell/qwen38-27b-fp8"
 # 8192 (stop_reason=length), the truncated turn was misreported as a
 # clean finish, and the worker exited having committed nothing — empty
 # bundles, integration-conflict loop, escalation (caught live on
-# quotagov01 2026-08-31, bead .159). 65536 (SB steering: "don't be
-# conservative") covers any legitimate single file emission (~4-5k
-# lines); sized to stay within the narrowest upstream's per-request
-# limit since this TOML also governs future Synthetic ladder rungs
-# (glm53/kimi3). Per-DISPATCH totals remain bounded by the charter's
-# [loop.dispatch_limits] output_tokens.
-max_tokens = 65536
+# quotagov01 2026-08-31, bead .159). SIZING TRADEOFF (measured live,
+# same day): this reserve is SUBTRACTED from context runway by the OA
+# capacity guard (available = window - max_tokens), so an oversized
+# output cap converts a recoverable session into a fatal overflow —
+# a 65536 reserve let a single ~117k tool-result turn push park-wiring
+# past qwen38's window by 686 tokens. 32768 = 1.8x the largest observed
+# legitimate completion (18,156 qwen38; 4,630 GLM-5.3) while giving back
+# 32k of runway. The real fix for result spikes is harness-side output
+# bounding, not an ever-larger reserve.
+max_tokens = 32768
 thinking = "off"
 
 # OA's config schema: the workspace is a TABLE with a `path` key
