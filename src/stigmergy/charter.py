@@ -184,13 +184,18 @@ _KNOWN_LANE_KEYS = {"selector", "driver", "model", "prompt", "egress", "entry", 
 # §4.2: a concrete union, no Protocol — an unknown driver value is a
 # charter-load error, never a runtime mystery).
 _KNOWN_LANE_DRIVERS = frozenset({"claude-code", "openalph-exec"})
-# bead .149 (spec §2 decision 8): the card-native effort vocabulary
-# (kdsn.301). `high`/`max` are charter-load ERRORS (collapsed onto
-# `medium`/`xhigh` at the provider layer — a warn-spam rung no human will
-# ever notice); only the four card values are legal. `effort` is an
-# openalph-exec concept ONLY — on a claude-code lane it is meaningless and
-# rejected at charter-load.
-_KNOWN_LANE_EFFORTS = frozenset({"none", "low", "medium", "xhigh"})
+# bead .149 (spec §2 decision 8): the card-native effort vocabulary.
+# 2026-09-02 (SB ruling, hardening01 pre-launch): `high` is LEGAL — it is
+# card-native on the Synthetic GLM/Kimi cards (lh3c.11 wire probe:
+# low/medium/high/xhigh pass 1:1; xhigh≈max at the model level); the old
+# blanket rejection traced to the blackwell/qwen38 provider collapse map
+# (kdsn.301), which never applied to the subscription cards. `max` remains
+# a charter-load ERROR (non-card-native alias; xhigh is the canonical
+# ceiling value). Operator posture ruling (SB, 2026-09-02): effort=none
+# (reasoning off) requires explicit operator sign-off — never a default.
+# `effort` is an openalph-exec concept ONLY — on a claude-code lane it is
+# meaningless and rejected at charter-load.
+_KNOWN_LANE_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh"})
 _KNOWN_STEPUP_KEYS = {"ladder"}
 _KNOWN_ROLES_KEYS = {"critic"}
 # bead .166 (Decision 18): `station` selects the staging-gate critic
@@ -613,8 +618,9 @@ def _validate_lanes_values(lanes_cfg: dict[str, Any]) -> None:
       :data:`_KNOWN_LANE_DRIVERS` — an unknown driver is a charter-load
       error (fail closed; there is no runtime fallback).
     - ``effort`` (when present) must be a card-native value from
-      :data:`_KNOWN_LANE_EFFORTS` — ``high``/``max`` are rejected naming
-      the kdsn.301 collapse (spec §2 decision 8).
+      :data:`_KNOWN_LANE_EFFORTS` — ``max`` is rejected as a non-card-native
+      alias of ``xhigh`` (spec §2 decision 8; ``high`` legalized 2026-09-02
+      per SB ruling — card-native on the Synthetic cards, lh3c.11).
     - ``effort`` on a ``claude-code`` lane is rejected (meaningless there
       — the claude-code driver has no effort concept).
     """
@@ -633,9 +639,9 @@ def _validate_lanes_values(lanes_cfg: dict[str, Any]) -> None:
         if not isinstance(effort, str) or effort not in _KNOWN_LANE_EFFORTS:
             raise CharterError(
                 f"lanes.{name}.effort {effort!r} is not a card-native effort "
-                f"(known: {sorted(_KNOWN_LANE_EFFORTS)}) — `high`/`max` collapse "
-                "at the provider layer (kdsn.301) and are charter-load errors, "
-                "not rungs"
+                f"(known: {sorted(_KNOWN_LANE_EFFORTS)}) — `max` is a "
+                "non-card-native alias of `xhigh` and a charter-load error, "
+                "not a rung"
             )
         if driver == "claude-code":
             raise CharterError(

@@ -961,8 +961,11 @@ def _append_exec_lane(
     return content + "\n".join(lines) + "\n"
 
 
-@pytest.mark.parametrize("effort", ["none", "low", "medium", "xhigh"])
+@pytest.mark.parametrize("effort", ["none", "low", "medium", "high", "xhigh"])
 def test_lane_effort_card_native_values_accepted(tmp_path: Path, effort: str) -> None:
+    # 2026-09-02 SB ruling: `high` is card-native on the Synthetic GLM/Kimi
+    # cards (lh3c.11 wire probe: 1:1 pass-through) — the old kdsn.301
+    # collapse rejection was a blackwell/qwen38-provider-only finding.
     charter = load_charter(
         make_charter(tmp_path, _append_exec_lane(BASE_CHARTER_TOML, effort=effort)), env={}
     )
@@ -970,17 +973,11 @@ def test_lane_effort_card_native_values_accepted(tmp_path: Path, effort: str) ->
     assert charter.raw["lanes"]["exec"]["driver"] == "openalph-exec"
 
 
-def test_lane_effort_high_rejected_naming_kdsn_301(tmp_path: Path) -> None:
-    # spec §2 decision 8: `high`/`max` are charter-load ERRORS (card-native
-    # only, kdsn.301 — no warn-spam rungs).
-    content = _append_exec_lane(BASE_CHARTER_TOML, effort="high")
-    with pytest.raises(CharterError, match="kdsn.301"):
-        load_charter(make_charter(tmp_path, content), env={})
-
-
-def test_lane_effort_max_rejected_naming_kdsn_301(tmp_path: Path) -> None:
+def test_lane_effort_max_rejected_non_card_native_alias(tmp_path: Path) -> None:
+    # spec §2 decision 8: `max` is not card-native (a per-provider alias;
+    # xhigh is the canonical ceiling value) — charter-load error, not a rung.
     content = _append_exec_lane(BASE_CHARTER_TOML, effort="max")
-    with pytest.raises(CharterError, match="kdsn.301"):
+    with pytest.raises(CharterError, match="alias"):
         load_charter(make_charter(tmp_path, content), env={})
 
 
