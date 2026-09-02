@@ -916,6 +916,27 @@ def test_critic_max_tokens_must_be_positive_int(tmp_path: Path) -> None:
         load_charter(make_charter(tmp_path, content), env={})
 
 
+# --- bead .166: roles.critic.station (optional bool; default True) ---------
+
+
+def test_critic_station_accepted(tmp_path: Path) -> None:
+    content = mutate(
+        '[roles.critic]\nmodel = "opus"',
+        '[roles.critic]\nmodel = "opus"\nstation = false',
+    )
+    charter = load_charter(make_charter(tmp_path, content), env={})
+    assert charter.raw["roles"]["critic"]["station"] is False
+
+
+def test_critic_station_must_be_bool(tmp_path: Path) -> None:
+    content = mutate(
+        '[roles.critic]\nmodel = "opus"',
+        '[roles.critic]\nmodel = "opus"\nstation = "yes"',
+    )
+    with pytest.raises(CharterError):
+        load_charter(make_charter(tmp_path, content), env={})
+
+
 # ==========================================================================
 # bead .149: lane driver closed set + card-native `effort`
 # ==========================================================================

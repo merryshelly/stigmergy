@@ -1,5 +1,18 @@
 """OA provider-layer critic clients — bead workspace-e2uh.143 (A′).
 
+**DEPRECATED for production wiring (bead workspace-e2uh.166/.167, Decision
+18 Station Contract, 2026-09-01):** the staging-gate and range critics now
+run as STATIONS — ephemeral grounded agents (`station_critic.
+StationGateCritic` / `StationRangeCritic`) invoked via `openalph exec`
+with read-only tools and a grammar-constrained `submit_*` terminal tool.
+The in-process forced-tool factories below (`make_oa_critic_client` /
+`make_oa_range_critic_client`) remain importable and tested as the
+CHARTER ROLLBACK LEVER (`roles.critic.station = false`) and as the
+fallback for stations where grounding isn't worth latency (D18d) — but no
+production construction site uses them by default, and new code must not
+reach for them without an adjudicated reason. The decompose-critic
+migrated first (be392ee); both remaining critics migrated here.
+
 SB's adjudicated ruling (openalph-exec-design.md §4, A′, 2026-08-30): the
 critic/range-critic become **in-process forced-tool calls through OA's
 provider layer** with the shared key-bearing-call hardening flag ON. This

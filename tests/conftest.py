@@ -26,7 +26,10 @@ import importlib.util
 import sys
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 
 def _openalph_importable() -> bool:
@@ -103,3 +106,26 @@ def _install_fake_openalph() -> None:
 
 if not _openalph_importable():
     _install_fake_openalph()
+
+
+# --- bead .166 (Decision 18): host-independent station construction --------
+#
+# `StationGateCritic` / `StationRangeCritic` preflight the INSTALLED station
+# agent TOML (`/etc/openalph/agents/stigmergy-decomposer.toml`) fail-closed
+# at rig launch. That path is host state; the unit suite must not require
+# it. This autouse fixture pins the module global to the in-repo TEMPLATE
+# (which ships with the source and always exists), so construction succeeds
+# in any environment. Tests that exercise the preflight itself pass an
+# explicit `agent_toml=` (or unset the fixture).
+#
+# The resolved default lives INSIDE StationGateCritic.__init__ (never a
+# def-time default binding) precisely so this monkeypatch is effective.
+
+
+@pytest.fixture(autouse=True)
+def _station_agent_toml_pinned_to_repo_template(monkeypatch):
+    import stigmergy.station_critic as _sc
+
+    template = Path(_sc.__file__).parent / "agents" / "stigmergy-decomposer.toml"
+    monkeypatch.setattr(_sc, "STATION_AGENT_TOML", template)
+

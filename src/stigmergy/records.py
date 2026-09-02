@@ -193,6 +193,57 @@ _REQUIRED_COMMON_FIELDS: tuple[str, ...] = (
 
 _TOKEN_KEYS: tuple[str, ...] = ("in", "cached", "out", "reasoning")
 
+# --- bead .166 (Decision 18): record-plane tool_trace bounding -------------
+#
+# Station critics (and the decomposer stations) carry a `tool_trace` — the
+# station's read/grep trail — onto their provenance events (GATE, DECOMPOSE).
+# A grounded critic's trail can carry dozens of tool calls with large path or
+# pattern arguments; persisted raw, ONE gate could balloon the event log
+# (the .109/.112 bounding discipline applies). Machinery bounds it here —
+# the single place events are shaped — with all-or-nothing per entry.
+
+TOOL_TRACE_MAX_ENTRIES = 64
+TOOL_TRACE_STR_CAP = 200
+TOOL_TRACE_TOTAL_CAP = 8_192
+
+
+def bound_tool_trace(raw: Any) -> list[dict[str, Any]]:
+    """Bound a station envelope's ``tool_trace`` for the record plane: at
+    most :data:`TOOL_TRACE_MAX_ENTRIES` entries, each value stringified and
+    truncated to :data:`TOOL_TRACE_STR_CAP` chars, the aggregate capped at
+    :data:`TOOL_TRACE_TOTAL_CAP` chars — all-or-nothing per entry (a
+    partially-captured trace entry is a misleading audit line). Never
+    raises; a non-list trace degrades to an empty list."""
+    if not isinstance(raw, list):
+        return []
+    bounded: list[dict[str, Any]] = []
+    total = 0
+    for item in raw:
+        if len(bounded) >= TOOL_TRACE_MAX_ENTRIES or total >= TOOL_TRACE_TOTAL_CAP:
+            break
+        if not isinstance(item, dict):
+            continue
+        entry: dict[str, Any] = {}
+        entry_cost = 0
+        overflow = False
+        for key, value in item.items():
+            if isinstance(value, (int, float, bool)) or value is None:
+                entry[key] = value
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, default=str)
+            clipped = text[:TOOL_TRACE_STR_CAP]
+            if total + entry_cost + len(clipped) > TOOL_TRACE_TOTAL_CAP:
+                # All-or-nothing per entry: drop the whole entry, stop.
+                overflow = True
+                break
+            entry[key] = clipped
+            entry_cost += len(clipped)
+        if overflow or not entry:
+            break
+        bounded.append(entry)
+        total += entry_cost
+    return bounded
+
 # Triage attribution events (bead .42, .102c): the human-triage acts are EXEMPT
 # from `_REQUIRED_COMMON_FIELDS` (no dispatch/worker/model/tokens/cost) and
 # validate against this set instead. Each must be a non-empty str — a forgeable-by-

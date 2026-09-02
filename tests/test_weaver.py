@@ -2698,3 +2698,170 @@ def test_weaver_accepts_critic_accepting_rename_kwarg(tmp_path, store, plane):
     )
     result = weaver.weave(now=1000.0)[0]
     assert result.outcome == "landed"
+
+
+# ==========================================================================
+# Bead .166 (Decision 18, Station Contract): the weaver passes the
+# integrated candidate clone to grounded station critics (probe-and-pass —
+# legacy critics that don't declare grounding_repo are called unchanged),
+# and the GATE event carries the station's audit fields (bounded tool_trace,
+# station descriptor, attempts) alongside the existing provenance.
+# ==========================================================================
+
+
+class GroundingStationStub:
+    """A station-shaped critic: declares `grounding_repo`, records the
+    kwargs it received, returns a contract-conformant MET verdict."""
+
+    def __init__(self) -> None:
+        self.received: dict | None = None
+        self.calls = 0
+
+    def judge(
+        self,
+        artifact: str,
+        rubric_items: list[str],
+        *,
+        check_evidence: str | None = None,
+        rename_evidence: str | None = None,
+        grounding_repo: str | None = None,
+    ):
+        from stigmergy.verdicts import Outcome, Severity, Verdict
+
+        self.calls += 1
+        self.received = {
+            "artifact": artifact,
+            "check_evidence": check_evidence,
+            "rename_evidence": rename_evidence,
+            "grounding_repo": grounding_repo,
+            # existence is captured AT CALL TIME — the weaver cleans the
+            # candidate clone up after the weave, so post-weave checks of
+            # the recorded path would assert against a removed directory.
+            "grounding_exists": Path(grounding_repo).is_dir()
+            if grounding_repo
+            else None,
+            "tree_has_work_file": (Path(grounding_repo) / "f.txt").is_file()
+            if grounding_repo
+            else None,
+        }
+        return (
+            Verdict(outcome=Outcome.MET, tier=1, reason="ok", severity=Severity.NONE),
+            {
+                "prompt_artifact_hash": "a" * 64,
+                "model": "synthetic/hf:moonshotai/Kimi-K3",
+                "decoding_params": {},
+                "tokens": {"in": 1, "cached": 0, "out": 1, "reasoning": 0},
+                "wall_time_seconds": 0.5,
+                "ts": 1234.5,
+                "tool_trace": [{"name": "file_read", "path": "src/app.py"}],
+                "station": {
+                    "agent": "stigmergy-decomposer",
+                    "submit_tool": "submit_verdict",
+                    "prompt": "critic04",
+                },
+                "station_attempts": 1,
+            },
+            [],
+        )
+
+
+def test_station_critic_receives_candidate_clone(tmp_path, store, plane):
+    """The grounded station critic is handed the candidate clone path so it
+    can verify the artifact's claims against the REAL tree (Decision 18)."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t1", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t1", work_product=bundle)
+    critic = GroundingStationStub()
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=critic,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+    assert critic.calls == 1
+    assert critic.received is not None
+    grounding = critic.received["grounding_repo"]
+    assert isinstance(grounding, str) and grounding  # the candidate clone path
+    # it EXISTED and carried the candidate's work at judge time (the weaver
+    # cleans the clone up after the weave — see the capture note in the stub)
+    assert critic.received["grounding_exists"] is True
+    assert critic.received["tree_has_work_file"] is True
+
+
+def test_legacy_critic_called_without_grounding_kwarg(tmp_path, store, plane):
+    """Probe-and-pass: a legacy critic that does NOT declare
+    `grounding_repo` (the pre-.166 stub contract) is invoked unchanged —
+    no TypeError, no grounding."""
+    received: dict = {}
+
+    class LegacyCritic:
+        def judge(self, artifact, rubric_items, *, check_evidence=None, rename_evidence=None):
+            from stigmergy.verdicts import Outcome, Severity, Verdict
+
+            received["kwargs"] = {
+                "check_evidence": check_evidence,
+                "rename_evidence": rename_evidence,
+            }
+            return (
+                Verdict(outcome=Outcome.MET, tier=1, reason="ok", severity=Severity.NONE),
+                {
+                    "prompt_artifact_hash": "b" * 64,
+                    "decoding_params": {},
+                    "tokens": {"in": 0, "cached": 0, "out": 0, "reasoning": 0},
+                },
+                [],
+            )
+
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t1", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t1", work_product=bundle)
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=LegacyCritic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+    assert set(received["kwargs"]) == {"check_evidence", "rename_evidence"}
+
+
+def test_gate_event_carries_station_audit_fields(tmp_path, store, plane):
+    """The GATE event picks the station audit fields out of gate_fields:
+    the bounded tool_trace, the station descriptor, and the attempts
+    count — alongside the existing provenance (model/tokens/wall time)."""
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t1", files={"f.txt": "x\n"})
+    add_parked_ticket(store, "t1", work_product=bundle)
+    critic = GroundingStationStub()
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=critic,
+    )
+    result = weaver.weave(now=1000.0)[0]
+    assert result.outcome == "landed"
+    events = gate_events(plane, "t1")
+    assert len(events) == 1
+    event = events[0]
+    assert event["tool_trace"] == [{"name": "file_read", "path": "src/app.py"}]
+    assert event["station"] == {
+        "agent": "stigmergy-decomposer",
+        "submit_tool": "submit_verdict",
+        "prompt": "critic04",
+    }
+    assert event["station_attempts"] == 1
+    # existing provenance keys untouched
+    assert event["model"] == "synthetic/hf:moonshotai/Kimi-K3"
+    assert event["tokens"] == {"in": 1, "cached": 0, "out": 1, "reasoning": 0}
+    assert event["wall_time_seconds"] == 0.5
+    assert event["ts"] == 1234.5

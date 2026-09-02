@@ -81,6 +81,7 @@ from stigmergy.relay_transport import RelayHandle, make_urllib_forwarder, start_
 from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
 from stigmergy.spend import Budgets, SpendLeash
 from stigmergy.statemachine import ESCALATED, POOL, transition
+from stigmergy.station_critic import StationGateCritic, StationRangeCritic
 from stigmergy.status import (
     gather_status,
     render_daemon_liveness,
@@ -390,33 +391,52 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # v0: one image for worker + checker.
     checker_image = resolved.worker_image
     critic_cfg = charter.raw["roles"]["critic"]
-    # bead .36: the critic client is now real -- any client-side/provider
-    # failure surfaces as CriticInfraError, never a silent wrong gate
-    # verdict (critic.py's own fail-closed discipline).
-    # bead .39: the staging-gate critic reads critic02+ (the D14 filing-
-    # mandate prompt bump, carrying the optional filed_tickets schema field).
-    # bead .140: critic03 adds the moved-file trusted-evidence exception
-    # (SB-approved 2026-08-30) so rename-only artifacts are verifiable.
-    # bead .143 (A′): the client is the OA provider-layer forced-tool
-    # call (hardened=True; the legacy bare-urllib client is deleted).
-    # The factory build is FAIL-CLOSED: an OA-less environment raises
-    # CriticOAUnavailableError here (rig launch), never at the first
-    # gate. The key ref follows the resolved entry's provider (Decision 3).
-    critic_key_provider = make_op_key_provider(
-        _critic_key_ref_for(resolved.registry, critic_cfg["model"])
-    )
-    critic = Critic.from_prompt_file(
-        rig_paths["prompts_dir"] / "critic03",  # hardcoded filename -- see §3.7 note
-        client=make_oa_critic_client(
-            key_provider=critic_key_provider,
+    # bead .166 (Decision 18, Station Contract): the staging-gate critic is
+    # a STATION by default — an ephemeral grounded agent (read-only tools +
+    # the grammar-constrained submit_verdict terminal tool) reaped by
+    # deterministic machinery (station_critic.StationGateCritic; the
+    # decompose-critic migration be392ee is the precedent). Construction is
+    # FAIL-CLOSED: a missing prompt artifact (critic04) or uninstalled
+    # station agent TOML raises CriticOAUnavailableError here (rig launch),
+    # never at the first gate. `roles.critic.station = false` selects the
+    # DEPRECATED in-process forced-tool path — the rollback lever during
+    # the .166 migration, kept until the station path is adjudicated on a
+    # real rig.
+    if critic_cfg.get("station", True):
+        critic = StationGateCritic(
             registry=registry,
-            # bead .118: charter-overridable verdict-critic output budget
-            # (default 4096) so a long verdict reason can't truncate.
-            max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
-        ),
-        model=critic_cfg["model"],
-        decoding_params={},
-    )
+            model=critic_cfg["model"],
+            prompts_dir=rig_paths["prompts_dir"],
+        )
+    else:
+        # DEPRECATED in-process fallback (bead .166 rollback lever).
+        # bead .36: the critic client is now real -- any client-side/provider
+        # failure surfaces as CriticInfraError, never a silent wrong gate
+        # verdict (critic.py's own fail-closed discipline).
+        # bead .39: the staging-gate critic reads critic02+ (the D14 filing-
+        # mandate prompt bump, carrying the optional filed_tickets schema field).
+        # bead .140: critic03 adds the moved-file trusted-evidence exception
+        # (SB-approved 2026-08-30) so rename-only artifacts are verifiable.
+        # bead .143 (A′): the client is the OA provider-layer forced-tool
+        # call (hardened=True; the legacy bare-urllib client is deleted).
+        # The factory build is FAIL-CLOSED: an OA-less environment raises
+        # CriticOAUnavailableError here (rig launch), never at the first
+        # gate. The key ref follows the resolved entry's provider (Decision 3).
+        critic_key_provider = make_op_key_provider(
+            _critic_key_ref_for(resolved.registry, critic_cfg["model"])
+        )
+        critic = Critic.from_prompt_file(
+            rig_paths["prompts_dir"] / "critic03",  # hardcoded filename -- see §3.7 note
+            client=make_oa_critic_client(
+                key_provider=critic_key_provider,
+                registry=registry,
+                # bead .118: charter-overridable verdict-critic output budget
+                # (default 4096) so a long verdict reason can't truncate.
+                max_tokens=critic_cfg.get("max_tokens", DEFAULT_MAX_TOKENS),
+            ),
+            model=critic_cfg["model"],
+            decoding_params={},
+        )
     dispatch_limits = charter.raw["loop"]["dispatch_limits"]
     weaver = Weaver(
         store=store,
@@ -1140,24 +1160,40 @@ def _cmd_ticket(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
-def _build_range_critic(resolved: ResolvedRig) -> RangeCritic:
-    """Production `RangeCritic` builder (bead .42 build spec §D; fixed by
-    beads .51 + .41; migrated by bead .143) — a monkeypatchable
-    module-level helper: tests replace `cli._build_range_critic`
-    wholesale to inject a stub client, so this function must be called
-    by plain module-global name (never imported/aliased/bound early) at
-    every call site.
+def _build_range_critic(resolved: ResolvedRig) -> Any:
+    """Production range-critic builder (beads .42/.51/.41; migrated to the
+    Station Contract by bead .167) — a monkeypatchable module-level helper:
+    tests replace `cli._build_range_critic` wholesale to inject a stub, so
+    this function must be called by plain module-global name (never
+    imported/aliased/bound early) at every call site.
 
-    `.51` fix: wires `make_oa_range_critic_client` (NOT the verdict
-    client `make_oa_critic_client`, which returns the wrong
-    `{outcome,tier,reason,severity}` shape) and reads the `rangecrit02`
-    prompt artifact (the `.41` combined-schema prompt bump, superseding
-    `rangecrit01`). `.143`: the client is the OA provider-layer
-    forced-tool call; it resolves the SAME `[roles.critic].model` as the
-    staging-gate critic (shared model, separate forced tool).
+    Decision 18: the STATION critic by default — `StationRangeCritic`, a
+    grounded exec station (read-only tools + the grammar-constrained
+    `submit_range_review` terminal tool) grounding its read against the
+    rig's staging tree, reading the `rangecrit03` prompt artifact.
+    `roles.critic.station = false` selects the DEPRECATED in-process
+    `RangeCritic` + `make_range_critic_client` path (the .167 rollback
+    lever). Both implementations return objects exposing
+    `review(report) -> RangeCriticResult`; the CLI's downstream
+    consumption is unchanged.
     """
     charter = resolved.charter
     critic_cfg = charter.raw["roles"]["critic"]
+    if critic_cfg.get("station", True):
+        return StationRangeCritic(
+            registry=resolved.registry,
+            model=critic_cfg["model"],
+            prompts_dir=resolved.rig_paths["prompts_dir"],
+            grounding_repo=resolved.rig_paths["repo_root"],
+        )
+    # DEPRECATED in-process fallback (bead .167 rollback lever).
+    # `.51` fix: wires `make_oa_range_critic_client` (NOT the verdict
+    # client `make_oa_critic_client`, which returns the wrong
+    # `{outcome,tier,reason,severity}` shape) and reads the `rangecrit02`
+    # prompt artifact (the `.41` combined-schema prompt bump, superseding
+    # `rangecrit01`). `.143`: the client is the OA provider-layer
+    # forced-tool call; it resolves the SAME `[roles.critic].model` as the
+    # staging-gate critic (shared model, separate forced tool).
     critic_key_provider = make_op_key_provider(
         _critic_key_ref_for(resolved.registry, critic_cfg["model"])
     )

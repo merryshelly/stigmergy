@@ -75,7 +75,7 @@ from stigmergy.charter import CharterError
 from stigmergy.intake import ingest_manifest
 from stigmergy.keyprovider import make_op_key_provider
 from stigmergy.manifest import validate_manifest
-from stigmergy.records import EventType, RecordPlane, make_event
+from stigmergy.records import EventType, RecordPlane, bound_tool_trace, make_event
 from stigmergy.registry import PricingClass, UnbudgetableError
 from stigmergy.rig import ResolvedRig, RigError, resolve_rig
 from stigmergy.steering import derive_steering
@@ -190,6 +190,10 @@ class DecomposerOutput:
     usage: dict | None
     manifest_text: str | None = None
     detail: dict = field(default_factory=dict)
+    # bead .166 (Decision 18): the exec envelope's tool_trace (raw), carried
+    # so the DECOMPOSE provenance event can record the station's bounded
+    # read trail. None on exec failures (nothing meaningful was invoked).
+    tool_trace: list | None = None
 
 
 # ==========================================================================
@@ -602,6 +606,10 @@ def _classify_exec(
 
     usage = _map_usage(obj.get("usage"))
     content = obj.get("content") if isinstance(obj.get("content"), str) else None
+    # bead .166: the station's raw tool trail, carried for DECOMPOSE
+    # provenance (bounded at emit time, never persisted raw).
+    tool_trace = obj.get("tool_trace")
+    tool_trace = tool_trace if isinstance(tool_trace, list) else None
 
     if obj.get("status") != "done" or obj.get("deny_reason") or obj.get("ceiling_trip"):
         return DecomposerOutput(
@@ -653,6 +661,7 @@ def _classify_exec(
             usage=usage,
             manifest_text=raw,
             detail={},
+            tool_trace=tool_trace,
         )
 
     # No manifest file: a non-empty notes.md is the legitimate no-manifest
@@ -664,6 +673,7 @@ def _classify_exec(
             notes_text=notes_text,
             usage=usage,
             detail={"reason": "no-manifest-escape", "diagnosis": notes_text[:2000]},
+            tool_trace=tool_trace,
         )
     return DecomposerOutput(
         kind="failure",
@@ -1224,7 +1234,12 @@ def _classify_critic_exec(result: subprocess.CompletedProcess) -> dict[str, Any]
             "decompose-critic submitted no result (the submit_validation "
             "terminal tool was never called)"
         )
-    return {"payload": payload, "usage": usage}
+    raw_trace = obj.get("tool_trace")
+    return {
+        "payload": payload,
+        "usage": usage,
+        "tool_trace": raw_trace if isinstance(raw_trace, list) else None,
+    }
 
 
 def run_critic(
@@ -1332,7 +1347,11 @@ def run_critic(
         except DecomposeError as exc:
             last_err = str(exc)
             continue
-        return {**classified["payload"], "usage": classified["usage"]}
+        return {
+            **classified["payload"],
+            "usage": classified["usage"],
+            "tool_trace": classified["tool_trace"],
+        }
     raise DecomposeError(f"decompose-critic failed after retry: {last_err}")
 
 
@@ -1487,6 +1506,7 @@ class _DecomposeDriver:
         tokens: dict[str, int],
         wall_time_seconds: float,
         prompt_artifact_hash: str,
+        tool_trace: list[dict[str, Any]] | None = None,
     ) -> None:
         """ONE ``EventType.DECOMPOSE`` event for a SUCCESSFUL LLM invocation
         (the decomposer exec that produced output — manifest, phase plan, or
@@ -1529,6 +1549,7 @@ class _DecomposeDriver:
             computed_usd=computed_usd,
             wall_time_seconds=wall_time_seconds,
             prompt_artifact_hash=prompt_artifact_hash,
+            **({"tool_trace": tool_trace} if tool_trace is not None else {}),
         )
         self.record_plane.append(event)
 
@@ -1603,6 +1624,7 @@ class _DecomposeDriver:
                 tokens=output.usage or {},
                 wall_time_seconds=wall,
                 prompt_artifact_hash=self.prompt_hash,
+                tool_trace=bound_tool_trace(output.tool_trace),
             )
         return output
 
@@ -1667,6 +1689,7 @@ class _DecomposeDriver:
             tokens=_map_usage(result.get("usage")),
             wall_time_seconds=wall,
             prompt_artifact_hash=self.critic_prompt_hash,
+            tool_trace=bound_tool_trace(result.get("tool_trace")),
         )
         self.findings_history.append(
             {

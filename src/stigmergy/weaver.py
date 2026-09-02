@@ -297,6 +297,13 @@ class Weaver:
                 "def judge(self, artifact, rubric_items, *, check_evidence=None, "
                 "rename_evidence=None)"
             )
+        # Bead .166 (Decision 18): the station critics accept an optional
+        # `grounding_repo` kwarg — the integrated candidate clone the
+        # grounded critic verifies claims against. PROBE-AND-PASS (never
+        # hard-require): legacy in-process critics and test doubles that
+        # don't declare the parameter keep working unchanged; production
+        # station wiring is asserted in the wiring tests.
+        self._critic_accepts_grounding = "grounding_repo" in judge_params
 
     # -- WeaveJournalResolver protocol (recover.py) ------------------------
 
@@ -514,11 +521,18 @@ class Weaver:
                 rename_evidence = self._rename_evidence(
                     candidate_dir, pinned_oid, candidate_oid
                 )
+                judge_kwargs: dict[str, Any] = {
+                    "check_evidence": check_evidence,
+                    "rename_evidence": rename_evidence,
+                }
+                # Bead .166 (Decision 18): hand the grounded station critic
+                # the integrated candidate clone so it can verify the
+                # artifact's claims against the real tree. Legacy critics
+                # that don't declare the kwarg are called unchanged.
+                if self._critic_accepts_grounding:
+                    judge_kwargs["grounding_repo"] = str(candidate_dir)
                 verdict, gate_fields, filed_tickets = self.critic.judge(
-                    artifact,
-                    rubric_items,
-                    check_evidence=check_evidence,
-                    rename_evidence=rename_evidence,
+                    artifact, rubric_items, **judge_kwargs
                 )
             except CriticInfraError as exc:
                 return self._die(
@@ -1249,6 +1263,15 @@ class Weaver:
             fields["repair_attempts"] = gate_fields["repair_attempts"]
         if "repair_instruction_hash" in gate_fields:
             fields["repair_instruction_hash"] = gate_fields["repair_instruction_hash"]
+        # Bead .166 (Decision 18): the station critics add their own audit
+        # fields — the bounded read/grep trail, the station descriptor, and
+        # the exec attempts consumed (including any retry).
+        if "tool_trace" in gate_fields:
+            fields["tool_trace"] = gate_fields["tool_trace"]
+        if "station" in gate_fields:
+            fields["station"] = gate_fields["station"]
+        if "station_attempts" in gate_fields:
+            fields["station_attempts"] = gate_fields["station_attempts"]
         event = make_event(EventType.GATE, **fields)
         self.record_plane.append(event)
 

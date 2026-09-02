@@ -193,7 +193,13 @@ _KNOWN_LANE_DRIVERS = frozenset({"claude-code", "openalph-exec"})
 _KNOWN_LANE_EFFORTS = frozenset({"none", "low", "medium", "xhigh"})
 _KNOWN_STEPUP_KEYS = {"ladder"}
 _KNOWN_ROLES_KEYS = {"critic"}
-_KNOWN_CRITIC_KEYS = {"model", "max_tokens"}
+# bead .166 (Decision 18): `station` selects the staging-gate critic
+# implementation — True (default) = the station-contract critic
+# (station_critic.StationGateCritic, an ephemeral grounded agent with a
+# grammar-constrained submit_verdict terminal tool); False = the DEPRECATED
+# in-process forced-tool provider call (the rollback lever, oa_critic
+# factories). Presence of the key with a non-bool value is a charter error.
+_KNOWN_CRITIC_KEYS = {"model", "max_tokens", "station"}
 _KNOWN_MODELS_KEYS = {"registry"}
 _KNOWN_EGRESS_GROUP_KEYS = {"hosts"}
 _KNOWN_NOTIFY_KEYS = {"ntfy_topic"}
@@ -649,6 +655,13 @@ def _validate_roles_keys(roles_cfg: Any) -> None:
         # positive int when present; absent -> critic_client.DEFAULT_MAX_TOKENS.
         if "max_tokens" in critic_cfg:
             _validate_positive_int(critic_cfg, "max_tokens", "roles.critic.max_tokens")
+        # bead .166 (Decision 18): optional critic-implementation selector.
+        # Must be a bool when present; absent -> True (station contract).
+        if "station" in critic_cfg and not isinstance(critic_cfg["station"], bool):
+            raise CharterError(
+                "roles.critic.station must be a bool (got "
+                f"{critic_cfg['station']!r})"
+            )
 
 
 def _validate_egress_keys(egress_cfg: Any) -> None:

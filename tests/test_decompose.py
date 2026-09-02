@@ -67,6 +67,9 @@ def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> P
     (repo_dir / "prompts" / "critic01").write_text("critic01 template\n")
     (repo_dir / "prompts" / "decomposer01").write_text("decomposer01 template\n")
     (repo_dir / "prompts" / "decomposecritic01").write_text("decomposecritic01 template\n")
+    # beads .166/.167 (Decision 18): station critics read critic04/rangecrit03.
+    (repo_dir / "prompts" / "critic04").write_text("critic04 template\n")
+    (repo_dir / "prompts" / "rangecrit03").write_text("rangecrit03 template\n")
     (repo_dir / "src").mkdir()
     (repo_dir / "src" / "app.py").write_text("def app():\n    return 1\n")
     (repo_dir / "src" / "util.py").write_text("def util():\n    return 2\n")
@@ -355,6 +358,7 @@ def _exec_result(
     ceiling_trip: str | None = None,
     usage: dict | None = None,
     detail: str | None = None,
+    tool_trace: list | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -363,7 +367,7 @@ def _exec_result(
         "stop_reason": "end_turn",
         "ceiling_trip": ceiling_trip,
         "deny_reason": deny_reason,
-        "tool_trace": [],
+        "tool_trace": tool_trace if tool_trace is not None else [],
         "detail": detail or "",
     }
 
@@ -455,6 +459,7 @@ def _critic_exec_result(
     evidence_log: list[dict] | None = None,
     summary: str = "manifest is faithful to the spec",
     usage: dict | None = None,
+    tool_trace: list | None = None,
 ) -> dict[str, Any]:
     """One critic STATION exec stdout JSON line (Decision 18): a `done`
     status whose top-level `result` field IS the submit_validation payload
@@ -466,7 +471,7 @@ def _critic_exec_result(
         "stop_reason": "end_turn",
         "ceiling_trip": None,
         "deny_reason": None,
-        "tool_trace": [],
+        "tool_trace": tool_trace if tool_trace is not None else [],
         "detail": "",
         "result": {
             "verdict": verdict,
@@ -1399,6 +1404,50 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
         resolved.store.close()
     assert decomp["prompt_artifact_hash"] == expected_decomp_hash
     assert critic["computed_usd"] == expected_critic_usd
+
+
+def test_run_decompose_events_carry_bounded_tool_trace(tmp_path: Path, monkeypatch) -> None:
+    """Bead .166 (Decision 18): DECOMPOSE provenance events record the
+    station's read trail — the RAW envelope tool_trace, bounded at emit
+    time (records.bound_tool_trace). Never persisted raw."""
+    manifest = [_ticket_entry("t-a")]
+    rigs_root = scaffold_rig(tmp_path)
+    spec = _write_spec(tmp_path)
+
+    decomposer_trace = [
+        {"name": "file_read", "path": f"/work/src/file_{i}.py"} for i in range(100)
+    ]
+    critic_trace = [{"name": "grep", "pattern": "z" * 900}]
+    _fake_exec(
+        monkeypatch,
+        [{"manifest": manifest, "notes": "n",
+          "result": _exec_result(tool_trace=decomposer_trace)}],
+    )
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    _critic_exec(
+        monkeypatch, [_critic_exec_result(tool_trace=critic_trace)]
+    )
+    rc = decompose.run_decompose(
+        rig_name=RIG,
+        spec_path=spec,
+        decompose_root=tmp_path / "d",
+        rigs_root=rigs_root,
+    )
+    assert rc == 0
+    events = _decompose_events(rigs_root)
+    by_station = {e["station"]: e for e in events}
+
+    decomposer = by_station["decomposer"]
+    # entry-capped at 64 (the raw trace carried 100)
+    assert len(decomposer["tool_trace"]) == 64
+    assert decomposer["tool_trace"][0]["name"] == "file_read"
+
+    critic = by_station["decompose-critic"]
+    # string-capped at 200 (the raw pattern carried 900 chars)
+    assert len(critic["tool_trace"]) == 1
+    assert len(critic["tool_trace"][0]["pattern"]) == 200
 
 
 def test_run_decompose_failed_exec_emits_no_event(tmp_path: Path, monkeypatch) -> None:

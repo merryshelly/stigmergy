@@ -11,6 +11,7 @@ No real podman / network / provider calls anywhere.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -55,6 +56,10 @@ def make_local_repo_with_prompts(tmp_path: Path, name: str = "source_repo") -> P
     # bead .140: production staging-gate critic reads critic03 (moved-file
     # trusted-evidence bump, rollover of the bead .39 critic02 filing bump).
     (repo_dir / "prompts" / "critic03").write_text("critic03 template\n")
+    # beads .166/.167 (Decision 18): the STATION critics read critic04 /
+    # rangecrit03 (grounded-agent artifacts; in-process path deprecated).
+    (repo_dir / "prompts" / "critic04").write_text("critic04 template\n")
+    (repo_dir / "prompts" / "rangecrit03").write_text("rangecrit03 template\n")
     # beads .41: production `range-report --critic` reads rangecrit02.
     (repo_dir / "prompts" / "rangecrit02").write_text("rangecrit02 template\n")
     (repo_dir / "README.md").write_text("hello from the fixture repo\n")
@@ -105,14 +110,21 @@ def test_main_daemon_run_builds_real_daemon(tmp_path: Path, monkeypatch) -> None
         assert isinstance(daemon, Daemon)
         # Real, non-placeholder collaborators where it matters:
         assert isinstance(daemon._container_reaper, PodmanContainerReaper)
-        # The critic is wired with the REAL provider-calling client (bead .36),
-        # NOT a silently-wrong stub. It's a make_critic_client closure; its own
-        # request/response + fail-closed behavior is covered in
-        # test_critic_client.py. Daemon construction must NOT shell out to
-        # 1Password (make_op_key_provider is lazy) -- reaching this assertion
-        # here without any op/network access is itself that regression guard.
-        assert callable(daemon._weaver.critic._client)
-        assert daemon._weaver.critic.model == "opus"  # charter [roles.critic].model
+        # bead .166 (Decision 18): the critic is a STATION by default —
+        # an ephemeral grounded agent (station_critic.StationGateCritic)
+        # reaped by the weaver; the in-process client path is the
+        # deprecated `station = false` branch (pinned by the .143-era
+        # tests). Its request/reap/fail-closed behavior is covered in
+        # test_station_critic.py. Daemon construction must NOT shell out
+        # to 1Password or openalph here -- reaching this assertion without
+        # any op/network/exec access is itself that regression guard.
+        from stigmergy.station_critic import StationGateCritic
+
+        assert isinstance(daemon._weaver.critic, StationGateCritic)
+        assert daemon._weaver.critic._model_charter == "opus"  # [roles.critic].model
+        assert daemon._weaver.critic.prompt_artifact_hash  # critic04 hash pinned
+        # The weaver passes the candidate clone to the grounded critic.
+        assert daemon._weaver._critic_accepts_grounding is True
     finally:
         daemon._store.close()
 
@@ -167,10 +179,15 @@ def test_build_daemon_wiring(tmp_path: Path) -> None:
         # bead .39: D14 filing caps flow charter -> weaver.
         assert daemon._weaver.filing_max_filings == 3
         assert daemon._weaver.filing_max_bytes == 9999
-        # bead .140: _build_daemon loads critic03 (moved-file bump), NOT critic01/02.
-        assert daemon._weaver.critic.template == (
-            resolved.rig_paths["prompts_dir"] / "critic03"
-        ).read_text(encoding="utf-8")
+        # bead .140: the LEGACY branch loaded critic03 (moved-file bump), NOT
+        # critic01/02. bead .166 (Decision 18): the DEFAULT branch is the
+        # station critic, pinned to critic04 (the grounded station artifact).
+        from stigmergy.station_critic import StationGateCritic
+
+        assert isinstance(daemon._weaver.critic, StationGateCritic)
+        assert daemon._weaver.critic.prompt_artifact_hash == hashlib.sha256(
+            (resolved.rig_paths["prompts_dir"] / "critic04").read_bytes()
+        ).hexdigest()
         # checker_image == charter [rig].image (v0: one image for worker+checker)
         assert daemon._checker_image == "stigmergy-worker:py312"
 
@@ -1129,15 +1146,44 @@ def _filed(rigs_root: Path) -> list[dict]:
 
 # --- .51 wiring regression: the REAL _build_range_critic ------------------
 # The .51 bug was a WIRING bug: _build_range_critic used the verdict client
-# (make_critic_client) + rangecrit01. The fix wires make_range_critic_client
-# + rangecrit02. This exercises the REAL builder (no _build_range_critic
-# monkeypatch), proving both, without shelling out to 1Password.
+# (make_critic_client) + rangecrit01. The fix wired make_range_critic_client
+# + rangecrit02. Bead .167 (Decision 18) migrated the range critic to the
+# STATION contract: the default branch now builds StationRangeCritic on
+# rangecrit03, grounding against the rig's staging tree; the legacy branch
+# (station=false) keeps the original .51 assertions. Both exercise the REAL
+# builder (no _build_range_critic monkeypatch), proving both, without
+# shelling out to 1Password or spawning an exec.
+
+
+def test_167_build_range_critic_station_wiring(tmp_path, monkeypatch):
+    import hashlib
+
+    from stigmergy.station_critic import StationRangeCritic
+
+    rigs_root = scaffold_rig(tmp_path)
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        critic = cli._build_range_critic(resolved)
+
+        assert isinstance(critic, StationRangeCritic)
+        # rangecrit03 (the .167 station prompt artifact), not rangecrit02.
+        rc03 = resolved.rig_paths["prompts_dir"] / "rangecrit03"
+        assert critic.prompt_artifact_hash == hashlib.sha256(
+            rc03.read_bytes()
+        ).hexdigest()
+        # Grounded against the rig's staging repo.
+        assert critic._grounding_repo == str(resolved.rig_paths["repo_root"])
+    finally:
+        resolved.store.close()
 
 
 def test_51_build_range_critic_uses_range_client_and_rangecrit02(tmp_path, monkeypatch):
+    """LEGACY branch (bead .167: roles.critic.station = false): the original
+    .51 assertions — the range client (NOT the verdict client) + rangecrit02."""
     import hashlib
 
     rigs_root = scaffold_rig(tmp_path)
+    _set_charter_critic_section(rigs_root, station=False)
     resolved = resolve_rig(RIG, rigs_root=rigs_root)
     try:
         made = {"range_client": False}
@@ -1790,9 +1836,18 @@ def test_ticket_detail_still_works_unchanged(tmp_path: Path, capsys) -> None:
 # ==========================================================================
 
 
-def _set_charter_critic_section(rigs_root: Path, *, model: str | None = None, max_tokens=None):
+def _set_charter_critic_section(
+    rigs_root: Path,
+    *,
+    model: str | None = None,
+    max_tokens=None,
+    station: bool | None = None,
+):
     """Rewrite the scaffolded rig's charter `[roles.critic]` section
-    (set `model` and/or `max_tokens` when given)."""
+    (set `model` and/or `max_tokens` and/or `station` when given).
+    `station=False` selects the DEPRECATED in-process critic branch (bead
+    .166's rollback lever) — the .143-era tests pin it; the default
+    (station=True) wiring is pinned by the .166 tests."""
     import re as _re
 
     charter_path = rigs_root / RIG / "charter.toml"
@@ -1812,6 +1867,8 @@ def _set_charter_critic_section(rigs_root: Path, *, model: str | None = None, ma
             existing["model"] = f'"{model}"'
         if max_tokens is not None:
             existing["max_tokens"] = str(max_tokens)
+        if station is not None:
+            existing["station"] = "true" if station else "false"
         lines = ["[roles.critic]"]
         for key, value in existing.items():
             lines.append(f"{key} = {value}")
@@ -1829,11 +1886,12 @@ def _set_charter_critic_section(rigs_root: Path, *, model: str | None = None, ma
 
 
 def test_143_daemon_builds_critic_via_oa_factory(tmp_path: Path, monkeypatch) -> None:
-    """`_build_daemon` constructs the critic through
-    `make_oa_critic_client` (NOT the deleted `make_critic_client`),
+    """LEGACY branch (bead .166: `roles.critic.station = false` — the
+    deprecated in-process path): `_build_daemon` constructs the critic
+    through `make_oa_critic_client` (NOT the deleted `make_critic_client`),
     forwarding the charter's `roles.critic.max_tokens` to the factory."""
     rigs_root = scaffold_rig(tmp_path)
-    _set_charter_critic_section(rigs_root, max_tokens=8192)
+    _set_charter_critic_section(rigs_root, max_tokens=8192, station=False)
     recorded: list[dict] = []
 
     def fake_oa_client(**kwargs):
@@ -1867,11 +1925,12 @@ def test_143_daemon_builds_critic_via_oa_factory(tmp_path: Path, monkeypatch) ->
 def test_143_daemon_critic_key_ref_defaults_for_anthropic(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """When the resolved critic entry is Anthropic-routed (the default),
-    the key provider is built from `_CRITIC_KEY_REF` (unchanged) — the
-    `STIGMERGY_CRITIC_OA_KEY_REF` env is NOT consulted (and its absence is not an
-    error)."""
+    """LEGACY branch (bead .166, station=false). When the resolved critic
+    entry is Anthropic-routed (the default), the key provider is built from
+    `_CRITIC_KEY_REF` (unchanged) — the `STIGMERGY_CRITIC_OA_KEY_REF` env is
+    NOT consulted (and its absence is not an error)."""
     rigs_root = scaffold_rig(tmp_path)
+    _set_charter_critic_section(rigs_root, station=False)
     refs: list[str] = []
     monkeypatch.delenv("STIGMERGY_CRITIC_OA_KEY_REF", raising=False)
     monkeypatch.setattr(
@@ -1906,12 +1965,13 @@ def test_143_daemon_critic_key_ref_defaults_for_anthropic(
 def test_143_non_anthropic_critic_entry_requires_key_ref_env(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """A non-Anthropic-routed critic entry (oa_provider_key !=
-    "anthropic") resolves its op ref via `STIGMERGY_CRITIC_OA_KEY_REF`; the env
-    missing -> a LOUD rig-launch failure (the `daemon run` path surfaces
-    it as exit 1 with stderr naming the env var), NOT a first-gate infra
-    trip (Decision 3)."""
+    """LEGACY branch (bead .166, station=false). A non-Anthropic-routed
+    critic entry (oa_provider_key != "anthropic") resolves its op ref via
+    `STIGMERGY_CRITIC_OA_KEY_REF`; the env missing -> a LOUD rig-launch
+    failure (the `daemon run` path surfaces it as exit 1 with stderr naming
+    the env var), NOT a first-gate infra trip (Decision 3)."""
     rigs_root = scaffold_rig(tmp_path)
+    _set_charter_critic_section(rigs_root, station=False)
     # registry: point the critic at a synthetic entry with explicit OA wiring
     models_path = rigs_root / RIG / "models.toml"
     models_path.write_text(
@@ -1948,9 +2008,11 @@ oa_type = "openai"
 def test_143_non_anthropic_critic_key_ref_env_is_used(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """WITH `STIGMERGY_CRITIC_OA_KEY_REF` set, the non-Anthropic entry's key
+    """LEGACY branch (bead .166, station=false). WITH
+    `STIGMERGY_CRITIC_OA_KEY_REF` set, the non-Anthropic entry's key
     provider is built from THAT ref (Decision 3's hook)."""
     rigs_root = scaffold_rig(tmp_path)
+    _set_charter_critic_section(rigs_root, station=False)
     models_path = rigs_root / RIG / "models.toml"
     models_path.write_text(
         models_path.read_text()

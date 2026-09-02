@@ -324,7 +324,7 @@ BASE_CHARTER_TOML = VALID_CHARTER_PATH.read_text()
 def _make_local_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "src_repo"
     (repo / "prompts").mkdir(parents=True)
-    for name in ("code01", "critic01", "critic03", "rangecrit02"):
+    for name in ("code01", "critic01", "critic03", "critic04", "rangecrit02", "rangecrit03"):
         (repo / "prompts" / name).write_text(f"{name} template\n")
     (repo / "README.md").write_text("fixture\n")
     cfg = ["-c", "user.email=test@example.com", "-c", "user.name=T"]
