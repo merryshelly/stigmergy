@@ -20,6 +20,8 @@ assert without a live model:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from stigmergy.critic import (
@@ -388,6 +390,19 @@ def test_unmet_does_not_land_regardless_of_severity():
     unmet_high = Verdict(outcome=Outcome.UNMET, tier=2, reason="no test", severity=Severity.HIGH)
     assert unmet_low.lands() is False
     assert unmet_high.lands() is False
+
+
+def test_outcome_stringified_matches_wire_form():
+    # Bead .162 audit fix (LOW): stringified outcomes must match the wire
+    # form for logs/dashboards — str()/f-strings/`%s` emit "met"/"unmet",
+    # never "Outcome.MET" (the Python >= 3.11 str-enum repr footgun).
+    assert f"{Outcome.MET}" == "met"
+    assert f"{Outcome.UNMET}" == "unmet"
+    assert str(Outcome.MET) == "met"
+    assert "outcome=%s" % Outcome.MET == "outcome=met"
+    # The wire/equality semantics the str mixin promises are unchanged.
+    assert Outcome.MET == "met"
+    assert json.dumps({"outcome": Outcome.MET}) == '{"outcome": "met"}'
 
 
 # --------------------------------------------------------------------------

@@ -8,7 +8,7 @@ decomposer::
     openalph exec --agent stigmergy-decomposer --task-file <task.md>
         --system-prompt-file <prompts_dir>/<prompt artifact>
         --model <qualified critic model> --effort none
-        --tools file_read,glob,grep --submit-schema <schema file>
+        --tools file_read,glob,grep,file_ticket --submit-schema <schema file>
 
 The role lives in a versioned prompt artifact (the system prompt); the
 judged materials are DATA pre-seeded into the station's scratch workspace
@@ -45,7 +45,11 @@ quality rejection (SPEC §9): the gate raises :class:`CriticInfraError`
 (range: :class:`RangeReportError`), the weaver parks the ticket, and the
 existing `.107` per-ticket critic-infra escalation contains a poisoned
 station. Bounded: at most ``_GATE_MAX_ATTEMPTS`` exec attempts per judgment
-(one retry), never a third.
+(one retry), never a third — the budget applies to EXEC-level failures
+(launch/timeout/non-zero/unparseable/no-submit); an INFRA-CLASSIFIED
+episode (non-`done` status / deny_reason / ceiling_trip) surfaces after
+ONE attempt, no retry (bead .162: a re-run cannot fix a denied/capped
+episode, it would only double the cost).
 
 **Grounding requirement (D18d):** every verdict carries an `evidence_log`
 (one entry per grounding: claim checked / method / found). A payload
@@ -68,7 +72,6 @@ from typing import Any
 from stigmergy.critic import (
     STANDING_RUBRIC_ITEM,
     CriticInfraError,
-    _extract_filed_tickets,
     _parse_verdict,
 )
 from stigmergy.decompose import (
@@ -105,7 +108,7 @@ STATION_AGENT_TOML = Path("/etc/openalph/agents/stigmergy-decomposer.toml")
 
 # Read-only grounding tools. No shell, no write tools, ever (D18: critics
 # are grounded agents; the repository is read-only to them by design).
-STATION_TOOLS = "file_read,glob,grep"
+STATION_TOOLS = "file_read,glob,grep,file_ticket"
 
 # 600s (not the decomposer's 1800s): the staging gate runs on the SERIALIZED
 # weaver — 2 attempts x 30min could hold a weave for an hour. A grounded
@@ -154,15 +157,6 @@ def _evidence_log_schema() -> dict[str, Any]:
             "only when the materials alone decided everything."
         ),
     }
-
-
-def _filed_tickets_schema() -> dict[str, Any]:
-    """The D14 ``filed_tickets`` channel, KEPT TOLERANT (an array of
-    objects, items unvalidated): `filing.file_proposals` is the single
-    item-shape validation authority and emits per-item `bad-shape` audit
-    events. Do not half-fix the shape here — the real fix is the
-    strict-schema `file_ticket` builtin (bead .162)."""
-    return {"type": "array", "items": {"type": "object"}}
 
 
 _SUBMIT_VERDICT_SCHEMA: dict[str, Any] = {
@@ -217,7 +211,11 @@ _SUBMIT_VERDICT_SCHEMA: dict[str, Any] = {
                 ),
             },
             "evidence_log": _evidence_log_schema(),
-            "filed_tickets": _filed_tickets_schema(),
+            # bead .162: filings moved OUT of the terminal payload into the
+            # file_ticket tool channel — harvested from the exec envelope's
+            # top-level `filed_proposals` (machine-assembled by the OA
+            # handler from validated calls), so this terminal schema no
+            # longer carries a `filed_tickets` field.
         },
         "required": [
             "outcome",
@@ -225,7 +223,6 @@ _SUBMIT_VERDICT_SCHEMA: dict[str, Any] = {
             "reason",
             "severity",
             "evidence_log",
-            "filed_tickets",
         ],
     },
 }
@@ -251,11 +248,55 @@ _SUBMIT_RANGE_REVIEW_SCHEMA: dict[str, Any] = {
                 ),
             },
             "evidence_log": _evidence_log_schema(),
-            "filed_tickets": _filed_tickets_schema(),
+            # bead .162: filings moved OUT of the terminal payload into the
+            # file_ticket tool channel — harvested from the exec envelope's
+            # top-level `filed_proposals` (machine-assembled by the OA
+            # handler from validated calls), so this terminal schema no
+            # longer carries a `filed_tickets` field.
         },
-        "required": ["text", "evidence_log", "filed_tickets"],
+        "required": ["text", "evidence_log"],
     },
 }
+
+
+class _InfraEpisode(Exception):
+    """Internal marker: the exec completed and its result classifies as an
+    INFRA episode (non-`done` status / deny_reason / ceiling_trip).
+
+    Raised by :func:`_classify_station_exec` to distinguish an INFRA
+    CLASSIFICATION (the model's episode finished; a re-run cannot fix a bad
+    status/deny/ceiling — it would just double the cost) from an exec-level
+    failure (launch/timeout/nonzero/unparseable/no-submit), which shares the
+    bounded retry budget at the caller. The attempt loop re-raises it as the
+    caller's ``error`` type WITHOUT consuming an attempt (bead .162: infra
+    classification does not retry — v1).
+
+    Carries the envelope's accepted filings (``filed_proposals`` — the
+    tolerant harvest, never raises) and a BOUNDED ``tool_trace`` so the
+    caller can salvage them onto the surfaced ``error`` BEFORE raising:
+    filings accepted during an infra episode are the highest-value
+    discoveries the loop has (they surface most often exactly near cap /
+    deny / ceiling trouble), and dropping them with no trace is the silent-
+    loss failure mode this channel exists to kill (audit .162 HIGH).
+    Salvage is additive — the verdict semantics are unchanged: the caller
+    still raises ``error``; the attributes only make the carry auditable
+    and recoverable downstream (the weaver files them through its normal
+    critic-filing path before the gate-infra death).
+    """
+
+    filed_proposals: list[dict[str, Any]]
+    tool_trace: list[dict[str, Any]]
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        filed_proposals: list[dict[str, Any]] | None = None,
+        tool_trace: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.filed_proposals = list(filed_proposals) if filed_proposals else []
+        self.tool_trace = list(tool_trace) if tool_trace else []
 
 
 def _classify_station_exec(
@@ -266,19 +307,27 @@ def _classify_station_exec(
     `decompose._classify_critic_exec`).
 
     The exec result's top-level ``result`` field (the OA terminal-tool
-    mechanism) IS the terminal payload. Failure classes (all raised as
-    ``error`` — :class:`CriticInfraError` for the gate,
-    :class:`RangeReportError` for the range — and sharing ONE retry budget
-    with the exec-failure classes at the caller):
+    mechanism) IS the terminal payload. Failure classes:
 
-    - non-zero exit = exec failure;
-    - unparseable stdout = exec failure;
-    - non-`done` status / deny_reason / ceiling_trip = exec failure;
+    exec-level failures (raised as ``error`` — :class:`CriticInfraError` for
+    the gate, :class:`RangeReportError` for the range — and sharing ONE
+    retry budget with the launch/timeout failures at the caller):
+
+    - non-zero exit;
+    - unparseable stdout;
     - a `done` exec with NO ``result`` field = the model never submitted =
       a station failure (not an exec failure, not a verdict);
     - a non-dict ``result`` = contract violation.
 
-    Returns ``{"payload": dict, "usage": 4-key dict, "tool_trace": raw}``.
+    infra-classified episode (raised as :class:`_InfraEpisode`; the caller
+    surfaces it WITHOUT retrying — a bad status/deny/ceiling cannot be
+    fixed by re-running the same episode):
+
+    - non-`done` status / deny_reason / ceiling_trip.
+
+    Returns ``{"payload": dict, "usage": 4-key dict, "tool_trace": raw,
+    "filed_proposals": list}`` — the envelope's top-level ``filed_proposals``
+    is harvested tolerantly (absent / non-list -> ``[]``; never raises).
     """
     if result.returncode != 0:
         raise error(
@@ -302,10 +351,27 @@ def _classify_station_exec(
         )
     usage = _map_usage(obj.get("usage"))
     if obj.get("status") != "done" or obj.get("deny_reason") or obj.get("ceiling_trip"):
-        raise error(
+        # An INFRA CLASSIFICATION, not an exec failure: the episode ran to
+        # its (denied/capped/non-done) conclusion — surfacing without retry
+        # (the caller re-raises as `error` after ONE attempt).
+        #
+        # Salvage the accepted filings BEFORE raising: an infra episode's
+        # per-run sink may already hold accepted file_ticket calls (cap /
+        # deny / ceiling trouble is exactly when filings cluster most). The
+        # tolerant harvest runs on the envelope here (absent / non-list ->
+        # []), never raising — the same never-raises posture as the done-
+        # path harvest below. The caller attaches both onto the surfaced
+        # `error` (station_filed_proposals / station_tool_trace).
+        filed_proposals = obj.get("filed_proposals")
+        if not isinstance(filed_proposals, list):
+            filed_proposals = []
+        raw_trace = obj.get("tool_trace")
+        raise _InfraEpisode(
             "station critic exec failure (status="
             f"{obj.get('status')!r}, deny_reason={obj.get('deny_reason')!r}, "
-            f"ceiling_trip={obj.get('ceiling_trip')!r})"
+            f"ceiling_trip={obj.get('ceiling_trip')!r})",
+            filed_proposals=filed_proposals,
+            tool_trace=bound_tool_trace(raw_trace),
         )
     payload = obj.get("result")
     if not isinstance(payload, dict):
@@ -314,7 +380,20 @@ def _classify_station_exec(
             f"station critic submitted no result (the {tool} terminal tool "
             "was never called)"
         )
-    return {"payload": payload, "usage": usage, "tool_trace": obj.get("tool_trace")}
+    # bead .162: accepted file_ticket filings ride the exec envelope as a
+    # top-level `filed_proposals` list (machine-assembled by the OA handler
+    # from already-validated tool calls — never model-generated payload).
+    # Tolerant harvest: absent or non-list -> [] (never raises — the same
+    # never-raises posture as filing.harvest_worker_filings).
+    filed_proposals = obj.get("filed_proposals")
+    if not isinstance(filed_proposals, list):
+        filed_proposals = []
+    return {
+        "payload": payload,
+        "usage": usage,
+        "tool_trace": obj.get("tool_trace"),
+        "filed_proposals": filed_proposals,
+    }
 
 
 def _run_station_exec_attempts(
@@ -327,10 +406,13 @@ def _run_station_exec_attempts(
     error: type[Exception],
 ) -> tuple[dict[str, Any], int]:
     """Run the station exec with the bounded retry budget: at most
-    ``_GATE_MAX_ATTEMPTS`` attempts, ONE retry, never a third. Exec
-    failures (launch error, timeout, non-done, unparseable, no-submit) all
-    share the budget. Returns ``(classified, attempts_used)``; raises
-    ``error`` on exhaustion."""
+    ``_GATE_MAX_ATTEMPTS`` attempts, ONE retry, never a third. Exec-level
+    failures (launch error, timeout, non-zero exit, unparseable stdout,
+    no-submit) share the budget. An infra-classified episode (non-`done`
+    status / deny_reason / ceiling_trip) does NOT retry — it surfaces as
+    ``error`` immediately (bead .162). Returns ``(classified,
+    attempts_used)``; raises ``error`` on exhaustion or infra
+    classification."""
     last_err: str | None = None
     attempts_used = 0
     for _attempt in range(_GATE_MAX_ATTEMPTS):
@@ -345,6 +427,19 @@ def _run_station_exec_attempts(
             continue
         try:
             classified = _classify_station_exec(result, tool=tool, error=error)
+        except _InfraEpisode as exc:
+            # The exec completed and its result classifies as an INFRA
+            # episode (bad status/deny/ceiling): NO retry — a re-run cannot
+            # fix it (the .162 no-retry infra classification; v1).
+            # The surfaced error carries the envelope's accepted filings +
+            # bounded trace (audit .162 HIGH: salvage before raising — the
+            # caller, e.g. the weaver's gate-infra catch, can file them
+            # through the normal path). Verdict semantics unchanged: `error`
+            # is still raised; these are attributes, not a verdict.
+            surf = error(str(exc))
+            surf.station_filed_proposals = exc.filed_proposals
+            surf.station_tool_trace = exc.tool_trace
+            raise surf from exc
         except error as exc:  # type: ignore[misc]
             last_err = str(exc)
             continue
@@ -388,6 +483,8 @@ class StationGateCritic:
         model: str,
         prompts_dir: str | Path,
         prompt_name: str = "critic04",
+        max_filings: int = 8,  # bead .162: file_ticket filing cap -> child env
+        effort: str = "none",  # SB steer 2026-09-02: reasoning on the judge seat
         agent: str = STATION_AGENT,
         exec_fn: Callable[[list[str], dict[str, str], float], subprocess.CompletedProcess]
         | None = None,
@@ -400,6 +497,8 @@ class StationGateCritic:
         self._model = _resolve_critic_model(registry, model)
         self._prompts_dir = Path(prompts_dir)
         self._prompt_name = prompt_name
+        self._max_filings = max_filings
+        self._effort = effort
         prompt_path = self._prompts_dir / prompt_name
         if not prompt_path.is_file():
             raise CriticOAUnavailableError(
@@ -602,13 +701,14 @@ class StationGateCritic:
             "--model",
             self._model,
             "--effort",
-            "none",
+            self._effort,
             "--tools",
             STATION_TOOLS,
             "--submit-schema",
             str(schema_path),
         ]
         env = _build_child_env()
+        env["FILE_TICKET_MAX_FILINGS"] = str(self._max_filings)
 
         classified, attempts_used = _run_station_exec_attempts(
             argv=argv,
@@ -632,6 +732,40 @@ class StationGateCritic:
                 "not auditable)"
             )
 
+        # bead .162: filings come from the exec ENVELOPE (top-level
+        # `filed_proposals`), harvested by _classify_station_exec — NOT from
+        # the terminal payload (the old D14 payload channel is gone).
+        filed_tickets = classified["filed_proposals"]
+
+        # Lost-batch tripwire (bead .162): a file_ticket call batched WITH
+        # the terminal call is not executed (OA terminal-turn semantics), so
+        # it never reaches the envelope. batch-lost = ONLY trace entries the
+        # terminal turn ended before executing — `name == "file_ticket"` AND
+        # `executed is False` (an absent `executed` key is treated as
+        # executed, hence NOT counted). Healthy rejections
+        # (is_error=True, executed=True) are the steering loop WORKING —
+        # the model was rejected and retried — and never count as losses;
+        # counting them (the old "every file_ticket call minus delivered"
+        # arithmetic) trained operators to ignore the tripwire on exactly
+        # the retry traffic the design promotes (audit .162: the metric
+        # must measure batch loss, not rejection traffic). The count is
+        # NOT reduced by delivered filings: a not-executed call by
+        # definition delivered nothing, so subtracting delivered counts
+        # could only mask a genuine batched loss (a lost call balancing
+        # against an unrelated delivered filing in the same episode).
+        # Bounded observability, no behavior change.
+        trace = classified["tool_trace"]
+        file_ticket_not_executed = 0
+        if isinstance(trace, list):
+            for entry in trace:
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("name") == "file_ticket"
+                    and entry.get("executed") is False
+                ):
+                    file_ticket_not_executed += 1
+        filings_lost_batch = file_ticket_not_executed
+
         gate_fields: dict[str, Any] = {
             "prompt_artifact_hash": self.prompt_artifact_hash,
             "model": self._model,
@@ -646,8 +780,8 @@ class StationGateCritic:
                 "prompt": self._prompt_name,
             },
             "station_attempts": attempts_used,
+            "filings_lost_batch": filings_lost_batch,
         }
-        filed_tickets = _extract_filed_tickets(payload)
         return verdict, gate_fields, filed_tickets
 
 
@@ -672,6 +806,8 @@ class StationRangeCritic:
         model: str,
         prompts_dir: str | Path,
         prompt_name: str = "rangecrit03",
+        max_filings: int = 8,  # bead .162: file_ticket filing cap -> child env
+        effort: str = "none",  # SB steer 2026-09-02: reasoning on the judge seat
         grounding_repo: str | Path,
         agent: str = STATION_AGENT,
         exec_fn: Callable[[list[str], dict[str, str], float], subprocess.CompletedProcess]
@@ -685,6 +821,8 @@ class StationRangeCritic:
         self._model = _resolve_critic_model(registry, model)
         self._prompts_dir = Path(prompts_dir)
         self._prompt_name = prompt_name
+        self._max_filings = max_filings
+        self._effort = effort
         prompt_path = self._prompts_dir / prompt_name
         if not prompt_path.is_file():
             raise CriticOAUnavailableError(
@@ -779,13 +917,14 @@ class StationRangeCritic:
             "--model",
             self._model,
             "--effort",
-            "none",
+            self._effort,
             "--tools",
             STATION_TOOLS,
             "--submit-schema",
             str(schema_path),
         ]
         env = _build_child_env()
+        env["FILE_TICKET_MAX_FILINGS"] = str(self._max_filings)
 
         # attempts_used has no surface on the advisory RangeCriticResult; the
         # bounded budget still applies inside _run_station_exec_attempts.
@@ -812,9 +951,10 @@ class StationRangeCritic:
                 "(Decision 18: a review without its grounding recorded is "
                 "not auditable)"
             )
-        filed_tickets = payload.get("filed_tickets")
-        if not isinstance(filed_tickets, list):
-            filed_tickets = []
+        # bead .162: filings come from the exec ENVELOPE (top-level
+        # `filed_proposals`), harvested by _classify_station_exec — NOT from
+        # the terminal payload (the old D14 payload channel is gone).
+        filed_tickets = classified["filed_proposals"]
         return RangeCriticResult(
             findings=text,
             filed_tickets=filed_tickets,

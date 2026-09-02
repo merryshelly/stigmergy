@@ -162,6 +162,23 @@ class ModelConfig:
 class Budgets:
     output_tokens: int  # <- charter [loop.dispatch_limits].output_tokens
     driver_turns: int  # <- charter [loop.dispatch_limits].driver_turns; also --max-turns
+    # <- charter [loop.dispatch_limits].filed_tickets (bead .162): the
+    # file_ticket tool-side filing cap, threaded to the cage env so the tool
+    # cap EQUALS the harvest-side count-cap — a tool cap above the harvest
+    # cap would let a diligent worker file N good proposals the harvest then
+    # whole-batch-rejects. Optional with the OA BUILTIN default so stub
+    # Budgets in older tests stay valid.
+    max_filings: int = 8
+    # <- charter [loop.dispatch_limits].filed_ticket_bytes (bead .162): the
+    # per-filing tool-side byte cap, threaded to the cage env as
+    # FILE_TICKET_MAX_BYTES so the tool rejects an over-size filing at CALL
+    # time (steering the model to shrink + re-file) instead of acking it
+    # and having the harvest silently drop the item as size-cap-exceeded.
+    # None (the default) = the env var is NOT set in the cage: the OA tool
+    # then applies no size check at call time and the harvest-side
+    # size-cap remains the backstop — matching the OA tool default.
+    # Optional so stub Budgets in older tests stay valid.
+    max_filing_bytes: int | None = None
 
 
 @dataclass(frozen=True)

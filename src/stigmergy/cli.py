@@ -402,11 +402,16 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
     # DEPRECATED in-process forced-tool path — the rollback lever during
     # the .166 migration, kept until the station path is adjudicated on a
     # real rig.
+    dispatch_limits = charter.raw["loop"]["dispatch_limits"]
     if critic_cfg.get("station", True):
         critic = StationGateCritic(
             registry=registry,
             model=critic_cfg["model"],
             prompts_dir=rig_paths["prompts_dir"],
+            # bead .162: the file_ticket filing cap rides to the station
+            # child env from the SAME charter source the weaver's harvest
+            # backstop reads below (dispatch_limits).
+            max_filings=dispatch_limits["filed_tickets"],
         )
     else:
         # DEPRECATED in-process fallback (bead .166 rollback lever).
@@ -437,7 +442,6 @@ def _build_daemon(resolved: ResolvedRig) -> Daemon:
             model=critic_cfg["model"],
             decoding_params={},
         )
-    dispatch_limits = charter.raw["loop"]["dispatch_limits"]
     weaver = Weaver(
         store=store,
         record_plane=record_plane,
@@ -1185,6 +1189,10 @@ def _build_range_critic(resolved: ResolvedRig) -> Any:
             model=critic_cfg["model"],
             prompts_dir=resolved.rig_paths["prompts_dir"],
             grounding_repo=resolved.rig_paths["repo_root"],
+            # bead .162: the file_ticket filing cap rides to the station
+            # child env from the SAME charter source the range-report
+            # harvest backstop reads (loop.dispatch_limits).
+            max_filings=charter.raw["loop"]["dispatch_limits"]["filed_tickets"],
         )
     # DEPRECATED in-process fallback (bead .167 rollback lever).
     # `.51` fix: wires `make_oa_range_critic_client` (NOT the verdict

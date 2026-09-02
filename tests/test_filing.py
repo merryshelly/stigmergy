@@ -318,6 +318,134 @@ def test_proposal_missing_required_key_rejected(tmp_path, store, plane):
     assert any(r["reason"] for r in result.rejected)
 
 
+# === six-field shape authority (bead .162 audit fix) =========================
+# The ingest is the single validation authority for the SIX contract fields —
+# the daemon routes worker-escape on blocks_ticket /
+# suspected_out_of_scope_paths, so their types must be validated here, not
+# only at the OA tool's call-time layer. Violations are per-item `bad-shape`
+# rejections (isolation preserved; NEVER whole-batch).
+
+
+def test_blocks_ticket_string_rejected_bad_shape_siblings_accepted(tmp_path, store, plane):
+    # blocks_ticket="yes" (a truthy STRING) must not persist — it is the
+    # misroute garbage the shape authority exists to keep out of the DB.
+    # Per-item isolation: the well-typed sibling still files.
+    worktree = tmp_path / "work"
+    bad = valid_proposal(1, blocks_ticket="yes")
+    good = valid_proposal(2)
+    seed_filings_file(worktree, [bad, good])
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert result.accepted_ids == [f"filed-worker-{DISPATCH_ID}-2"]
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+    assert result.rejected[0]["title"] == bad["title"]
+    filed = store.list_filed_tickets()
+    assert {r["title"] for r in filed} == {good["title"]}
+    rej_events = [e for e in filed_events(plane) if e["outcome"] == "rejected"]
+    assert [e["reason"] for e in rej_events] == ["bad-shape"]
+    # No escape surfacing from a string-typed blocks_ticket (is True fails).
+    assert result.escape is None
+
+
+def test_blocks_ticket_none_explicit_is_absent_semantics(tmp_path, store, plane):
+    # An EXPLICIT blocks_ticket=None is absent-semantics (bool-or-absent):
+    # accepted, and it does not surface as escape.
+    worktree = tmp_path / "work"
+    seed_filings_file(worktree, [valid_proposal(1, blocks_ticket=None)])
+    result = harvest(worktree, store, plane)
+    assert len(result.accepted_ids) == 1
+    assert result.rejected == []
+    assert result.escape is None
+
+
+def test_suspected_paths_string_rejected_bad_shape(tmp_path, store, plane):
+    # suspected_out_of_scope_paths="x.py" (a string, not a list of strings)
+    # is a per-item bad-shape rejection; the sibling still files.
+    worktree = tmp_path / "work"
+    bad = valid_proposal(1, suspected_out_of_scope_paths="x.py")
+    good = valid_proposal(2)
+    seed_filings_file(worktree, [bad, good])
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+    assert result.rejected[0]["title"] == bad["title"]
+    assert result.escape is None
+
+
+def test_suspected_paths_list_with_non_string_rejected_bad_shape(tmp_path, store, plane):
+    # A list containing a non-string element is still not list[str].
+    worktree = tmp_path / "work"
+    bad = valid_proposal(1, suspected_out_of_scope_paths=["x.py", 42])
+    good = valid_proposal(2)
+    seed_filings_file(worktree, [bad, good])
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+
+
+def test_reason_non_string_rejected_bad_shape(tmp_path, store, plane):
+    # reason=42 (not str-or-absent) is a per-item bad-shape rejection; the
+    # sibling still files.
+    worktree = tmp_path / "work"
+    bad = valid_proposal(1, reason=42)
+    good = valid_proposal(2)
+    seed_filings_file(worktree, [bad, good])
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+    assert result.rejected[0]["title"] == bad["title"]
+
+
+def test_valid_escape_filing_still_accepted_and_routed(tmp_path, store, plane):
+    # A well-typed escape filing (blocks_ticket=True + a list-of-str paths +
+    # a str reason) is STILL accepted and STILL surfaces via the harvest's
+    # escape routing (.102.2 contract): the typed validation must not break
+    # the escape path.
+    worktree = tmp_path / "work"
+    escape_obj = valid_proposal(
+        1,
+        blocks_ticket=True,
+        reason="worker hit an out-of-scope dependency",
+        suspected_out_of_scope_paths=["tests/test_bar.py", "src/lib/other.py"],
+    )
+    normal_obj = valid_proposal(2)
+    seed_filings_file(worktree, [escape_obj, normal_obj])
+
+    result = harvest(worktree, store, plane)
+
+    assert result.rejected == []
+    assert len(result.accepted_ids) == 2  # BOTH filed, including the escape
+    assert result.escape is not None
+    assert result.escape["reason"] == "worker hit an out-of-scope dependency"
+    assert result.escape["suspected_out_of_scope_paths"] == [
+        "tests/test_bar.py",
+        "src/lib/other.py",
+    ]
+
+
+def test_unknown_extra_keys_not_rejected(tmp_path, store, plane):
+    # Unknown extra keys are NOT rejected: the store insert takes named
+    # fields only (the extras never reach the DB) and proposal_hash hashes
+    # the three provenance keys only.
+    worktree = tmp_path / "work"
+    seed_filings_file(worktree, [valid_proposal(1, priority="high", approved=True)])
+    result = harvest(worktree, store, plane)
+    assert len(result.accepted_ids) == 1
+    assert result.rejected == []
+    row = store.list_filed_tickets()[0]
+    # The row carries the named fields only — the extras did not persist.
+    assert row["title"] == valid_proposal(1)["title"]
+    assert "priority" not in row
+
+
 def test_path_traversal_symlink_rejected(tmp_path, store, plane):
     worktree = tmp_path / "work"
     (worktree / ".stigmergy").mkdir(parents=True)
@@ -572,15 +700,24 @@ def test_escape_first_wins(tmp_path, store, plane):
 def test_escape_malformed_never_raises(tmp_path, store, plane):
     """Malformed escape fields are defensively handled and harvest never
     raises. blocks_ticket as string does not match (is True); paths as string
-    coerced to []; reason as non-str coerced to None."""
+    coerced to []; reason as non-str coerced to None. Bead .162 audit fix:
+    these malformed items are ALSO per-item `bad-shape` rejections at the
+    shape authority (the escape COERCION above is harvest-side escape-object
+    building; the item itself no longer persists)."""
     worktree = tmp_path / "work"
 
-    # blocks_ticket="true" (string, not bool) — does not match
+    # blocks_ticket="true" (string, not bool) — does not match AND the item
+    # is a per-item bad-shape rejection (a truthy string is the misroute
+    # garbage the shape authority exists to keep out of the DB).
     seed_filings_file(worktree, [valid_proposal(1, blocks_ticket="true")])
     result = harvest(worktree, store, plane, ctx=dispatch_ctx(dispatch_id="d1"))
     assert result.escape is None
+    assert result.accepted_ids == []
+    assert [r["reason"] for r in result.rejected] == ["bad-shape"]
 
-    # blocks_ticket=True but suspected_out_of_scope_paths is a string
+    # blocks_ticket=True but suspected_out_of_scope_paths is a string —
+    # escape coercion still yields [] (never raises), and the item is a
+    # per-item bad-shape rejection.
     store2 = RigStore.create(tmp_path / "tickets2.db")
     plane2 = RecordPlane(tmp_path / "records2")
     obj2 = valid_proposal(1, blocks_ticket=True, suspected_out_of_scope_paths="not-a-list")
@@ -588,9 +725,12 @@ def test_escape_malformed_never_raises(tmp_path, store, plane):
     result2 = harvest(worktree, store2, plane2, ctx=dispatch_ctx(dispatch_id="d2"))
     assert result2.escape is not None
     assert result2.escape["suspected_out_of_scope_paths"] == []
+    assert result2.accepted_ids == []
+    assert [r["reason"] for r in result2.rejected] == ["bad-shape"]
     store2.close()
 
-    # blocks_ticket=True but reason is non-str
+    # blocks_ticket=True but reason is non-str — escape coercion still yields
+    # None, and the item is a per-item bad-shape rejection.
     store3 = RigStore.create(tmp_path / "tickets3.db")
     plane3 = RecordPlane(tmp_path / "records3")
     obj3 = valid_proposal(1, blocks_ticket=True, reason=123)
@@ -598,6 +738,8 @@ def test_escape_malformed_never_raises(tmp_path, store, plane):
     result3 = harvest(worktree, store3, plane3, ctx=dispatch_ctx(dispatch_id="d3"))
     assert result3.escape is not None
     assert result3.escape["reason"] is None
+    assert result3.accepted_ids == []
+    assert [r["reason"] for r in result3.rejected] == ["bad-shape"]
     store3.close()
 
 

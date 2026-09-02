@@ -535,6 +535,40 @@ class Weaver:
                     artifact, rubric_items, **judge_kwargs
                 )
             except CriticInfraError as exc:
+                # Bead .162 audit fix (HIGH): an infra-classified station
+                # episode may carry ACCEPTED filings harvested from the exec
+                # envelope (the station attaches them onto the exception —
+                # `station_filed_proposals`). Salvage them through the SAME
+                # filing path the success path uses BEFORE the gate-infra
+                # death: cap/deny/ceiling trouble is exactly when filings
+                # cluster most, and the .107 escalation may never re-run
+                # this gate — dropping the carry with no record-plane trace
+                # is the silent-loss failure mode the filing channel exists
+                # to kill. The salvage is strictly best-effort and can NEVER
+                # alter the infra flow: _file_critic_proposals is
+                # contracted to swallow every filing-side exception, and
+                # the getattr default (None for a bare CriticInfraError
+                # without the attributes — e.g. the legacy in-process
+                # critic) short-circuits to the original death path
+                # unchanged.
+                salvaged = getattr(exc, "station_filed_proposals", None)
+                if isinstance(salvaged, list) and salvaged:
+                    try:
+                        self._file_critic_proposals(ctx, salvaged)
+                    except Exception:  # noqa: BLE001 — salvage is best-effort
+                        # _file_critic_proposals already swallows
+                        # file_proposals failures (logged); this outer belt
+                        # covers everything else (ctx construction, ...) so
+                        # a salvage failure can NEVER alter the infra flow:
+                        # log and continue to the original gate-infra death.
+                        _logger.warning(
+                            "critic filing SALVAGE failed for dispatch %s "
+                            "(ticket %s) — continuing to the gate-infra "
+                            "death path unchanged",
+                            ctx.get("dispatch_id"),
+                            ctx.get("ticket"),
+                            exc_info=True,
+                        )
                 return self._die(
                     ticket_id=ticket_id,
                     dispatch_id=dispatch_id,
@@ -1328,8 +1362,15 @@ class Weaver:
             # exception here (after the GATE event, before disposition) must
             # never strand the weave at GATED. Filing is strictly additive:
             # losing a filing is acceptable; crashing the writer is not.
+            # NOTE: this is a BULK-abort signal, not a "nothing landed"
+            # verdict — file_proposals commits per-item, so any filings
+            # accepted BEFORE the exception persist in filed_tickets with
+            # their ACCEPTED events.
             _logger.warning(
-                "critic filing failed for dispatch %s (ticket %s)",
+                "critic filing aborted for dispatch %s (ticket %s) — partial "
+                "acceptance is possible: filings already accepted this batch "
+                "persist; inspect the record plane (ticket-filed events) for "
+                "what landed",
                 ctx.get("dispatch_id"),
                 ctx.get("ticket"),
                 exc_info=True,

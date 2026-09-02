@@ -126,6 +126,34 @@ def _emit(
 
 
 def _is_valid_shape(proposal: Any) -> bool:
+    """The single ingest-side shape authority for the SIX contract fields
+    (audit .162 HIGH: the daemon routes worker-escape on
+    `blocks_ticket` / `suspected_out_of_scope_paths`, so the ingest — not
+    just the OA tool's call-time defense-in-depth — must validate their
+    types before anything persists):
+
+    - `title` / `description`: non-empty str (required);
+    - `evidence`: str-or-absent;
+    - `blocks_ticket`: bool-or-absent — the .102.2 escape route keys on
+      `is True`, and a truthy STRING ("yes"/"true") is exactly the
+      misroute garbage the audit named;
+    - `suspected_out_of_scope_paths`: list-of-str-or-absent;
+    - `reason`: str-or-absent.
+
+    Per-item isolation is preserved by the caller: a violation rejects ONLY
+    the offending item (`bad-shape`), never the whole batch, and an
+    escape-shaped item (`blocks_ticket is True`) still surfaces via
+    `harvest_worker_filings`' escape routing when its other fields are
+    well-typed.
+
+    Unknown EXTRA keys are deliberately NOT rejected: the store insert
+    takes NAMED fields only (`RigStore.add_filed_ticket`), so extra keys
+    never reach the DB, and :func:`proposal_hash` hashes only the three
+    provenance keys (`title`/`description`/`evidence`), so they don't
+    perturb provenance either — the raw dict's only whole-shape consumers
+    are the size-cap byte count and the raw-hash of the per-item rejection
+    event.
+    """
     if not isinstance(proposal, dict):
         return False
     title = proposal.get("title")
@@ -136,6 +164,18 @@ def _is_valid_shape(proposal: Any) -> bool:
         return False
     evidence = proposal.get("evidence")
     if evidence is not None and not isinstance(evidence, str):
+        return False
+    blocks_ticket = proposal.get("blocks_ticket")
+    if blocks_ticket is not None and not isinstance(blocks_ticket, bool):
+        return False
+    suspected_paths = proposal.get("suspected_out_of_scope_paths")
+    if suspected_paths is not None and not (
+        isinstance(suspected_paths, list)
+        and all(isinstance(p, str) for p in suspected_paths)
+    ):
+        return False
+    reason = proposal.get("reason")
+    if reason is not None and not isinstance(reason, str):
         return False
     return True
 

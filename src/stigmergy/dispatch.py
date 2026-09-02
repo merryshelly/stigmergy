@@ -661,7 +661,22 @@ def prepare_dispatch(
         )
     # Same claude_code.Budgets type for BOTH drivers (spec §4.2: output_tokens
     # + driver_turns feed the driver's ceilings / --max-turns identically).
-    budgets = claude_code.Budgets(output_tokens=output_tokens, driver_turns=driver_turns)
+    # max_filings (bead .162): the charter filing cap rides Budgets into the
+    # openalph-exec cage env so the in-cage file_ticket tool cap equals the
+    # harvest-side count-cap. max_filing_bytes: the charter per-filing byte
+    # cap rides the SAME Budgets into the cage env (FILE_TICKET_MAX_BYTES)
+    # so the tool size-checks at call time, matching the harvest-side
+    # size-cap. Both keys are REQUIRED on a validated charter (charter.py
+    # validates them as positive ints — DEFAULT_CHARTER carries
+    # 5 / 16384), so they are read STRICTLY like filed_tickets (no .get
+    # fallback — a missing key is a charter-validation failure, not a
+    # silent tool>harvest cap drift).
+    budgets = claude_code.Budgets(
+        output_tokens=output_tokens,
+        driver_turns=driver_turns,
+        max_filings=int(dispatch_limits["filed_tickets"]),
+        max_filing_bytes=int(dispatch_limits["filed_ticket_bytes"]),
+    )
 
     return DispatchPlan(
         dispatch_id=dispatch_id,

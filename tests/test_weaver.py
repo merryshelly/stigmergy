@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from stigmergy.checks import CheckOutcome, CheckResources, CheckResult
+from stigmergy.critic import CriticInfraError
 from stigmergy.records import RecordPlane
 from stigmergy.rig import RigStore
 from stigmergy.statemachine import GATED, LANDED, PARKED, REJECTED, FailureClass
@@ -1299,6 +1300,89 @@ def test_critic_infra_files_nothing(tmp_path, store, plane):
     assert result.outcome == "infra"
     assert store.list_filed_tickets() == []  # no verdict -> no filings
     assert ticket_filed_events(plane, "t4") == []
+
+
+def test_critic_infra_salvages_carried_filings_and_still_dies(tmp_path, store, plane):
+    # Bead .162 audit fix (HIGH): a station infra episode raises
+    # CriticInfraError with the envelope's accepted filings attached
+    # (station_filed_proposals). The weaver salvages them through the SAME
+    # filing path as the success path (origin_role="critic") BEFORE dying:
+    # outcome is STILL "infra", the ticket returns to parked, no GATE
+    # event — verdict semantics unchanged; only the carry no longer
+    # vanishes without a record-plane trace.
+    class SalvageCritic:
+        def judge(self, artifact, rubric_items, *, check_evidence=None, rename_evidence=None):
+            exc = CriticInfraError("station critic exec failure (status='infra')")
+            exc.station_filed_proposals = [dict(t) for t in _CRITIC_FILINGS]
+            raise exc
+
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-salvage", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t-salvage", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=SalvageCritic(),
+    )
+    result = weaver.weave(now=1000.0)[0]
+
+    # The gate still dies INFRA — salvage never turns infra into a verdict.
+    assert result.outcome == "infra"
+    assert result.reason == "critic-infra"
+    assert store.get_ticket("t-salvage")["state"] == PARKED
+    # ...but the carried filings were filed through the normal critic path.
+    filed = store.list_filed_tickets(triaged=False)
+    assert len(filed) == len(_CRITIC_FILINGS)
+    assert {f["title"] for f in filed} == {t["title"] for t in _CRITIC_FILINGS}
+    for row in filed:
+        assert row["origin_role"] == "critic"
+    filings = ticket_filed_events(plane, "t-salvage")
+    assert len(filings) == len(_CRITIC_FILINGS)
+    assert all(ev["outcome"] == "accepted" for ev in filings)
+    # No GATE event (no verdict was ever produced).
+    assert gate_events(plane, "t-salvage") == []
+
+
+def test_critic_infra_salvage_failure_never_alters_infra_flow(
+    tmp_path, store, plane, monkeypatch
+):
+    # The salvage is strictly best-effort: a filing-side failure while
+    # salvaging a carried batch must NEVER alter the gate-infra death
+    # (log + continue to the original death path).
+    import stigmergy.weaver as weaver_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("salvage filing blew up")
+
+    monkeypatch.setattr(weaver_mod, "file_proposals", boom)
+
+    class SalvageCritic:
+        def judge(self, artifact, rubric_items, *, check_evidence=None, rename_evidence=None):
+            exc = CriticInfraError("station critic exec failure (status='infra')")
+            exc.station_filed_proposals = [dict(t) for t in _CRITIC_FILINGS]
+            raise exc
+
+    staging_repo = make_staging_repo(tmp_path)
+    bundle = make_bundle(tmp_path, staging_repo, name="t-salvage-fail", files={"feature.txt": "x\n"})
+    add_parked_ticket(store, "t-salvage-fail", work_product=bundle)
+
+    weaver = make_weaver(
+        tmp_path,
+        store,
+        plane,
+        staging_repo,
+        run_checks_fn=FakeRunChecks([green_result()]),
+        critic=SalvageCritic(),
+    )
+    result = weaver.weave(now=1000.0)[0]  # must NOT raise
+
+    assert result.outcome == "infra"
+    assert result.reason == "critic-infra"
+    assert store.get_ticket("t-salvage-fail")["state"] == PARKED
 
 
 def test_no_filings_when_critic_returns_none(tmp_path, store, plane):

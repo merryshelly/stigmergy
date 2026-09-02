@@ -6,7 +6,10 @@ same discipline as `decompose._run_exec`'s monkeypatchable seam: no live
 `openalph exec`, no provider calls, no `op` reads in the unit suite. The
 seam scripts the exec envelope OA's terminal-tool mechanism returns: ONE
 JSON line on stdout with `status` / `usage` / `tool_trace` / `result`
-(the terminal tool's arguments ARE the return value).
+(the terminal tool's arguments ARE the return value) and — bead .162 — an
+optional top-level `filed_proposals` list (the accepted file_ticket
+filings, machine-assembled by the OA handler — the NEW filing channel; the
+terminal payload carries NO filed_tickets field anymore).
 
 Contract under test:
 - judge/review return the EXACT upstream contract (Verdict + gate_fields +
@@ -14,7 +17,9 @@ Contract under test:
   them unchanged;
 - ANY failure to obtain a valid, contract-conformant verdict is INFRA
   (CriticInfraError / RangeReportError), never a quality rejection;
-- the retry budget is bounded (2 attempts, one retry, never a third);
+- the retry budget is bounded (2 attempts, one retry, never a third), and
+  an INFRA-CLASSIFIED episode (non-`done` status / deny_reason /
+  ceiling_trip) does NOT retry — it surfaces after ONE attempt (bead .162);
 - grammar-enforced FIELD defects (bad outcome, missing evidence_log) do
   NOT consume the retry — they cannot be fixed by re-running the same
   episode (strict-grammar violations are environment problems); only
@@ -115,10 +120,16 @@ def exec_envelope(
     result: Any = None,
     tool_trace: Any = None,
     usage: Any = None,
+    filed_proposals: Any = None,
     returncode: int = 0,
     stdout: str | None = None,
 ) -> subprocess.CompletedProcess:
-    """One scripted OA exec envelope (ONE JSON line on stdout)."""
+    """One scripted OA exec envelope (ONE JSON line on stdout).
+
+    `filed_proposals` (bead .162) is the envelope's TOP-LEVEL filing
+    channel — added ONLY when not None (mirroring OA exec's additive
+    field behavior; `None` = field absent).
+    """
     if stdout is None:
         line = {
             "status": status,
@@ -134,6 +145,8 @@ def exec_envelope(
         }
         if result is not None:
             line["result"] = result
+        if filed_proposals is not None:
+            line["filed_proposals"] = filed_proposals
         stdout = json.dumps(line) + "\n"
     return subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=""
@@ -153,7 +166,9 @@ def verdict_payload(**overrides: Any) -> dict[str, Any]:
                 "found": "branch present at the described site",
             }
         ],
-        "filed_tickets": [],
+        # bead .162: NO filed_tickets key — filings ride the exec
+        # envelope's top-level `filed_proposals` (exec_envelope), not the
+        # terminal payload.
     }
     base.update(overrides)
     return base
@@ -190,21 +205,22 @@ def test_submit_verdict_schema_shape():
         "reason",
         "severity",
         "evidence_log",
-        "filed_tickets",
     }
     assert schema["properties"]["outcome"]["enum"] == ["met", "unmet"]
     assert schema["properties"]["severity"]["enum"] == ["none", "low", "medium", "high"]
     assert schema["properties"]["tier"]["type"] == "integer"
-    # filed_tickets stays TOLERANT (filing.file_proposals is the shape
-    # authority; bead .162 owns the strict-schema fix).
-    assert schema["properties"]["filed_tickets"] == {"type": "array", "items": {"type": "object"}}
+    # bead .162: the filed_tickets field is GONE from the terminal payload
+    # (filings moved to the file_ticket tool channel; the envelope's
+    # top-level `filed_proposals` is the harvest surface).
+    assert "filed_tickets" not in schema["properties"]
 
 
 def test_submit_range_review_schema_shape():
     assert _SUBMIT_RANGE_REVIEW_SCHEMA["name"] == "submit_range_review"
     assert _SUBMIT_RANGE_REVIEW_SCHEMA["strict"] is True
     schema = _SUBMIT_RANGE_REVIEW_SCHEMA["input_schema"]
-    assert set(schema["required"]) == {"text", "evidence_log", "filed_tickets"}
+    assert set(schema["required"]) == {"text", "evidence_log"}
+    assert "filed_tickets" not in schema["properties"]
 
 
 # --------------------------------------------------------------------------
@@ -263,7 +279,7 @@ def test_gate_station_happy_path(tmp_path):
     assert argv[argv.index("--system-prompt-file") + 1] == str(critic04)
     assert argv[argv.index("--model") + 1] == "synthetic/hf:moonshotai/Kimi-K3"
     assert argv[argv.index("--effort") + 1] == "none"
-    assert argv[argv.index("--tools") + 1] == "file_read,glob,grep"
+    assert argv[argv.index("--tools") + 1] == "file_read,glob,grep,file_ticket"
     schema_path = Path(argv[argv.index("--submit-schema") + 1])
     assert schema_path.is_file()
     assert json.loads(schema_path.read_text()) == _SUBMIT_VERDICT_SCHEMA
@@ -318,10 +334,20 @@ def test_gate_station_rename_evidence_material_seeded(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_gate_station_filed_tickets_flow_through(tmp_path):
+def test_gate_station_filed_proposals_flow_through(tmp_path):
+    """bead .162 contract migration: filings arrive on the exec ENVELOPE's
+    top-level `filed_proposals` (NOT the terminal payload) and flow through
+    verbatim and unvalidated (filing.file_proposals remains the shape
+    authority downstream)."""
     filing = {"title": "Add regression test", "description": "surfaced while judging"}
     script = ScriptedExec(
-        [exec_envelope(result=verdict_payload(filed_tickets=[filing]))]
+        [
+            exec_envelope(
+                result=verdict_payload(),
+                tool_trace=[{"name": "file_ticket", "is_error": False}],
+                filed_proposals=[filing],
+            )
+        ]
     )
     critic = make_gate_critic(tmp_path, script)
     _, _, filed = critic.judge("diff", ["item"])
@@ -367,10 +393,6 @@ def test_gate_station_deny_and_ceiling_are_infra(tmp_path):
     script = ScriptedExec(
         [
             exec_envelope(status="failed", result=None, stdout=json.dumps({
-                "status": "failed", "ceiling_trip": "driver_turns",
-                "deny_reason": None, "usage": {}, "tool_trace": [], "result": None,
-            })),
-            exec_envelope(status="failed", result=None, stdout=json.dumps({
                 "status": "failed", "ceiling_trip": None,
                 "deny_reason": "revoked", "usage": {}, "tool_trace": [], "result": None,
             })),
@@ -379,8 +401,11 @@ def test_gate_station_deny_and_ceiling_are_infra(tmp_path):
     critic = make_gate_critic(tmp_path, script)
     with pytest.raises(CriticInfraError) as excinfo:
         critic.judge("diff", ["item"])
-    # the surfaced error is the LAST attempt's failure (the deny)
     assert "deny_reason='revoked'" in str(excinfo.value)
+    # bead .162: an infra-classified episode (bad status / deny / ceiling)
+    # does NOT consume the retry budget — ONE attempt, surfaced bare
+    # (v1: a re-run cannot fix a deny/ceiling; it would only double the cost).
+    assert len(script.calls) == 1
 
 
 def test_gate_station_missing_evidence_log_is_infra_no_retry(tmp_path):
@@ -539,11 +564,12 @@ def test_range_station_happy_path(tmp_path):
                             "found": "one added line, no deletions",
                         }
                     ],
-                    "filed_tickets": [
-                        {"title": "Follow up", "description": "because"}
-                    ],
                 },
-                tool_trace=[{"name": "file_read", "path": "app.py"}],
+                tool_trace=[
+                    {"name": "file_read", "path": "app.py"},
+                    {"name": "file_ticket", "is_error": False},
+                ],
+                filed_proposals=[{"title": "Follow up", "description": "because"}],
                 usage={"in": 50, "cached": 0, "out": 200, "reasoning": 0},
             )
         ]
@@ -576,7 +602,7 @@ def test_range_station_happy_path(tmp_path):
 
 def test_range_station_missing_text_is_infra(tmp_path):
     script = ScriptedExec(
-        [exec_envelope(result={"evidence_log": [], "filed_tickets": []})]
+        [exec_envelope(result={"evidence_log": []})]
     )
     critic = make_range_critic(tmp_path, script)
     with pytest.raises(RangeReportError) as excinfo:
@@ -601,11 +627,17 @@ def test_range_station_exhaustion_is_infra(tmp_path):
     assert len(script.calls) == 2
 
 
-def test_range_station_malformed_filed_tickets_tolerated(tmp_path):
-    """The D14 channel is tolerant — a malformed list degrades to [] and
-    never sinks the advisory prose (filing.py is the shape authority)."""
+def test_range_station_malformed_filed_proposals_tolerated(tmp_path):
+    """bead .162: the envelope's `filed_proposals` channel is tolerant — a
+    non-list degrades to [] and never sinks the advisory prose (filing.py
+    is the shape authority)."""
     script = ScriptedExec(
-        [exec_envelope(result={"text": "prose", "evidence_log": [], "filed_tickets": "not-a-list"})]
+        [
+            exec_envelope(
+                result={"text": "prose", "evidence_log": []},
+                filed_proposals="not-a-list",
+            )
+        ]
     )
     critic = make_range_critic(tmp_path, script)
     result = critic.review(_range_report(tmp_path))

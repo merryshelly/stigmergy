@@ -12,7 +12,10 @@ Deterministic, offline: every executor is an injected `run_one` script
 (mirrors `tests/test_driver.py`'s `CapturingRunOne`/`RaisingRunOne`
 pattern); no real podman/openalph/relay. The single in-cage shim constant
 (`RELAY_PORT = 18081`, `worker_image/shim.py`) is asserted as a literal
-constant against the shipped shim module.
+constant against the shipped shim module. Bead .162: the in-cage tool
+inventory gains `file_ticket` (one filing channel fleet-wide) and the cage
+env gains the two non-credential filing vars (`FILE_TICKET_TRANSPORT` /
+`FILE_TICKET_MAX_FILINGS`) on the same channel as the credential pair.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ from stigmergy.worker_image import shim
 
 PINNED_IMAGE = "localhost/stigmergy-worker@sha256:" + "a" * 64
 
-WORKER_TOOLS = "shell,file_read,file_write,file_edit,file_patch,glob,grep"
+WORKER_TOOLS = "shell,file_read,file_write,file_edit,file_patch,glob,grep,file_ticket"
 
 
 def _model_cfg(**overrides) -> ModelConfig:
@@ -286,6 +289,116 @@ def test_spawn_argv_env_flags_carry_credential(tmp_path):
     assert "--env=OPENAI_BASE_URL=http://127.0.0.1:18081" in argv
     image_index = argv.index(PINNED_IMAGE)
     assert argv.index("--env=OPENAI_API_KEY=cap-tok-ENV") < image_index
+
+
+def test_spawn_tools_argv_contains_file_ticket(tmp_path):
+    # bead .162: the worker files discovered work through the SAME
+    # file_ticket builtin as the stations — appended to the v0 tool
+    # inventory (order preserved; the existing seven tools untouched).
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout=_exec_json())
+    spawn(pack, work, _model_cfg(), _capability(), _budgets(), run_one=runner)
+    argv, _env, _timeout = runner.calls[0]
+    command = _argv_tail(argv)
+    tools = command[command.index("--tools") + 1]
+    assert tools == WORKER_TOOLS
+    assert "file_ticket" in tools.split(",")
+    assert tools == "shell,file_read,file_write,file_edit,file_patch,glob,grep,file_ticket"
+
+
+def test_spawn_cage_env_carries_file_ticket_transport_and_cap(tmp_path):
+    # bead .162: the file_ticket builtin's file-transport sink path + the
+    # per-run count cap ride the SAME cage env channel as the credential
+    # pair (one --env= token per entry, sorted, before the image ref).
+    # The byte cap is ABSENT here: this Budgets carries no
+    # max_filing_bytes (default None), and an absent env var means the
+    # tool applies no call-time size check (OA tool default) — the
+    # harvest-side size-cap stays the backstop.
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout=_exec_json())
+    spawn(pack, work, _model_cfg(), _capability(), _budgets(), run_one=runner)
+    argv, _env, _timeout = runner.calls[0]
+    transport_flag = "--env=FILE_TICKET_TRANSPORT=/work/.stigmergy/filed-tickets.json"
+    cap_flag = "--env=FILE_TICKET_MAX_FILINGS=8"
+    assert transport_flag in argv
+    assert cap_flag in argv
+    assert not any(a.startswith("--env=FILE_TICKET_MAX_BYTES=") for a in argv)
+    image_index = argv.index(PINNED_IMAGE)
+    assert argv.index(transport_flag) < image_index
+    assert argv.index(cap_flag) < image_index
+    # the cap here is the getattr DEFAULT: this test's Budgets stub does not
+    # carry max_filings (older stubs stay valid). The charter-threaded path
+    # is pinned in test_spawn_cage_env_filing_cap_from_budgets below.
+    # the transport must track the harvest's /work-mount path (filing.py
+    # owns the transport literal — a drift would orphan every worker filing).
+    from stigmergy import filing
+
+    assert openalph_exec._FILE_TICKET_TRANSPORT == "/work/" + filing.FILED_TICKETS_REL
+
+
+def test_spawn_cage_env_file_ticket_max_bytes_from_budgets(tmp_path):
+    # bead .162 audit fix: the per-filing byte cap rides the SAME cage env
+    # channel (FILE_TICKET_MAX_BYTES from budgets.max_filing_bytes <-
+    # charter [loop.dispatch_limits].filed_ticket_bytes) so the tool
+    # size-checks at call time, matching the harvest-side size-cap. Present
+    # with the exact value when Budgets carries max_filing_bytes; ABSENT
+    # (never a fabricated default) when it is None — the default stub case
+    # is pinned in test_spawn_cage_env_carries_file_ticket_transport_and_cap.
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+
+    # present + correct value when the Budgets carries the cap.
+    runner = CapturingRunOne(stdout=_exec_json())
+    spawn(
+        pack,
+        work,
+        _model_cfg(),
+        _capability(),
+        _budgets(max_filings=5, max_filing_bytes=20480),
+        run_one=runner,
+    )
+    argv, _env, _timeout = runner.calls[0]
+    bytes_flag = "--env=FILE_TICKET_MAX_BYTES=20480"
+    assert bytes_flag in argv
+    assert "--env=FILE_TICKET_MAX_FILINGS=5" in argv
+    image_index = argv.index(PINNED_IMAGE)
+    assert argv.index(bytes_flag) < image_index
+
+    # explicit None -> ABSENT env var (unchecked, OA tool default).
+    runner2 = CapturingRunOne(stdout=_exec_json())
+    spawn(
+        pack,
+        work,
+        _model_cfg(),
+        _capability(),
+        _budgets(max_filing_bytes=None),
+        run_one=runner2,
+    )
+    argv2, _env2, _timeout2 = runner2.calls[0]
+    assert not any(a.startswith("--env=FILE_TICKET_MAX_BYTES=") for a in argv2)
+
+
+def test_spawn_cage_env_filing_cap_from_budgets(tmp_path):
+    # bead .162: the charter filing cap rides budgets.max_filings (threaded
+    # through prepare_dispatch from [loop.dispatch_limits].filed_tickets)
+    # so the tool-side cap EQUALS the harvest-side count-cap — a tool cap
+    # above the harvest cap would let a worker file N good proposals the
+    # harvest then whole-batch-rejects.
+    pack = _task_pack(tmp_path)
+    work = _make_work_clone(tmp_path, with_work_branch=False)
+    runner = CapturingRunOne(stdout=_exec_json())
+    spawn(
+        pack,
+        work,
+        _model_cfg(),
+        _capability(),
+        _budgets(max_filings=5),
+        run_one=runner,
+    )
+    argv, _env, _timeout = runner.calls[0]
+    assert "--env=FILE_TICKET_MAX_FILINGS=5" in argv
 
 
 def test_spawn_argv_relay_and_egress_sockets_mounted(tmp_path):

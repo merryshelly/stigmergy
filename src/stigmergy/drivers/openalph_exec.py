@@ -21,6 +21,12 @@ sibling import — do not duplicate).
   (``worker_image/shim.py`` RELAY_PORT 18081, worker-facing path
   ``/chat/completions`` WITHOUT ``/v1``). No real provider key ever enters
   the worker env (AC4 parity with claude_code's token-only cred env).
+  bead .162: the SAME ``env=`` channel also carries
+  ``FILE_TICKET_TRANSPORT`` (the file_ticket builtin's JSONL sink path)
+  and ``FILE_TICKET_MAX_FILINGS`` (the per-run filing count cap, OA
+  BUILTIN default "8" — the driver never sees the charter) — non-credential
+  worker-env additions; AC4 still holds (the ONLY secret value in the env
+  is the capability token).
 - The container gains ``--workdir=/work`` (spec §2 decision 1: workspace =
   ``/scratch`` (tmpfs HOME — the OA SessionLog/flight-recorder JSONLs die
   with the cage, never land in the clone), process cwd = ``/work`` (the
@@ -90,8 +96,30 @@ _AGENT_NAME = "stigmergy-worker"
 # v0 fixed worker tool inventory (spec §1 in-cage argv) — NOT
 # charter-configurable (per-lane tool inventory is deferred, spec §8).
 # Containship: same capabilities as claude_code's DEFAULT_ALLOWED_TOOLS,
-# OA-native names.
-_WORKER_TOOLS = "shell,file_read,file_write,file_edit,file_patch,glob,grep"
+# OA-native names. bead .162: the worker files discovered work through the
+# SAME file_ticket builtin as the stations (one filing channel fleet-wide);
+# the JSONL transport file lives in the /work mount the harvest reads.
+_WORKER_TOOLS = "shell,file_read,file_write,file_edit,file_patch,glob,grep,file_ticket"
+
+# bead .162: the file_ticket builtin's file-transport sink — the /work-mount
+# path filing.harvest_worker_filings reads (must match "/work/" +
+# filing.FILED_TICKETS_REL). NOTE: the driver still never sees the CHARTER
+# (module contract) — the filing caps do not contradict that: they arrive
+# via Budgets, which is the caller's (.21 prepare_dispatch) resolved thread
+# of charter [loop.dispatch_limits].filed_tickets /
+# .filed_ticket_bytes. So the in-cage tool caps EQUAL the harvest-side
+# caps without the driver ever importing charter/registry:
+#
+# - FILE_TICKET_MAX_FILINGS <- Budgets.max_filings (str, always set — the
+#   getattr default below only keeps older stub Budgets valid and matches
+#   the OA BUILTIN default "8");
+# - FILE_TICKET_MAX_BYTES <- Budgets.max_filing_bytes — set ONLY when the
+#   value is not None; an ABSENT env var means the tool applies no
+#   call-time size check (the OA tool default), leaving the harvest-side
+#   size-cap as the backstop. (There is NO hardcoded default for the byte
+#   cap on the driver side — a stub Budgets without the field gets an
+#   absent env var, never a fabricated cap.)
+_FILE_TICKET_TRANSPORT = "/work/.stigmergy/filed-tickets.json"
 
 # spec §2 decision 1: process cwd = /work (the git clone) so OA's file
 # tools resolve relative paths into the tree; workspace = /scratch is the
@@ -309,7 +337,26 @@ def spawn(
             "vocabulary: none/low/medium/xhigh)"
         )
 
-    cred_env = _credential_env(capability)
+    # bead .162: the worker files through the SAME file_ticket builtin as
+    # the stations. The file-transport sink path + the per-run count cap
+    # ride the cage env on the SAME channel as the credential pair. The cap
+    # arrives via budgets.max_filings (charter [loop.dispatch_limits]
+    # .filed_tickets, threaded through prepare_dispatch) so the tool-side
+    # cap EQUALS the harvest-side count-cap; the getattr default keeps stub
+    # Budgets objects valid and matches the OA BUILTIN default. The per-
+    # filing byte cap rides the SAME channel (FILE_TICKET_MAX_BYTES from
+    # budgets.max_filing_bytes <- charter .filed_ticket_bytes) and is set
+    # ONLY when the value is not None: an absent env var means the tool
+    # applies no call-time size check (OA tool default) and the harvest-
+    # side size-cap stays the backstop.
+    cage_env = {
+        **_credential_env(capability),
+        "FILE_TICKET_TRANSPORT": _FILE_TICKET_TRANSPORT,
+        "FILE_TICKET_MAX_FILINGS": str(getattr(budgets, "max_filings", 8)),
+    }
+    _max_filing_bytes = getattr(budgets, "max_filing_bytes", None)
+    if _max_filing_bytes is not None:
+        cage_env["FILE_TICKET_MAX_BYTES"] = str(_max_filing_bytes)
 
     profile = ContainerProfile(
         image=model_cfg.image,
@@ -351,7 +398,7 @@ def spawn(
         command=command,
         egress_socket=model_cfg.egress_socket,
         relay_socket=model_cfg.relay_socket,
-        env=cred_env,
+        env=cage_env,
         dispatch_id=capability.dispatch_id,
         workdir=_WORKDIR,
     )

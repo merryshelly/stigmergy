@@ -83,9 +83,13 @@ $prior_check_output
   - Out of scope — a pre-existing defect you tripped over (a flaky or
     failing test you did not cause, a latent bug in code you happened to
     read), something missing from the system, or a material improvement —
-    file it as a proposed ticket in /work/.stigmergy/filed-tickets.json
-    (a JSON array of objects with keys "title", "description", and
-    optional "evidence" file/line pointers), then return to your ticket.
+    file it as a proposed ticket with the file_ticket tool (arguments:
+    "title", "description", and optional "evidence" file/line pointers).
+    The tool validates each filing when you call it: a rejected call tells
+    you what was wrong — fix it and call again; nothing is lost. If your
+    toolset has no file_ticket, write the same objects to
+    /work/.stigmergy/filed-tickets.json (a JSON array) instead. Then
+    return to your ticket.
   Do not merely mention discovered work in your final message: a sentence
   there is not actionable and disappears when this dispatch ends; only a
   filed ticket survives. Filing does not widen your scope — you still
@@ -138,17 +142,17 @@ work (the committed progress is the evidence the ticket is blocked, not merely
 hard); a specific file OUTSIDE your target scope is what blocks completion; and
 no change confined to your target scope can satisfy the acceptance criteria.
 
-To declare it, add ONE object to /work/.stigmergy/filed-tickets.json — the same
-file and array used for filings above — describing the change that would unblock
-the ticket, with these additional keys:
+To declare it, file ONE unblocking-change proposal with the file_ticket tool —
+"title" and "description" as for any filing (they describe the unblocking
+change) — plus these additional arguments:
   - "blocks_ticket": true
-  - "suspected_out_of_scope_paths": a JSON array of the out-of-scope file
-    path(s) that block completion
-  - "reason": a string stating why the ticket cannot be completed within its
-    target scope
-Keep "title" and "description" as for any filing (they describe the unblocking
-change). File at most one such object per dispatch. Also state it plainly in
-your final message.
+  - "suspected_out_of_scope_paths": the out-of-scope file path(s) that block
+    completion
+  - "reason": why the ticket cannot be completed within its target scope
+If your toolset has no file_ticket, add the same object (a JSON object with
+those keys) to /work/.stigmergy/filed-tickets.json — the same file used for
+filings above. File at most one such proposal per dispatch. Also state it
+plainly in your final message.
 
 Do NOT use this escape for work that is merely hard, for a failure your own
 changes caused, for running out of ideas, or for disagreeing with the spec —
