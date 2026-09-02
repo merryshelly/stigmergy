@@ -854,7 +854,8 @@ def test_run_decomposer_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
     )
     assert argv[argv.index("--model") + 1] == "stub-model"
     assert argv[argv.index("--effort") + 1] == "xhigh"
-    assert argv[argv.index("--tools") + 1] == "file_read,glob,grep,file_write"
+    # json_lint (bead .168): the station can lint its JSONL manifest in-episode.
+    assert argv[argv.index("--tools") + 1] == "file_read,glob,grep,file_write,json_lint"
 
 
 def test_run_decomposer_child_env_proxy_unset_and_key_set(
@@ -2343,12 +2344,12 @@ def test_repair_round_pre_seeds_round_scratch_and_edit_tools(
     # Repair exec (the 2nd decomposer exec): the edit-capable tool set.
     repair_argv = exec_calls[1]
     assert repair_argv[repair_argv.index("--tools") + 1] == (
-        "file_read,glob,grep,file_write,file_edit,file_patch"
+        "file_read,glob,grep,file_write,file_edit,file_patch,json_lint"
     )
     # The initial round kept the current write-capable set (no
     # edit/patch).
     assert exec_calls[0][exec_calls[0].index("--tools") + 1] == (
-        "file_read,glob,grep,file_write"
+        "file_read,glob,grep,file_write,json_lint"
     )
     # The round's scratch dir was PRE-SEEDED with the previous round's
     # manifest + notes BYTE-IDENTICAL (Decision 18: the repair agent edits
