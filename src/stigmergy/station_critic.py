@@ -484,7 +484,7 @@ class StationGateCritic:
         prompts_dir: str | Path,
         prompt_name: str = "critic04",
         max_filings: int = 8,  # bead .162: file_ticket filing cap -> child env
-        effort: str = "none",  # SB steer 2026-09-02: reasoning on the judge seat
+        effort: str = "xhigh",  # SB ruling 2026-09-02: critics reason at xhigh
         agent: str = STATION_AGENT,
         exec_fn: Callable[[list[str], dict[str, str], float], subprocess.CompletedProcess]
         | None = None,
@@ -807,7 +807,7 @@ class StationRangeCritic:
         prompts_dir: str | Path,
         prompt_name: str = "rangecrit03",
         max_filings: int = 8,  # bead .162: file_ticket filing cap -> child env
-        effort: str = "none",  # SB steer 2026-09-02: reasoning on the judge seat
+        effort: str = "xhigh",  # SB ruling 2026-09-02: critics reason at xhigh
         grounding_repo: str | Path,
         agent: str = STATION_AGENT,
         exec_fn: Callable[[list[str], dict[str, str], float], subprocess.CompletedProcess]

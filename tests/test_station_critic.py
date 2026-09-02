@@ -278,7 +278,7 @@ def test_gate_station_happy_path(tmp_path):
     assert argv[argv.index("--agent") + 1] == "stigmergy-decomposer"
     assert argv[argv.index("--system-prompt-file") + 1] == str(critic04)
     assert argv[argv.index("--model") + 1] == "synthetic/hf:moonshotai/Kimi-K3"
-    assert argv[argv.index("--effort") + 1] == "none"
+    assert argv[argv.index("--effort") + 1] == "xhigh"  # SB ruling 2026-09-02
     assert argv[argv.index("--tools") + 1] == "file_read,glob,grep,file_ticket"
     schema_path = Path(argv[argv.index("--submit-schema") + 1])
     assert schema_path.is_file()
