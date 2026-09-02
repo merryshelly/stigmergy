@@ -97,8 +97,11 @@ _EXEC_TIMEOUT_SECONDS = 1800.0
 # phase-first rounds carry the write-capable set WITHOUT edit/patch; REPAIR
 # rounds are edit-in-place and carry the edit-capable set (Decision 18).
 _DECOMPOSER_AGENT = "stigmergy-decomposer"
-_DECOMPOSER_TOOLS = "file_read,glob,grep,file_write"
-_DECOMPOSER_REPAIR_TOOLS = "file_read,glob,grep,file_write,file_edit,file_patch"
+# json_lint (bead .168): the station can lint its JSONL manifest BEFORE the
+# submit — a missing brace is an in-episode fix instead of a validator-gate-1
+# repair round (Decision 18: proper tools beat prose workarounds).
+_DECOMPOSER_TOOLS = "file_read,glob,grep,file_write,json_lint"
+_DECOMPOSER_REPAIR_TOOLS = "file_read,glob,grep,file_write,file_edit,file_patch,json_lint"
 # The critic station's read-only tool set (it grounds with reads and
 # submits through the terminal `submit_validation` tool — no write tools).
 _CRITIC_TOOLS = "file_read,glob,grep"

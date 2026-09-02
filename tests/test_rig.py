@@ -25,7 +25,14 @@ from stigmergy.checks import CheckOutcome, run_check
 from stigmergy.cli import main
 from stigmergy.daemon import _REQUIRED_RIG_PATH_KEYS
 from stigmergy.registry import Registry, UnbudgetableError
-from stigmergy.rig import ResolvedRig, RigError, RigStore, create_rig, resolve_rig
+from stigmergy.rig import (
+    ResolvedRig,
+    RigError,
+    RigStore,
+    create_rig,
+    provision_rig_image,
+    resolve_rig,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 VALID_CHARTER_PATH = FIXTURES / "charter_valid.toml"
@@ -49,6 +56,23 @@ def make_local_repo(tmp_path: Path) -> Path:
     subprocess.run(["git", *env_cfg, "-C", str(repo_dir), "add", "README.md"], check=True)
     subprocess.run(
         ["git", *env_cfg, "-C", str(repo_dir), "commit", "-q", "-m", "initial commit"],
+        check=True,
+    )
+    return repo_dir
+
+
+def make_oa_source_repo(tmp_path: Path, name: str = "oa_src") -> Path:
+    """A minimal stand-in for /opt/openalph (bead .161 pin tests): a git
+    repo with one committed pyproject + package file, and NOTHING untracked."""
+    repo_dir = tmp_path / name
+    (repo_dir / "src" / "openalph").mkdir(parents=True)
+    env_cfg = ["-c", "user.email=t@e.x", "-c", "user.name=T"]
+    subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+    (repo_dir / "pyproject.toml").write_text("[project]\nname = 'openalph'\n")
+    (repo_dir / "src" / "openalph" / "__init__.py").write_text("")
+    subprocess.run(["git", *env_cfg, "-C", str(repo_dir), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", *env_cfg, "-C", str(repo_dir), "commit", "-q", "-m", "oa initial"],
         check=True,
     )
     return repo_dir
@@ -1182,6 +1206,11 @@ def test_provision_wiring_faked_build(tmp_path, monkeypatch):
     worker_image — with the real (slow) podman build faked out."""
     import stigmergy.rig as rig_mod
 
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
+
     captured: dict = {}
 
     def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
@@ -1222,6 +1251,11 @@ def test_no_provision_table_skips_build_and_falls_back_to_base(tmp_path, monkeyp
     stays unchanged)."""
     import stigmergy.rig as rig_mod
 
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
+
     called = {"n": 0}
 
     def fake_build_image(*a, **k):
@@ -1246,6 +1280,11 @@ def test_no_provision_table_skips_build_and_falls_back_to_base(tmp_path, monkeyp
 def test_provision_containerfile_omits_pip_lines_when_no_specs(tmp_path, monkeypatch):
     """[provision] present but pip empty -> FROM only, no apt/pip layers."""
     import stigmergy.rig as rig_mod
+
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
 
     captured: dict = {}
 
@@ -1353,10 +1392,15 @@ def test_provision_oa_wheelhouse_bakes_openalph_stack(tmp_path, monkeypatch):
     build context. The real podman build + real pip are both faked."""
     import stigmergy.rig as rig_mod
 
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
+
     captured: dict = {}
     wheelhouse_calls: list[Path] = []
 
-    def fake_build_oa_wheelhouse(wheels_dir):
+    def fake_build_oa_wheelhouse(wheels_dir, *, pin):
         wheelhouse_calls.append(Path(wheels_dir))
         Path(wheels_dir).mkdir(parents=True, exist_ok=True)
         (Path(wheels_dir) / "openalph-0.0.0-py3-none-any.whl").write_text("fake wheel")
@@ -1415,6 +1459,11 @@ def test_provision_oa_wheelhouse_without_pip_bootstraps_pip(tmp_path, monkeypatc
     install can run."""
     import stigmergy.rig as rig_mod
 
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
+
     captured: dict = {}
 
     def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
@@ -1423,7 +1472,9 @@ def test_provision_oa_wheelhouse_without_pip_bootstraps_pip(tmp_path, monkeypatc
 
     monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
     monkeypatch.setattr(
-        rig_mod, "_build_oa_wheelhouse", lambda d: Path(d).mkdir(parents=True, exist_ok=True)
+        rig_mod,
+        "_build_oa_wheelhouse",
+        lambda d, *, pin: Path(d).mkdir(parents=True, exist_ok=True),
     )
 
     out = []
@@ -1447,6 +1498,11 @@ def test_provision_without_oa_wheelhouse_is_byte_identical(tmp_path, monkeypatch
     shape (FROM + the .79 lines only)."""
     import stigmergy.rig as rig_mod
 
+    # bead .161: pin tests run against a controlled fixture repo.
+    monkeypatch.setattr(
+        rig_mod, "_OA_SOURCE_DIR", make_oa_source_repo(tmp_path)
+    )
+
     wheelhouse_calls: list = []
 
     def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
@@ -1461,7 +1517,7 @@ def test_provision_without_oa_wheelhouse_is_byte_identical(tmp_path, monkeypatch
         )
         return _FAKE_DIGEST
 
-    def fake_build_oa_wheelhouse(wheels_dir):
+    def fake_build_oa_wheelhouse(wheels_dir, *, pin):
         wheelhouse_calls.append(wheels_dir)
 
     monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
@@ -1527,3 +1583,201 @@ def test_oa_worker_toml_template_schema():
         )
         assert "api_key" not in prov, f"{key}: never bake a literal api_key into an image"
         assert prov.get("api_key_env") == "OPENAI_API_KEY", key
+
+
+# ==========================================================================
+# bead .161: the scaffold-time OA source pin — oa_wheelhouse bakes the
+# PINNED COMMIT's tree (git archive), never the moving working tree; a
+# re-provision ignores the working tree entirely; a dirty tree refuses the
+# FIRST scaffold; an unreachable pin fails loud.
+# ==========================================================================
+
+
+def _oa_pin(rig_root: Path) -> str | None:
+    import stigmergy.rig as rig_mod
+
+    store = rig_mod.RigStore(rig_root / "tickets.db")
+    try:
+        return store.get_meta("oa_source_commit")
+    finally:
+        store.close()
+
+
+def test_provision_records_oa_source_pin(tmp_path, monkeypatch):
+    """First scaffold: rig_meta records the OA source HEAD and the
+    wheelhouse is built from THAT pin."""
+    import stigmergy.rig as rig_mod
+
+    captured: dict = {}
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        return _FAKE_DIGEST
+
+    def fake_build_oa_wheelhouse(wheels_dir, *, pin):
+        captured["pin"] = pin
+        Path(wheels_dir).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+    monkeypatch.setattr(rig_mod, "_build_oa_wheelhouse", fake_build_oa_wheelhouse)
+    oa_src = make_oa_source_repo(tmp_path)
+    monkeypatch.setattr(rig_mod, "_OA_SOURCE_DIR", oa_src)
+
+    repo = make_local_repo(tmp_path)
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_oa_wheelhouse(_FAKE_BASE)
+    )
+    rig_root = create_rig(charter_path, base_dir=tmp_path / "rigs")
+    provision_rig_image(rig_root, load_charter(charter_path))
+
+    head = subprocess.run(
+        ["git", "-C", str(oa_src), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert _oa_pin(rig_root) == head
+    assert captured["pin"] == head
+
+
+def test_provision_dirty_oa_tree_refused(tmp_path, monkeypatch):
+    """First scaffold against a dirty OA working tree is REFUSED (fail loud,
+    naming the files) — uncommitted work must never be silently not-baked;
+    no pin is recorded."""
+    import stigmergy.rig as rig_mod
+
+    monkeypatch.setattr(rig_mod, "build_image", lambda *a, **k: _FAKE_DIGEST)
+    monkeypatch.setattr(
+        rig_mod, "_build_oa_wheelhouse", lambda d, *, pin: None
+    )
+    oa_src = make_oa_source_repo(tmp_path)
+    (oa_src / "uncommitted.py").write_text("wip\n")
+    monkeypatch.setattr(rig_mod, "_OA_SOURCE_DIR", oa_src)
+
+    repo = make_local_repo(tmp_path)
+    # scaffold the rig WITHOUT a provision table (create_rig deletes the rig
+    # root on any provision failure), then drive provision explicitly with
+    # the oa_wheelhouse charter — the sanctioned re-provision entry point.
+    plain = "\n".join(
+        f'image = "{_FAKE_BASE}"' if ln.strip().startswith("image =") else ln
+        for ln in BASE_CHARTER_TOML.splitlines()
+    )
+    plain_path = make_charter(tmp_path, repo, content=plain)
+    rig_root = create_rig(plain_path, base_dir=tmp_path / "rigs")
+
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_oa_wheelhouse(_FAKE_BASE)
+    )
+    with pytest.raises(RigError) as excinfo:
+        provision_rig_image(rig_root, load_charter(charter_path))
+    assert "dirty" in str(excinfo.value).lower()
+    assert "uncommitted.py" in str(excinfo.value)
+    # the refusal left NO pin (the pin is set only after the dirty check
+    # passes); the store exists (the clean scaffold created it).
+    assert _oa_pin(rig_root) is None
+
+
+def _rig_root_from(charter_path: Path, tmp_path: Path) -> Path:
+    import tomllib
+
+    data = tomllib.loads(charter_path.read_text())
+    return tmp_path / "rigs" / data["rig"]["name"]
+
+
+def test_reprovision_pin_wins_over_dirty_tree(tmp_path, monkeypatch):
+    """The .161 live bug: a mid-run re-provision baked the moving tree. The
+    fix — a re-provision IGNORES the working tree entirely and rebuilds from
+    the stored pin, dirty or not."""
+    import stigmergy.rig as rig_mod
+
+    captured: list[str] = []
+
+    def fake_build_image(containerfile_dir, tag, *, no_secrets=True):
+        return _FAKE_DIGEST
+
+    def fake_build_oa_wheelhouse(wheels_dir, *, pin):
+        captured.append(pin)
+        Path(wheels_dir).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(rig_mod, "build_image", fake_build_image)
+    monkeypatch.setattr(rig_mod, "_build_oa_wheelhouse", fake_build_oa_wheelhouse)
+    oa_src = make_oa_source_repo(tmp_path)
+    monkeypatch.setattr(rig_mod, "_OA_SOURCE_DIR", oa_src)
+    charter_path = make_charter(
+        tmp_path,
+        make_local_repo(tmp_path),
+        content=_charter_with_oa_wheelhouse(_FAKE_BASE),
+    )
+    rig_root = create_rig(charter_path, base_dir=tmp_path / "rigs")
+    charter = load_charter(charter_path)
+
+    provision_rig_image(rig_root, charter)
+    first_pin = _oa_pin(rig_root)
+    assert first_pin
+
+    # dirty the tree AND advance HEAD (simulating foreign in-flight work)
+    (oa_src / "uncommitted.py").write_text("wip\n")
+    subprocess.run(
+        ["git", "-C", str(oa_src), "commit", "-q", "--allow-empty", "-m", "foreign work"],
+        env={"GIT_AUTHOR_NAME": "x", "GIT_AUTHOR_EMAIL": "x@x",
+             "GIT_COMMITTER_NAME": "x", "GIT_COMMITTER_EMAIL": "x@x"},
+        check=True,
+    )
+
+    # create_rig already provisioned once; clear and drive TWO explicit
+    # re-provisions (both must ride the stored pin, not the moved HEAD).
+    captured.clear()
+    charter = load_charter(charter_path)
+    provision_rig_image(rig_root, charter)
+    provision_rig_image(rig_root, charter)
+    assert captured == [first_pin, first_pin]
+    assert _oa_pin(rig_root) == first_pin
+
+
+def test_reprovision_unreachable_pin_fails_loud(tmp_path, monkeypatch):
+    """A pinned commit the source repo can no longer reach (history
+    rewritten) is a loud RigError — never a silent fall-forward to HEAD."""
+    import stigmergy.rig as rig_mod
+
+    monkeypatch.setattr(rig_mod, "build_image", lambda *a, **k: _FAKE_DIGEST)
+    monkeypatch.setattr(
+        rig_mod, "_build_oa_wheelhouse", lambda d, *, pin: None
+    )
+    oa_src = make_oa_source_repo(tmp_path)
+    monkeypatch.setattr(rig_mod, "_OA_SOURCE_DIR", oa_src)
+
+    repo = make_local_repo(tmp_path)
+    charter_path = make_charter(
+        tmp_path, repo, content=_charter_with_oa_wheelhouse(_FAKE_BASE)
+    )
+    rig_root = create_rig(charter_path, base_dir=tmp_path / "rigs")
+    import stigmergy.rig as rig_mod2
+
+    store = rig_mod2.RigStore(rig_root / "tickets.db")
+    try:
+        store.set_meta("oa_source_commit", "0" * 40)
+    finally:
+        store.close()
+
+    with pytest.raises(RigError) as excinfo:
+        provision_rig_image(rig_root, load_charter(charter_path))
+    assert "not reachable" in str(excinfo.value)
+
+
+def test_materialize_oa_source_excludes_untracked(tmp_path, monkeypatch):
+    """The archive materialization is the committed tree ONLY — untracked
+    working-tree files cannot leak into the wheel build (the quotagov01
+    class, closed at the root)."""
+    import stigmergy.rig as rig_mod
+
+    oa_src = make_oa_source_repo(tmp_path)
+    monkeypatch.setattr(rig_mod, "_OA_SOURCE_DIR", oa_src)
+    (oa_src / "uncommitted.py").write_text("wip\n")
+
+    dest = tmp_path / "materialized"
+    head = subprocess.run(
+        ["git", "-C", str(oa_src), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    rig_mod._materialize_oa_source(head, dest)
+
+    assert (dest / "pyproject.toml").is_file()
+    assert (dest / "src" / "openalph" / "__init__.py").is_file()
+    assert not (dest / "uncommitted.py").exists()

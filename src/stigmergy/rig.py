@@ -861,19 +861,118 @@ def _clone_repo(repo: str, dest: Path) -> None:
 # --- resolve: read-side inverse of create_rig -------------------------------
 
 
-def _build_oa_wheelhouse(wheels_dir: Path) -> None:
+def _git_oa(*args: str) -> str:
+    """One read-only git command against the OA source repo (captured,
+    check=False -> :class:`RigError` on failure). Never writes to the
+    source repo — ``archive``/``rev-parse``/``cat-file``/``status`` only."""
+    result = subprocess.run(  # noqa: S603
+        ["git", "-C", str(_OA_SOURCE_DIR), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RigError(
+            f"git -C {_OA_SOURCE_DIR} {' '.join(args)} failed "
+            f"(exit {result.returncode}): {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+_OA_SOURCE_COMMIT_META_KEY = "oa_source_commit"
+
+
+def _resolve_oa_source_pin(store: RigStore) -> str:
+    """Bead .161 (structural fix): resolve the OA source commit the
+    wheelhouse bakes, and pin it in rig meta.
+
+    The bug this closes: the wheelhouse was built from the MOVING
+    ``/opt/openalph`` working tree, so a mid-run re-provision baked
+    whatever unvetted work happened to be in flight (quotagov01, live:
+    kdsn.305's mid-work context-gc code landed in a re-provisioned worker
+    image). The control is a **scaffold-time commit pin**:
+
+    - First scaffold: HEAD is recorded under rig meta
+      ``oa_source_commit`` — and a DIRTY working tree is REFUSED (fail
+      loud naming the files): uncommitted OA work must never be silently
+      not-baked. Commit first, then scaffold.
+    - Any re-provision: the PIN wins. The moving working tree — dirty or
+      not — is ignored entirely; the build materializes the pinned
+      committed tree via ``git archive`` (read-only, byte-exact, no
+      worktree bookkeeping in the root-owned source repo).
+    - An unreachable pin (history rewritten) is a loud :class:`RigError`,
+      never a silent fall-forward to HEAD.
+
+    Returns the pin. Failure is a rig-launch-time error class (scaffold /
+    provision), never a mid-run surprise.
+    """
+    stored = store.get_meta(_OA_SOURCE_COMMIT_META_KEY)
+    if stored is not None:
+        try:
+            _git_oa("cat-file", "-e", f"{stored}^{{commit}}")
+        except RigError as exc:
+            raise RigError(
+                f"pinned OA source commit {stored} is not reachable in "
+                f"{_OA_SOURCE_DIR} (history rewritten?): {exc}"
+            ) from exc
+        return stored
+    current = _git_oa("rev-parse", "HEAD")
+    dirty = _git_oa("status", "--porcelain")
+    if dirty:
+        files = ", ".join(sorted(dirty.splitlines())[:8])
+        raise RigError(
+            f"refusing to scaffold against a DIRTY OA working tree "
+            f"({_OA_SOURCE_DIR}) — the wheelhouse bakes the COMMITTED "
+            f"tree, so uncommitted work would silently not ship. Commit "
+            f"or stash first. Dirty files: {files}"
+        )
+    store.set_meta(_OA_SOURCE_COMMIT_META_KEY, current)
+    return current
+
+
+def _materialize_oa_source(pin: str, dest: Path) -> None:
+    """Extract the PINNED OA commit's tree into ``dest`` (read-only against
+    the source repo: ``git archive`` piped to ``tar`` — no worktree
+    bookkeeping, and untracked/dirty working-tree state cannot leak)."""
+    archive = subprocess.run(  # noqa: S603
+        ["git", "-C", str(_OA_SOURCE_DIR), "archive", pin],
+        capture_output=True,
+        check=False,
+    )
+    if archive.returncode != 0:
+        raise RigError(
+            f"git archive of OA pin {pin} failed "
+            f"(exit {archive.returncode}): {archive.stderr.decode(errors='replace').strip()}"
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+    untar = subprocess.run(  # noqa: S603
+        ["tar", "-x", "-C", str(dest)],
+        input=archive.stdout,
+        capture_output=True,
+        check=False,
+    )
+    if untar.returncode != 0:
+        raise RigError(
+            f"extracting the OA source archive failed "
+            f"(exit {untar.returncode}): {untar.stderr.decode(errors='replace').strip()}"
+        )
+
+
+def _build_oa_wheelhouse(wheels_dir: Path, *, pin: str) -> None:
     """bead .149: build the host-side openalph wheelhouse (spec §5:
     ``pip wheel /opt/openalph -w <rig_root>/images/worker/wheels/`` — OA +
     all deps incl. matrix-nio; heavy but one-time per rig; network is
     available host-side at provision time, so the in-image install itself
     can be fully offline ``--no-index --find-links=/wheels``).
 
-    pip builds a directory source IN the source tree (setuptools writes
-    ``egg-info`` next to the package), and ``/opt/openalph`` is root-owned
-    and read-only for the rig owner — so the wheel is built from a
-    throwaway WRITABLE COPY (git/venv/caches excluded; the wheel bytes are
-    identical). Caught live in the .149 dogfood scaffold
-    ("Cannot update time stamp of directory 'src/openalph.egg-info'").
+    bead .161: the wheel is built from the PINNED COMMIT's tree (materialized
+    via ``git archive`` — see :func:`_resolve_oa_source_pin`), NEVER the
+    moving working tree. Historically the build used a throwaway copy of the
+    live tree because pip writes ``egg-info`` next to the package and
+    ``/opt/openalph`` is root-owned/read-only for the rig owner ("Cannot
+    update time stamp of directory 'src/openalph.egg-info'", .149 dogfood)
+    — the throwaway-copy property is preserved (the archive extraction is a
+    fresh writable dir); the moving-tree hazard is gone.
 
     Two-step build, because the HOST python (3.13) and the WORKER IMAGE
     python (3.11, bookworm) differ: ``pip wheel`` emits binary dependency
@@ -893,18 +992,7 @@ def _build_oa_wheelhouse(wheels_dir: Path) -> None:
     wheels_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="oa-wheelbuild-") as tmp:
         tmp_src = Path(tmp) / "openalph-src"
-        shutil.copytree(
-            _OA_SOURCE_DIR,
-            tmp_src,
-            ignore=shutil.ignore_patterns(
-                ".git", ".venv", "__pycache__", "*.pyc", ".pytest_cache",
-                # .ruff_cache: root-owned cache files in /opt/openalph aborted
-                # the quotagov01 scaffold live (EACCES in copytree, 2026-08-31)
-                # — same class as the .pytest_cache exclusion above.
-                ".ruff_cache",
-                "sessions", "logs", "*.egg-info",
-            ),
-        )
+        _materialize_oa_source(pin, tmp_src)
         oa_wheel = subprocess.run(  # noqa: S603
             [
                 sys.executable, "-m", "pip", "wheel",
@@ -981,50 +1069,55 @@ def provision_rig_image(rig_root: Path, charter: Charter, *, store: RigStore | N
     pip_specs = provision_cfg.get("pip", [])
     oa_wheelhouse = bool(provision_cfg.get("oa_wheelhouse", False))
 
-    images_dir = rig_root / "images" / "worker"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"FROM {base_image}"]
-    if oa_wheelhouse or pip_specs:
-        # The base worker image carries python3 but NOT python3-pip (node +
-        # python3 + git only) — bootstrap it exactly once when EITHER stack
-        # needs it.
-        lines.append(
-            "RUN apt-get update "
-            "&& apt-get install -y --no-install-recommends python3-pip "
-            "&& rm -rf /var/lib/apt/lists/*"
-        )
-    if oa_wheelhouse:
-        # bead .149 (spec §5): the openalph worker stack, BEFORE the
-        # existing pip line (spec §5 ordering). (1) host-side wheelhouse
-        # (the one network step — at provision time, not build time); (2)
-        # the fully-offline in-image install; (3) the agent TOML.
-        _build_oa_wheelhouse(images_dir / "wheels")
-        lines.append("COPY wheels/ /wheels/")
-        lines.append(
-            "RUN pip3 install --break-system-packages --no-cache-dir "
-            "--no-index --find-links=/wheels openalph"
-        )
-        shutil.copy(_OA_WORKER_TOML, images_dir / "oa-worker.toml")
-        lines.append("COPY oa-worker.toml /etc/openalph/agents/stigmergy-worker.toml")
-    if pip_specs:
-        lines.append(
-            "RUN pip3 install --break-system-packages --no-cache-dir "
-            + " ".join(shlex.quote(spec) for spec in pip_specs)
-        )
-    (images_dir / "Containerfile").write_text("\n".join(lines) + "\n")
-
-    tag = f"localhost/stigmergy-rig-{charter.raw['rig']['name']}:latest"
-    digest = build_image(images_dir, tag)
-
+    # bead .161: the store is opened BEFORE any baking so the scaffold-time
+    # OA pin resolves (and is recorded) even if a later step fails — the pin
+    # is a scaffold-time fact, not a success fact.
     owns_store = store is None
     if owns_store:
         store = RigStore(rig_root / "tickets.db")
     try:
+        oa_pin = _resolve_oa_source_pin(store) if oa_wheelhouse else None
+
+        images_dir = rig_root / "images" / "worker"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        lines = [f"FROM {base_image}"]
+        if oa_wheelhouse or pip_specs:
+            # The base worker image carries python3 but NOT python3-pip (node +
+            # python3 + git only) — bootstrap it exactly once when EITHER stack
+            # needs it.
+            lines.append(
+                "RUN apt-get update "
+                "&& apt-get install -y --no-install-recommends python3-pip "
+                "&& rm -rf /var/lib/apt/lists/*"
+            )
+        if oa_wheelhouse:
+            # bead .149 (spec §5): the openalph worker stack, BEFORE the
+            # existing pip line (spec §5 ordering). (1) host-side wheelhouse
+            # (the one network step — at provision time, not build time); (2)
+            # the fully-offline in-image install; (3) the agent TOML.
+            _build_oa_wheelhouse(images_dir / "wheels", pin=oa_pin)
+            lines.append("COPY wheels/ /wheels/")
+            lines.append(
+                "RUN pip3 install --break-system-packages --no-cache-dir "
+                "--no-index --find-links=/wheels openalph"
+            )
+            shutil.copy(_OA_WORKER_TOML, images_dir / "oa-worker.toml")
+            lines.append("COPY oa-worker.toml /etc/openalph/agents/stigmergy-worker.toml")
+        if pip_specs:
+            lines.append(
+                "RUN pip3 install --break-system-packages --no-cache-dir "
+                + " ".join(shlex.quote(spec) for spec in pip_specs)
+            )
+        (images_dir / "Containerfile").write_text("\n".join(lines) + "\n")
+
+        tag = f"localhost/stigmergy-rig-{charter.raw['rig']['name']}:latest"
+        digest = build_image(images_dir, tag)
+
         store.set_meta("worker_image", digest)
+        return digest
     finally:
         if owns_store:
             store.close()
-    return digest
 
 
 @dataclass(frozen=True)
