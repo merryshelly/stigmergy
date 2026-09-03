@@ -1521,6 +1521,9 @@ class _DecomposeDriver:
         prompt_artifact_hash: str,
         tool_trace: list[dict[str, Any]] | None = None,
         effort: str = "",
+        output_kind: str | None = None,
+        verdict: str | None = None,
+        findings_count: int | None = None,
     ) -> None:
         """ONE ``EventType.DECOMPOSE`` event for a SUCCESSFUL LLM invocation
         (the decomposer exec that produced output — manifest, phase plan, or
@@ -1533,7 +1536,20 @@ class _DecomposeDriver:
         decomposer/critic model string), model_version=None.
         ``computed_usd`` uses the `cli._emit_report_event` unbudgetable
         logic: registry-miss -> `"unbudgetable"`; SUBSCRIPTION -> 0.0; else
-        ``spend.cost_usd`` (which may itself return `"unbudgetable"`)."""
+        ``spend.cost_usd`` (which may itself return `"unbudgetable"`).
+
+        Additive observability fields (validator tolerates extras; same
+        mechanism as `station`/`effort`/`tool_trace`): ``round_no`` (int)
+        and ``phase_id`` (nullable) always — the invocation's structural
+        coordinates, recorded flat so renderers never scrape
+        ``dispatch_id``; ``output_kind`` (decomposer events only:
+        "manifest"|"phase_plan"|"escape") and ``verdict`` +
+        ``findings_count`` (critic events only: the submit_validation
+        verdict, scalar count — finding BODIES stay in run-dir artifacts,
+        the record plane stays bounded) conditionally, only when known.
+        Render-side repair-cause derives from event ORDERING (two
+        decomposer events with no critic between = validator-driven), never
+        from recorded findings counts."""
         try:
             entry = self.resolved.registry.resolve(model)
         except UnbudgetableError:
@@ -1543,6 +1559,15 @@ class _DecomposeDriver:
                 computed_usd = 0.0
             else:
                 computed_usd = spend.cost_usd(entry, tokens)
+        extras: dict[str, Any] = {}
+        if tool_trace is not None:
+            extras["tool_trace"] = tool_trace
+        if output_kind is not None:
+            extras["output_kind"] = output_kind
+        if verdict is not None:
+            extras["verdict"] = verdict
+        if findings_count is not None:
+            extras["findings_count"] = findings_count
         event = make_event(
             EventType.DECOMPOSE,
             station=station,
@@ -1564,7 +1589,9 @@ class _DecomposeDriver:
             wall_time_seconds=wall_time_seconds,
             prompt_artifact_hash=prompt_artifact_hash,
             effort=effort,
-            **({"tool_trace": tool_trace} if tool_trace is not None else {}),
+            round_no=round_no,
+            phase_id=phase_id,
+            **extras,
         )
         self.record_plane.append(event)
 
@@ -1641,6 +1668,7 @@ class _DecomposeDriver:
                 prompt_artifact_hash=self.prompt_hash,
                 tool_trace=bound_tool_trace(output.tool_trace),
                 effort=self.decomposer_effort,
+                output_kind=output.kind,
             )
         return output
 
@@ -1708,6 +1736,10 @@ class _DecomposeDriver:
             prompt_artifact_hash=self.critic_prompt_hash,
             tool_trace=bound_tool_trace(result.get("tool_trace")),
             effort=self.critic_effort,
+            verdict=(str(result["verdict"]) if result.get("verdict") is not None else None),
+            findings_count=(
+                len(result["findings"]) if isinstance(result.get("findings"), list) else None
+            ),
         )
         self.findings_history.append(
             {

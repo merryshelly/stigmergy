@@ -1445,9 +1445,18 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
         assert len(ev["prompt_artifact_hash"]) == 64
         # dispatch_id carries the run id (UTC compact + 8 hex of spec sha).
         assert ev["dispatch_id"].startswith("decompose-")
+        # Structural coordinates recorded FLAT (renderers never scrape
+        # dispatch_id): round_no always, phase_id nullable.
+        assert ev["round_no"] == 0
+        assert ev["phase_id"] is None
     decomp = by_station["decomposer"]
     assert decomp["tokens"] == decomp_usage
     assert decomp["model"] == "claude-max-sub"
+    # output_kind rides decomposer events (the invocation's classified
+    # output); verdict/findings_count do NOT.
+    assert decomp["output_kind"] == "manifest"
+    assert "verdict" not in decomp
+    assert "findings_count" not in decomp
     # Effort is recorded, not inferred: the decomposer event carries the
     # CLI default; the critic event carries the judge-seat default (ruling 09-02).
     assert decomp["effort"] == "xhigh"
@@ -1461,6 +1470,11 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
     # spend.cost_usd for its usage.
     assert critic["model"] == "opus"
     assert critic["effort"] == "xhigh"  # SB ruling 2026-09-02: judge seat reasons
+    # verdict + scalar findings_count ride critic events (finding BODIES
+    # stay in run-dir artifacts); output_kind does not.
+    assert critic["verdict"] == "accept"
+    assert critic["findings_count"] == 0
+    assert "output_kind" not in critic
     resolved = _resolve(rigs_root)
     try:
         import hashlib
@@ -2327,6 +2341,14 @@ def test_critic_verdict_parsed_and_evidence_log_carried(
     }
     for ev in critic_events:
         assert ev["model"] == "opus"
+    # Additive observability fields: verdict + scalar findings_count on
+    # critic events; round_no flat on every event (0 -> repair round 1).
+    assert critic_events[0]["verdict"] == "repair"
+    assert critic_events[0]["findings_count"] == 1
+    assert critic_events[1]["verdict"] == "accept"
+    assert critic_events[1]["findings_count"] == 0
+    rounds = sorted(e["round_no"] for e in events if e["station"] == "decomposer")
+    assert rounds == [0, 1]
     resolved = _resolve(rigs_root)
     try:
         expected_hash = hashlib.sha256(
