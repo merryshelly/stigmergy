@@ -35,6 +35,24 @@ def test_resolve_unknown_model_raises_unbudgetable(registry: Registry) -> None:
         registry.resolve("does-not-exist")
 
 
+def test_resolve_qualified_provider_version_string(registry: Registry) -> None:
+    """bead .172: resolve() also accepts the QUALIFIED provider/version form
+    (the decompose CLI's default model string is qualified, not an alias) —
+    the first entry matching (provider, version) in registry order; an
+    unknown qualified string stays unbudgetable (fail-closed, AC10 intact)."""
+    entry = registry.resolve("anthropic/opus-4-1-20250805")
+    assert entry.name == "opus"
+    with pytest.raises(UnbudgetableError):
+        registry.resolve("anthropic/does-not-exist")
+
+
+def test_resolve_alias_beats_qualified_scan_order(registry: Registry) -> None:
+    """An alias that literally matches a qualified form still resolves as an
+    alias first (alias lookup precedes the provider/version scan)."""
+    entry = registry.resolve("claude-max-sub")
+    assert entry.name == "claude-max-sub"
+
+
 # --- missing required price field never defaults to $0 -------------------
 
 

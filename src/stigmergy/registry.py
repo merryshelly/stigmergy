@@ -94,17 +94,27 @@ class Registry:
         self.version_hash = version_hash
 
     def resolve(self, name: str) -> ModelEntry:
-        """Look up a model entry by name.
+        """Look up a model entry by registry alias, or by the QUALIFIED
+        ``provider/version`` form (bead .172: the decompose CLI's default
+        model string is qualified, not an alias, and must still price).
 
-        Raises :class:`UnbudgetableError` on a registry miss — an unknown
-        model is unbudgetable, never defaulted to $0 or any other price.
+        On an alias miss, entries are scanned in registry (source) order and
+        the FIRST entry whose (provider, version) matches is returned —
+        deterministic; two aliases may share one provider/version. A miss on
+        both axes raises :class:`UnbudgetableError` — an unknown model is
+        unbudgetable, never defaulted to $0 or any other price.
         """
-        try:
-            return self.entries[name]
-        except KeyError:
-            raise UnbudgetableError(
-                f"model {name!r} is not in the registry: unbudgetable, refusing"
-            ) from None
+        entry = self.entries.get(name)
+        if entry is not None:
+            return entry
+        provider, sep, version = name.partition("/")
+        if sep:
+            for candidate in self.entries.values():
+                if candidate.provider == provider and candidate.version == version:
+                    return candidate
+        raise UnbudgetableError(
+            f"model {name!r} is not in the registry: unbudgetable, refusing"
+        )
 
 
 def _canonical_hash(data: dict[str, Any]) -> str:

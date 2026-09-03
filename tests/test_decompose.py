@@ -929,8 +929,8 @@ def test_build_evidence_bundle_sections_and_exact_strings(tmp_path: Path) -> Non
 
 def test_run_decompose_happy_path_seeds_and_approves(tmp_path: Path, monkeypatch) -> None:
     """End-to-end happy path on a tmp rig with stubbed exec+critic: spec ->
-    2-ticket DAG seeded + approved + DECOMPOSE events appended + summary.md
-    written, rc 0."""
+    2-ticket DAG seeded + approved + DECOMPOSE events appended + one
+    DECOMPOSE_INTAKE emission (bead .174) + summary.md written, rc 0."""
     manifest = [
         _ticket_entry("t-base", scope=["src/app.py", "tests/test_app.py"]),
         _ticket_entry(
@@ -999,6 +999,18 @@ def test_run_decompose_happy_path_seeds_and_approves(tmp_path: Path, monkeypatch
     stations = {e["station"] for e in d_events}
     assert stations == {"decomposer", "decompose-critic"}
 
+    # DECOMPOSE_INTAKE emission (bead .174): exactly one, carrying the
+    # seeded ticket ids + the D17 auto-approve outcome, same attribution
+    # as the approval events.
+    i_events = [e for e in events if e.get("event_type") == "decompose-intake"]
+    assert len(i_events) == 1
+    i_ev = i_events[0]
+    assert i_ev["tickets"] == ["t-base", "t-cli"]
+    assert i_ev["approved"] is True
+    assert i_ev["acting_agent"] == "merry"
+    assert i_ev["operator_session"].startswith("decompose-")
+    assert i_ev["dispatch_id"].startswith("decompose-")
+
     # summary.md written.
     run_dir = list((decompose_root / "decompose").iterdir())[0]
     assert (run_dir / "summary.md").exists()
@@ -1027,6 +1039,21 @@ def test_run_decompose_no_approve_leaves_unapproved(tmp_path: Path, monkeypatch)
     assert t is not None
     assert t["approved"] == 0  # stays unapproved/pool
 
+    # Emission recorded (the tickets WERE seeded) with approved=False, and
+    # NO approval events (D17 auto-approve skipped).
+    resolved = _resolve(rigs_root)
+    try:
+        from stigmergy.records import RecordPlane
+
+        events = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+    i_events = [e for e in events if e.get("event_type") == "decompose-intake"]
+    assert len(i_events) == 1
+    assert i_events[0]["tickets"] == ["t-only"]
+    assert i_events[0]["approved"] is False
+    assert not [e for e in events if e.get("event_type") == "approval"]
+
 
 def test_run_decompose_dry_run_intakes_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
     rigs_root = scaffold_rig(tmp_path)
@@ -1043,6 +1070,16 @@ def test_run_decompose_dry_run_intakes_nothing(tmp_path: Path, monkeypatch, caps
     assert _ticket(rigs_root, "t-dry") is None  # nothing intaked
     out = capsys.readouterr().out
     assert "would seed t-dry" in out
+
+    # dry-run seeds nothing -> NO emission event (it would be a recorded lie).
+    resolved = _resolve(rigs_root)
+    try:
+        from stigmergy.records import RecordPlane
+
+        events = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+    assert not [e for e in events if e.get("event_type") == "decompose-intake"]
 
 
 def test_run_decompose_escape_is_exit_1(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1409,6 +1446,39 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
         resolved.store.close()
     assert decomp["prompt_artifact_hash"] == expected_decomp_hash
     assert critic["computed_usd"] == expected_critic_usd
+
+
+def test_run_decompose_qualified_model_string_is_priced(tmp_path: Path, monkeypatch) -> None:
+    """bead .172: the decomposer's default model is the QUALIFIED
+    provider/version string, not a registry alias — pricing must resolve it
+    to its entry. A $0 subscription call prices 0.0, never "unbudgetable"
+    (the dryrun-phases UNBUDGETABLE=7 class)."""
+    manifest = [_ticket_entry("t-a")]
+    usage = {"in": 11, "cached": 2, "out": 33, "reasoning": 0}
+    rigs_root = scaffold_rig(tmp_path)
+    spec = _write_spec(tmp_path)
+    _fake_exec(
+        monkeypatch,
+        [{"manifest": manifest, "notes": "n",
+          "result": _exec_result(usage=usage)}],
+    )
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    _critic_exec(monkeypatch, [_critic_exec_result(
+        usage={"in": 1, "cached": 0, "out": 1, "reasoning": 0})])
+    rc = decompose.run_decompose(
+        rig_name=RIG,
+        spec_path=spec,
+        decompose_root=tmp_path / "d",
+        rigs_root=rigs_root,
+        decomposer_model="anthropic/claude-code-subscription",  # QUALIFIED form
+    )
+    assert rc == 0
+    decomp = [e for e in _decompose_events(rigs_root)
+              if e["station"] == "decomposer"]
+    assert decomp[0]["model"] == "anthropic/claude-code-subscription"
+    assert decomp[0]["computed_usd"] == 0.0  # subscription, priced — not "unbudgetable"
 
 
 def test_run_decompose_events_carry_bounded_tool_trace(tmp_path: Path, monkeypatch) -> None:
