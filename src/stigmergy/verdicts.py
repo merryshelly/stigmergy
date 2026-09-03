@@ -17,21 +17,17 @@ import enum
 from dataclasses import dataclass
 
 
-# str-mixed (bead .162): a verdict outcome IS its wire string — a station
-# consumer may compare `verdict.outcome == "met"` directly. `.value`, member
-# identity (`is`), `Outcome("met")` lookup, and the ValueError on bad values
-# are all unchanged; `Severity` stays a plain enum (no consumer demands the
-# str mix).
-class Outcome(str, enum.Enum):
+# bead .162: a verdict outcome IS its wire string — a station consumer may
+# compare `verdict.outcome == "met"` directly. 2026-09-02: migrated from the
+# `str, enum.Enum` mixin to `enum.StrEnum` (repo floor is py3.12) after the
+# mixin failed Tier-1 ruff (UP042) in every hardening01 cage and burned the
+# ladder's first attempts. All pinned semantics unchanged: `.value`, member
+# identity (`is`), `Outcome("met")` lookup, the ValueError on bad values,
+# and wire-form stringification (StrEnum.__str__ == str.__str__).
+# `Severity` stays a plain enum (no consumer demands the str mix).
+class Outcome(enum.StrEnum):
     MET = "met"
     UNMET = "unmet"
-
-    def __str__(self) -> str:
-        # Stringified outcomes must match the WIRE form for logs/dashboards
-        # (audit .162 LOW): without this override, `str()`/f-strings/`%s`
-        # on Python >= 3.11 emit "Outcome.MET", which substring/regex
-        # consumers matching the wire value ("met") will not find.
-        return self.value
 
 
 class Severity(enum.Enum):

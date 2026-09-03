@@ -399,7 +399,7 @@ def test_outcome_stringified_matches_wire_form():
     assert f"{Outcome.MET}" == "met"
     assert f"{Outcome.UNMET}" == "unmet"
     assert str(Outcome.MET) == "met"
-    assert "outcome=%s" % Outcome.MET == "outcome=met"
+    assert "outcome=%s" % Outcome.MET == "outcome=met"  # noqa: UP031 (%-format consumer pinned)
     # The wire/equality semantics the str mixin promises are unchanged.
     assert Outcome.MET == "met"
     assert json.dumps({"outcome": Outcome.MET}) == '{"outcome": "met"}'

@@ -42,21 +42,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
-from stigmergy.critic import CriticInfraError
-from stigmergy import station_critic
-from stigmergy.station_critic import (
-    _SUBMIT_RANGE_REVIEW_SCHEMA,
-    _SUBMIT_VERDICT_SCHEMA,
-    STATION_TOOLS,
-)
-
 from test_station_critic import (  # scripted-seam helpers (stable surface)
     ScriptedExec,
     _range_report,
     exec_envelope,
     make_gate_critic,
     make_range_critic,
+)
+
+from stigmergy import station_critic
+from stigmergy.critic import CriticInfraError
+from stigmergy.station_critic import (
+    _SUBMIT_RANGE_REVIEW_SCHEMA,
+    _SUBMIT_VERDICT_SCHEMA,
+    STATION_TOOLS,
 )
 
 

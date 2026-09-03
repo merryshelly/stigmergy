@@ -1367,7 +1367,9 @@ def test_critic_infra_salvage_failure_never_alters_infra_flow(
             raise exc
 
     staging_repo = make_staging_repo(tmp_path)
-    bundle = make_bundle(tmp_path, staging_repo, name="t-salvage-fail", files={"feature.txt": "x\n"})
+    bundle = make_bundle(
+        tmp_path, staging_repo, name="t-salvage-fail", files={"feature.txt": "x\n"}
+    )
     add_parked_ticket(store, "t-salvage-fail", work_product=bundle)
 
     weaver = make_weaver(

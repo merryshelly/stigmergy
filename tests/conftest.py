@@ -129,3 +129,17 @@ def _station_agent_toml_pinned_to_repo_template(monkeypatch):
     template = Path(_sc.__file__).parent / "agents" / "stigmergy-decomposer.toml"
     monkeypatch.setattr(_sc, "STATION_AGENT_TOML", template)
 
+
+@pytest.fixture(autouse=True)
+def _stub_op_key_provider(monkeypatch):
+    """Station child-env builds resolve ``STIG_DECOMP_KEY`` via the op-backed
+    provider at call time (decompose._build_child_env -> _decomp_key_provider,
+    the documented module-level test seam). Without this stub, every station
+    test depends on the HOST holding the `op` binary + a session token: it
+    passed locally and failed in every cage — live-fired on hardening01
+    (2026-09-02, 30 Tier-1 fails, ``KeyProviderError: op binary not found``).
+    No test may touch real credentials; patch the seam instead."""
+    import stigmergy.decompose as _dec
+
+    monkeypatch.setattr(_dec, "_decomp_key_provider", lambda: lambda: "stub-key")
+
