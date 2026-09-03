@@ -111,7 +111,7 @@ if not _openalph_importable():
 # --- bead .166 (Decision 18): host-independent station construction --------
 #
 # `StationGateCritic` / `StationRangeCritic` preflight the INSTALLED station
-# agent TOML (`/etc/openalph/agents/stigmergy-decomposer.toml`) fail-closed
+# agent TOML (`/etc/openalph/agents/stigmergy/stigmergy-decomposer.toml`) fail-closed
 # at rig launch. That path is host state; the unit suite must not require
 # it. This autouse fixture pins the module global to the in-repo TEMPLATE
 # (which ships with the source and always exists), so construction succeeds

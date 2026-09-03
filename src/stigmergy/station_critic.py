@@ -5,7 +5,7 @@ critic and the range critic as ephemeral grounded agents.
 `be392ee` is the precedent): an ephemeral OA agent invoked exactly like the
 decomposer::
 
-    openalph exec --agent stigmergy-decomposer --task-file <task.md>
+    openalph exec --config <installed station toml> --task-file <task.md>
         --system-prompt-file <prompts_dir>/<prompt artifact>
         --model <qualified critic model> --effort xhigh   # SB ruling 2026-09-02: judge seat reasons
         --tools file_read,glob,grep,file_ticket --submit-schema <schema file>
@@ -104,7 +104,7 @@ __all__ = [
 # TOML for its critic). The daemon preflights its presence fail-closed at
 # rig launch (never at the first gate).
 STATION_AGENT = "stigmergy-decomposer"
-STATION_AGENT_TOML = Path("/etc/openalph/agents/stigmergy-decomposer.toml")
+STATION_AGENT_TOML = Path("/etc/openalph/agents/stigmergy/stigmergy-decomposer.toml")
 
 # Read-only grounding tools. No shell, no write tools, ever (D18: critics
 # are grounded agents; the repository is read-only to them by design).
@@ -523,10 +523,12 @@ class StationGateCritic:
         if not toml_path.is_file():
             raise CriticOAUnavailableError(
                 f"station agent TOML not installed: {toml_path} — install with: "
-                f"cp {(Path(__file__).parent / 'agents' / f'{agent}.toml')} "
+                f"install -m 640 -D "
+                f"{(Path(__file__).parent / 'agents' / f'{agent}.toml')} "
                 f"{toml_path} (the staging-gate critic is an exec station; "
                 "fail-closed at launch, never at the first gate)"
             )
+        self._toml_path = toml_path
 
     # -- task render -------------------------------------------------------
 
@@ -692,8 +694,8 @@ class StationGateCritic:
         argv = [
             _resolve_openalph_bin(),
             "exec",
-            "--agent",
-            self._agent,
+            "--config",
+            str(self._toml_path),
             "--task-file",
             str(task_path),
             "--system-prompt-file",
@@ -845,8 +847,9 @@ class StationRangeCritic:
         )
         if not toml_path.is_file():
             raise CriticOAUnavailableError(
-                f"station agent TOML not installed: {agent_toml}"
+                f"station agent TOML not installed: {toml_path}"
             )
+        self._toml_path = toml_path
 
     def _render_task(self, report: RangeReport, scratch: Path) -> str:
         nonce = secrets.token_hex(16)
@@ -909,8 +912,8 @@ class StationRangeCritic:
         argv = [
             _resolve_openalph_bin(),
             "exec",
-            "--agent",
-            self._agent,
+            "--config",
+            str(self._toml_path),
             "--task-file",
             str(task_path),
             "--system-prompt-file",

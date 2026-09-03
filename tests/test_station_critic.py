@@ -276,7 +276,10 @@ def test_gate_station_happy_path(tmp_path):
     assert len(script.calls) == 1
     argv = script.calls[0]["argv"]
     assert argv[0].endswith("openalph") or "openalph" in argv[0]
-    assert argv[argv.index("--agent") + 1] == "stigmergy-decomposer"
+    assert argv[argv.index("--config") + 1] == str(
+        Path(__file__).parent.parent
+        / "src" / "stigmergy" / "agents" / "stigmergy-decomposer.toml"
+    )
     assert argv[argv.index("--system-prompt-file") + 1] == str(critic04)
     assert argv[argv.index("--model") + 1] == "synthetic/hf:moonshotai/Kimi-K3"
     assert argv[argv.index("--effort") + 1] == "xhigh"  # SB ruling 2026-09-02

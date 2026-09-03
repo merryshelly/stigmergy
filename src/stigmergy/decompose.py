@@ -96,7 +96,6 @@ _EXEC_TIMEOUT_SECONDS = 1800.0
 # set (the driver's invariants, not charter-configurable). INITIAL and
 # phase-first rounds carry the write-capable set WITHOUT edit/patch; REPAIR
 # rounds are edit-in-place and carry the edit-capable set (Decision 18).
-_DECOMPOSER_AGENT = "stigmergy-decomposer"
 # json_lint (bead .168): the station can lint its JSONL manifest BEFORE the
 # submit — a missing brace is an in-episode fix instead of a validator-gate-1
 # repair round (Decision 18: proper tools beat prose workarounds).
@@ -110,7 +109,7 @@ _SCRATCH_ROOT = Path("/tmp/stig-decomposer/ws")
 
 # OA's agent config dir (openalph.config.CONFIG_DIR) — resolved WITHOUT
 # importing openalph (the exec driver names the CLI, never the package).
-_DECOMP_AGENT_TOML = Path("/etc/openalph/agents/stigmergy-decomposer.toml")
+_DECOMP_AGENT_TOML = Path("/etc/openalph/agents/stigmergy/stigmergy-decomposer.toml")
 
 # Bounded repo-tree defaults for the critic evidence bundle (deterministic;
 # never the whole tree — depth 3, <= 400 entries, cache/.git dirs skipped).
@@ -704,7 +703,7 @@ def run_decomposer(
 
     The argv is the exact `openalph exec` contract::
 
-        openalph exec --agent stigmergy-decomposer --task-file <abs>
+        openalph exec --config <installed decomposer toml> --task-file <abs>
             --system-prompt-file <prompts_dir>/decomposer01 --model <model>
             --effort <effort> --tools <tools>
 
@@ -732,8 +731,8 @@ def run_decomposer(
     argv = [
         _resolve_openalph_bin(),
         "exec",
-        "--agent",
-        _DECOMPOSER_AGENT,
+        "--config",
+        str(_DECOMP_AGENT_TOML),
         "--task-file",
         str(task_file),
         "--system-prompt-file",
@@ -1263,7 +1262,7 @@ def run_critic(
     """One validation-critic STATION judgment (Decision 18): the critic is
     an ephemeral agent invoked EXACTLY like the decomposer::
 
-        openalph exec --agent stigmergy-decomposer --task-file <critic task>
+        openalph exec --config <installed decomposer toml> --task-file <critic task>
             --system-prompt-file <prompts_dir>/decomposecritic01
             --model <critic model> --effort xhigh
             --tools file_read,glob,grep --submit-schema <schema file>
@@ -1318,8 +1317,8 @@ def run_critic(
     argv = [
         _resolve_openalph_bin(),
         "exec",
-        "--agent",
-        _DECOMPOSER_AGENT,
+        "--config",
+        str(_DECOMP_AGENT_TOML),
         "--task-file",
         str(task_file),
         "--system-prompt-file",
@@ -2248,7 +2247,8 @@ def run_decompose(
         print(
             f"stigmergy decompose: decomposer agent TOML missing at {_DECOMP_AGENT_TOML} "
             f"(OA CONFIG_DIR) — install the shipped template: "
-            f"install -m 644 src/stigmergy/agents/stigmergy-decomposer.toml {_DECOMP_AGENT_TOML}",
+            f"install -m 640 -D "
+            f"src/stigmergy/agents/stigmergy-decomposer.toml {_DECOMP_AGENT_TOML}",
             file=sys.stderr,
         )
         return 1

@@ -872,13 +872,13 @@ def test_run_decomposer_garbage_manifest_is_failure(tmp_path: Path, monkeypatch)
 
 
 def test_run_decomposer_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
-    """The argv is the exact `openalph exec` contract: agent, task-file,
+    """The argv is the exact `openalph exec` contract: station config path (--config), task-file,
     system-prompt-file (prompts_dir/decomposer01), model, effort, tools."""
     calls = _fake_exec(monkeypatch, [{"manifest": [_ticket_entry("a")]}])
     decompose.run_decomposer("task", **_rd_common(tmp_path))
     argv = calls[0]
     assert "exec" in argv
-    assert argv[argv.index("--agent") + 1] == "stigmergy-decomposer"
+    assert argv[argv.index("--config") + 1] == str(decompose._DECOMP_AGENT_TOML)
     assert argv[argv.index("--task-file") + 1].endswith("task.md")
     assert argv[argv.index("--system-prompt-file") + 1].endswith(
         str(Path("prompts") / "decomposer01")
@@ -2174,7 +2174,8 @@ def _scaffold_and_patch(
 
 def test_critic_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
     """The critic exec's argv is the Station Contract invocation: the SAME
-    agent, the critic task file, system-prompt-file decomposecritic01, the
+    station config path (--config), the critic task file,
+    system-prompt-file decomposecritic01, the
     registry-QUALIFIED critic model, --effort xhigh (SB ruling 2026-09-02:
     the judge seat reasons), read-only tools, and
     --submit-schema run-dir/submit-schema.json."""
@@ -2188,7 +2189,7 @@ def test_critic_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
     assert rc == 0
     argv = critic_argvs[0]
     assert "exec" in argv
-    assert argv[argv.index("--agent") + 1] == "stigmergy-decomposer"
+    assert argv[argv.index("--config") + 1] == str(decompose._DECOMP_AGENT_TOML)
     assert argv[argv.index("--task-file") + 1].endswith("task.md")
     assert argv[argv.index("--system-prompt-file") + 1].endswith("decomposecritic01")
     # The charter's [roles.critic].model ("opus") resolved to the
