@@ -1380,6 +1380,9 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
     decomp = by_station["decomposer"]
     assert decomp["tokens"] == decomp_usage
     assert decomp["model"] == "claude-max-sub"
+    # Effort is recorded, not inferred: the decomposer event carries the
+    # CLI default; the critic event carries the judge-seat default (ruling 09-02).
+    assert decomp["effort"] == "xhigh"
     # Subscription pricing -> computed_usd exactly 0.0 (never
     # "unbudgetable", never a fabricated positive).
     assert decomp["computed_usd"] == 0.0
@@ -1389,6 +1392,7 @@ def test_run_decompose_provenance_event_shape(tmp_path: Path, monkeypatch) -> No
     # registry-priced entry, here the metered `opus`), priced via
     # spend.cost_usd for its usage.
     assert critic["model"] == "opus"
+    assert critic["effort"] == "xhigh"  # SB ruling 2026-09-02: judge seat reasons
     resolved = _resolve(rigs_root)
     try:
         import hashlib
@@ -2070,7 +2074,8 @@ def _scaffold_and_patch(
 def test_critic_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
     """The critic exec's argv is the Station Contract invocation: the SAME
     agent, the critic task file, system-prompt-file decomposecritic01, the
-    registry-QUALIFIED critic model, --effort none, read-only tools, and
+    registry-QUALIFIED critic model, --effort xhigh (SB ruling 2026-09-02:
+    the judge seat reasons), read-only tools, and
     --submit-schema run-dir/submit-schema.json."""
     manifest = [_ticket_entry("t-a")]
     rc, _, critic_argvs, _, run_dir, _rr = _scaffold_and_patch(
@@ -2088,7 +2093,9 @@ def test_critic_exec_argv_contract(tmp_path: Path, monkeypatch) -> None:
     # The charter's [roles.critic].model ("opus") resolved to the
     # registry-qualified provider/version form.
     assert argv[argv.index("--model") + 1] == "anthropic/opus-4-1-20250805"
-    assert argv[argv.index("--effort") + 1] == "none"
+    # SB ruling 2026-09-02: judge seat reasons (the old kdsn.301 none
+    # default was a mis-attribution).
+    assert argv[argv.index("--effort") + 1] == "xhigh"
     assert argv[argv.index("--tools") + 1] == "file_read,glob,grep"
     schema_arg = argv[argv.index("--submit-schema") + 1]
     assert schema_arg == str(run_dir / "submit-schema.json")

@@ -1293,6 +1293,10 @@ def _emit_report_event(
         computed_usd=computed_usd,
         prompt_artifact_hash=result.prompt_artifact_hash,
         wall_time_seconds=0.0,
+        # bead .173: the station range-critic records its exec effort; the
+        # deprecated in-process result leaves effort="" (field omitted,
+        # legacy events byte-identical).
+        **({"effort": result.effort} if getattr(result, "effort", "") else {}),
     )
     record_plane.append(event)
 

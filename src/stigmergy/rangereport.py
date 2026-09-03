@@ -274,6 +274,10 @@ class RangeCriticResult:
     prompt_artifact_hash: str
     model: str
     usage: dict[str, Any]
+    # bead .173 (SB ruling 2026-09-02): the station range-critic records its
+    # exec effort on the result (REPORT-event provenance). The deprecated
+    # in-process path has no effort axis and leaves the default "".
+    effort: str = ""
 
 
 class RangeCritic:

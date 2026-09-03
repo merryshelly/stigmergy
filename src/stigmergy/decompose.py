@@ -1258,21 +1258,25 @@ def run_critic(
     prompts_dir: Path,
     scratch_dir: Path,
     schema_path: Path,
+    effort: str = "xhigh",
 ) -> dict[str, Any]:
     """One validation-critic STATION judgment (Decision 18): the critic is
     an ephemeral agent invoked EXACTLY like the decomposer::
 
         openalph exec --agent stigmergy-decomposer --task-file <critic task>
             --system-prompt-file <prompts_dir>/decomposecritic01
-            --model <critic model> --effort none
+            --model <critic model> --effort xhigh
             --tools file_read,glob,grep --submit-schema <schema file>
 
     ``scratch_dir`` is PRE-SEEDED before the first attempt with the judged
     round's materials: ``manifest.json`` (the manifest, JSONL),
     ``notes.md``, ``evidence-bundle.md``, and ``validator-report.md``; the
     task file names them by path (the critic grounds with its read tools).
-    ``--effort none`` for the critic (kdsn.301: kimi3 ignores effort;
-    none is honest). ``--submit-schema`` is the driver-owned
+    ``--effort xhigh`` by default (SB ruling 2026-09-02: the judgment seat
+    reasons; the earlier ``none`` default cited kdsn.301 — a
+    blackwell/qwen38-provider-only finding mis-attributed to kimi3 — and
+    effort=none is never a default posture). ``--submit-schema`` is the
+    driver-owned
     ``submit-schema.json`` (see :data:`_SUBMIT_VALIDATION_SCHEMA`).
 
     Bounded failure: max 2 attempts total (the critic's own retry budget —
@@ -1323,7 +1327,7 @@ def run_critic(
         "--model",
         model,
         "--effort",
-        "none",
+        effort,
         "--tools",
         _CRITIC_TOOLS,
         "--submit-schema",
@@ -1425,6 +1429,13 @@ class _DecomposeDriver:
         self.max_repairs = max_repairs
         self.decomposer_model = decomposer_model
         self.decomposer_effort = decomposer_effort
+        # bead .173 (SB ruling 2026-09-02): the validation critic is a
+        # judgment seat — it reasons at xhigh by default (the old
+        # hardcoded --effort none cited kdsn.301, a
+        # blackwell/qwen38-provider-only finding mis-attributed to kimi3;
+        # effort=none is never a default posture). The driver owns the
+        # value: argv and the DECOMPOSE event record the SAME object.
+        self.critic_effort = "xhigh"
         # Decision 18: the critic station's model. The charter's
         # [roles.critic].model is the registry NAME (or an already-qualified
         # value): the exec's --model carries the QUALIFIED form
@@ -1510,6 +1521,7 @@ class _DecomposeDriver:
         wall_time_seconds: float,
         prompt_artifact_hash: str,
         tool_trace: list[dict[str, Any]] | None = None,
+        effort: str = "",
     ) -> None:
         """ONE ``EventType.DECOMPOSE`` event for a SUCCESSFUL LLM invocation
         (the decomposer exec that produced output — manifest, phase plan, or
@@ -1552,6 +1564,7 @@ class _DecomposeDriver:
             computed_usd=computed_usd,
             wall_time_seconds=wall_time_seconds,
             prompt_artifact_hash=prompt_artifact_hash,
+            effort=effort,
             **({"tool_trace": tool_trace} if tool_trace is not None else {}),
         )
         self.record_plane.append(event)
@@ -1628,6 +1641,7 @@ class _DecomposeDriver:
                 wall_time_seconds=wall,
                 prompt_artifact_hash=self.prompt_hash,
                 tool_trace=bound_tool_trace(output.tool_trace),
+                effort=self.decomposer_effort,
             )
         return output
 
@@ -1679,6 +1693,7 @@ class _DecomposeDriver:
             prompts_dir=self.prompts_dir,
             scratch_dir=self._critic_scratch(subject, round_no),
             schema_path=self.submit_schema_path,
+            effort=self.critic_effort,
         )
         wall = time.monotonic() - t0
         self._write(
@@ -1693,6 +1708,7 @@ class _DecomposeDriver:
             wall_time_seconds=wall,
             prompt_artifact_hash=self.critic_prompt_hash,
             tool_trace=bound_tool_trace(result.get("tool_trace")),
+            effort=self.critic_effort,
         )
         self.findings_history.append(
             {

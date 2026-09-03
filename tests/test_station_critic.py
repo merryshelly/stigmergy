@@ -270,6 +270,7 @@ def test_gate_station_happy_path(tmp_path):
         "prompt": "critic04",
     }
     assert gate_fields["station_attempts"] == 1
+    assert gate_fields["effort"] == "xhigh"  # SB ruling 2026-09-02: judge seat reasons
 
     # ONE exec, correct argv
     assert len(script.calls) == 1

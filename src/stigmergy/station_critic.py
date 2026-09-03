@@ -7,7 +7,7 @@ decomposer::
 
     openalph exec --agent stigmergy-decomposer --task-file <task.md>
         --system-prompt-file <prompts_dir>/<prompt artifact>
-        --model <qualified critic model> --effort none
+        --model <qualified critic model> --effort xhigh   # SB ruling 2026-09-02: judge seat reasons
         --tools file_read,glob,grep,file_ticket --submit-schema <schema file>
 
 The role lives in a versioned prompt artifact (the system prompt); the
@@ -781,6 +781,7 @@ class StationGateCritic:
             },
             "station_attempts": attempts_used,
             "filings_lost_batch": filings_lost_batch,
+            "effort": self._effort,
         }
         return verdict, gate_fields, filed_tickets
 
@@ -961,4 +962,5 @@ class StationRangeCritic:
             prompt_artifact_hash=self.prompt_artifact_hash,
             model=self._model,
             usage=classified["usage"],
+            effort=self._effort,
         )

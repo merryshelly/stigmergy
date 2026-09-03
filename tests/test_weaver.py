@@ -2844,6 +2844,7 @@ class GroundingStationStub:
                     "prompt": "critic04",
                 },
                 "station_attempts": 1,
+                "effort": "xhigh",
             },
             [],
         )
@@ -2944,6 +2945,7 @@ def test_gate_event_carries_station_audit_fields(tmp_path, store, plane):
         "prompt": "critic04",
     }
     assert event["station_attempts"] == 1
+    assert event["effort"] == "xhigh"  # the weaver copies the station effort onto the GATE event
     # existing provenance keys untouched
     assert event["model"] == "synthetic/hf:moonshotai/Kimi-K3"
     assert event["tokens"] == {"in": 1, "cached": 0, "out": 1, "reasoning": 0}

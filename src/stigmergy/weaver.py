@@ -1306,6 +1306,8 @@ class Weaver:
             fields["station"] = gate_fields["station"]
         if "station_attempts" in gate_fields:
             fields["station_attempts"] = gate_fields["station_attempts"]
+        if "effort" in gate_fields:
+            fields["effort"] = gate_fields["effort"]
         event = make_event(EventType.GATE, **fields)
         self.record_plane.append(event)
 

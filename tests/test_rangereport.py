@@ -352,6 +352,7 @@ def test_range_critic_never_files_beads():
         "prompt_artifact_hash",
         "model",
         "usage",
+        "effort",  # bead .173: station range-critic exec effort
     }
     assert isinstance(result.findings, str)
 
