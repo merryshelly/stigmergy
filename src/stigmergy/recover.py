@@ -40,7 +40,15 @@ from typing import Any, Protocol
 
 from stigmergy import intake
 from stigmergy.records import EventType, RecordPlane, make_event
-from stigmergy.statemachine import TERMINAL_STATES
+from stigmergy.statemachine import (
+    ESCALATED,
+    IN_FLIGHT,
+    LANDED,
+    PARKED,
+    POOL,
+    REJECTED,
+    TERMINAL_STATES,
+)
 
 # Event types that count as a dispatch's terminal seal for orphan detection.
 # A DISPOSITION event (whether written by the normal loop via
@@ -276,3 +284,61 @@ def _clear_stale_git_locks(git_repo_paths: list[str | os.PathLike[str]]) -> list
         if cleared_path is not None:
             cleared.append(cleared_path)
     return cleared
+
+
+# --- event-log projection (read-only drift reporting) ------------------------
+
+
+# The named disposition-to-state mapping (SPEC §9): a DISPOSITION event's
+# `disposition` value is the ticket-table state the ticket is expected to
+# hold afterwards. Terminal dispositions name their state directly; the
+# pool re-entry dispositions — daemon infra fast path (`infra-retry`),
+# quota-governor lane park (`quota-parked`), the retry-ladder re-entry
+# (`pool-reentry`), and this module's own orphan seal (`orphaned`) — all
+# project `pool`.
+DISPOSITION_TO_STATE: dict[str, str] = {
+    "landed": LANDED,
+    "rejected": REJECTED,
+    "escalated": ESCALATED,
+    "parked": PARKED,
+    "pool-reentry": POOL,
+    "infra-retry": POOL,
+    "quota-parked": POOL,
+    "orphaned": POOL,
+}
+
+
+def project_ticket_states(events: list[dict[str, Any]]) -> dict[str, str]:
+    """Pure projection: the full event log -> per-ticket projected
+    ticket-table state.
+
+    Walks ``events`` in log order and keeps, for each ticket, the state
+    implied by that ticket's most recent state-defining event:
+
+    - a DISPATCH event projects its ticket to ``in_flight`` (an open
+      dispatch — no terminal disposition has been recorded for it yet);
+    - a DISPOSITION event whose `disposition` appears in
+      :data:`DISPOSITION_TO_STATE` projects the mapped state.
+
+    A DISPATCH after a disposition is a RE-dispatch (pool re-entry
+    already journaled) and correctly re-projects the ticket to
+    ``in_flight``. Tickets with no events at all — or only events that
+    define no state — are ABSENT from the returned mapping (there is
+    nothing to compare a store row against).
+
+    Pure: reads ``events`` only. It performs no mutation of the input
+    list or its dicts, and never touches a ticket store or record plane.
+    """
+    projection: dict[str, str] = {}
+    for ev in events:
+        ticket = ev.get("ticket")
+        if not isinstance(ticket, str):
+            continue
+        event_type = ev.get("event_type")
+        if event_type == EventType.DISPATCH.value:
+            projection[ticket] = IN_FLIGHT
+        elif event_type == EventType.DISPOSITION.value:
+            state = DISPOSITION_TO_STATE.get(ev.get("disposition"))
+            if state is not None:
+                projection[ticket] = state
+    return projection

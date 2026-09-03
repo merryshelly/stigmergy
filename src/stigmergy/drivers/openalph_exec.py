@@ -35,7 +35,11 @@ sibling import — do not duplicate).
   6: stdout discipline is load-bearing) and the classification table is
   spec §4.1's CLOSED vocabulary:
 
-  - ``status="done"``: ``usage["out"] >= budgets.output_tokens`` ->
+  - ``status="done"``: a ``stop_reason`` of ``max_tokens``/``length`` (the
+    final turn was truncated at the output ceiling — never a completion) ->
+    FAILED/ceiling_trip="output_tokens", the stop_reason named in the detail
+    (same provenance channel as the ``relay-deny:<reason>`` details);
+    else ``usage["out"] >= budgets.output_tokens`` ->
     FAILED/ceiling_trip="output_tokens" (claude_code parity); else DONE.
   - ``status="failed"`` + ``deny_reason`` in {quota-calls, quota-tokens} ->
     FAILED + ceiling_trip ("driver_turns"/"output_tokens") + detail prefix
@@ -236,6 +240,20 @@ def _classify(
     detail = detail_raw if isinstance(detail_raw, str) and detail_raw else ""
 
     if status == "done":
+        stop_reason = result_obj.get("stop_reason")
+        if stop_reason in ("max_tokens", "length"):
+            # A done result whose final turn ended truncated at the output
+            # ceiling is NOT a completion — read FAILED/output_tokens
+            # regardless of usage (a provider can cut the turn with usage
+            # still under budget). The offending stop_reason value rides the
+            # DISPATCH-event detail provenance channel, like the
+            # 'relay-deny:<reason>' details.
+            return (
+                DispatchStatus.FAILED,
+                "output_tokens",
+                f"truncated:stop_reason={stop_reason!r} — the final turn was "
+                "cut at the output-token ceiling, not a completed result",
+            )
         if usage["out"] >= budgets.output_tokens:
             return (
                 DispatchStatus.FAILED,

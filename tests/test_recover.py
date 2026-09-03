@@ -15,9 +15,22 @@ from typing import Any
 import pytest
 
 from stigmergy.records import EventType, RecordPlane, make_event
-from stigmergy.recover import RecoveryError, RecoveryReport, recover
+from stigmergy.recover import (
+    DISPOSITION_TO_STATE,
+    RecoveryError,
+    RecoveryReport,
+    project_ticket_states,
+    recover,
+)
 from stigmergy.rig import RigStore
-from stigmergy.statemachine import IN_FLIGHT, LANDED, POOL
+from stigmergy.statemachine import (
+    ESCALATED,
+    IN_FLIGHT,
+    LANDED,
+    PARKED,
+    POOL,
+    REJECTED,
+)
 
 # --- fixtures / helpers ------------------------------------------------------
 
@@ -490,3 +503,108 @@ def test_recover_terminal_ticket_running_container_not_reaped(
 
     assert report.reaped_containers == []
     assert reaper.reaped == []
+
+
+# --- project_ticket_states (pure event-log -> ticket-table projection) -------
+
+
+def test_disposition_to_state_mapping_is_named() -> None:
+    # The named disposition-to-state mapping the projection is built from:
+    # terminal dispositions name their state; every pool re-entry projects pool.
+    assert DISPOSITION_TO_STATE == {
+        "landed": LANDED,
+        "rejected": REJECTED,
+        "escalated": ESCALATED,
+        "parked": PARKED,
+        "pool-reentry": POOL,
+        "infra-retry": POOL,
+        "quota-parked": POOL,
+        "orphaned": POOL,
+    }
+
+
+def test_project_ticket_states_landed_disposition_projects_landed() -> None:
+    events = [
+        make_dispatch_event(ticket="t-landed", dispatch_id="d-1").payload,
+        make_disposition_event(
+            ticket="t-landed", dispatch_id="d-1", disposition="landed"
+        ).payload,
+    ]
+    assert project_ticket_states(events) == {"t-landed": LANDED}
+
+
+@pytest.mark.parametrize("disposition", ["infra-retry", "quota-parked", "orphaned", "pool-reentry"])
+def test_project_ticket_states_pool_reentry_projects_pool(disposition: str) -> None:
+    events = [
+        make_dispatch_event(ticket="t-retry", dispatch_id="d-2").payload,
+        make_disposition_event(
+            ticket="t-retry",
+            dispatch_id="d-2",
+            attempt_kind="infra-retry",
+            disposition=disposition,
+        ).payload,
+    ]
+    assert project_ticket_states(events) == {"t-retry": POOL}
+
+
+def test_project_ticket_states_parked_disposition_projects_parked() -> None:
+    events = [
+        make_dispatch_event(ticket="t-parked", dispatch_id="d-3").payload,
+        make_disposition_event(ticket="t-parked", dispatch_id="d-3", disposition="parked").payload,
+    ]
+    assert project_ticket_states(events) == {"t-parked": PARKED}
+
+
+def test_project_ticket_states_open_dispatch_projects_in_flight() -> None:
+    # A dispatch with no terminal disposition anywhere projects in-flight.
+    events = [make_dispatch_event(ticket="t-open", dispatch_id="d-4").payload]
+    assert project_ticket_states(events) == {"t-open": IN_FLIGHT}
+
+
+def test_project_ticket_states_rejected_and_escalated_project_their_states() -> None:
+    events = [
+        make_dispatch_event(ticket="t-rej", dispatch_id="d-5").payload,
+        make_disposition_event(ticket="t-rej", dispatch_id="d-5", disposition="rejected").payload,
+        make_dispatch_event(ticket="t-esc", dispatch_id="d-6", attempt=2).payload,
+        make_disposition_event(
+            ticket="t-esc",
+            dispatch_id="d-6",
+            attempt=2,
+            attempt_kind="tier1-repair",
+            disposition="escalated",
+            reason="ladder-exhausted",
+        ).payload,
+    ]
+    assert project_ticket_states(events) == {"t-rej": REJECTED, "t-esc": ESCALATED}
+
+
+def test_project_ticket_states_redispatch_after_reentry_reprojects_in_flight() -> None:
+    # pool re-entry disposition, then a fresh dispatch: the ticket is open
+    # again, so the projection moves back to in_flight.
+    events = [
+        make_dispatch_event(ticket="t-re", dispatch_id="d-7").payload,
+        make_disposition_event(
+            ticket="t-re", dispatch_id="d-7", attempt_kind="infra-retry", disposition="infra-retry"
+        ).payload,
+        make_dispatch_event(ticket="t-re", dispatch_id="d-8", attempt=2).payload,
+    ]
+    assert project_ticket_states(events) == {"t-re": IN_FLIGHT}
+
+
+def test_project_ticket_states_tickets_without_events_are_absent() -> None:
+    events = [make_dispatch_event(ticket="t-only", dispatch_id="d-9").payload]
+    projection = project_ticket_states(events)
+    assert projection == {"t-only": IN_FLIGHT}
+    assert "t-no-events" not in projection
+
+    assert project_ticket_states([]) == {}
+
+
+def test_project_ticket_states_does_not_mutate_its_input() -> None:
+    events = [
+        make_dispatch_event(ticket="t-mut", dispatch_id="d-10").payload,
+        make_disposition_event(ticket="t-mut", dispatch_id="d-10", disposition="parked").payload,
+    ]
+    snapshot = [dict(ev) for ev in events]
+    assert project_ticket_states(events) == {"t-mut": PARKED}
+    assert events == snapshot  # input list and its dicts are untouched

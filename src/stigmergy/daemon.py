@@ -402,6 +402,16 @@ class Daemon:
         # `None` -> every existing stub/test keeps today's behaviour.
         self._relay_feed_cell: dict | None = relay_feed_cell
         self._relay_feed_path: Path | None = None
+        # The dispatch ids THIS daemon process minted during the current
+        # run (minted in `_claim_and_prepare` — the same point that hands
+        # the id to the relay/egress setup, whose per-dispatch relay JSONL
+        # log is named `relay-<dispatch_id>.jsonl`). The governor's
+        # feed-folding consults this set: a relay feed file is folded only
+        # when its name matches `relay-<dispatch_id>.jsonl` for an id
+        # minted this run; every other relay feed file under the configured
+        # feed path is skipped with a logged warning, so a forged/planted
+        # feed file can never reach the governor state.
+        self._minted_dispatch_ids: set[str] = set()
         # The quota governor's live state (quotagov module): the
         # per-provider QuotaState map folded across polls from the relay
         # JSONL feed, the byte offset last read from each feed file, and the
@@ -755,6 +765,12 @@ class Daemon:
         # This is the same id that prepare_dispatch would mint, minted early so both
         # relay and egress can log it from the very first request.
         real_dispatch_id = generate_worker_name(self._store, "worker", lane.model, lane.prompt)
+        # Record the mint for the governor's feed-name gate: this run now
+        # owns `real_dispatch_id`, so the relay feed file the relay logs to
+        # (`relay-<real_dispatch_id>.jsonl`) is folded — and no other relay
+        # feed file under the configured feed path is (see
+        # `_refresh_governor` / `_is_minted_relay_feed`).
+        self._minted_dispatch_ids.add(real_dispatch_id)
 
         egress_handle = self._setup_egress(ticket_id, lane, now, real_dispatch_id)
         egress_socket = egress_handle.socket_path if egress_handle is not None else None
@@ -926,8 +942,33 @@ class Daemon:
             return [self._relay_feed_path]
         return None
 
+    def _is_minted_relay_feed(self, path: Path) -> bool:
+        """``True`` only when ``path`` is named ``relay-<dispatch_id>.jsonl``
+        for a dispatch id THIS daemon process minted during the current run.
+
+        This is the governor's feed-name gate: the relay logs each dispatch
+        to ``relay-<dispatch_id>.jsonl``, so a feed file the governor may
+        fold is one named for an id this run minted — any other relay feed
+        file (forged, planted, or stale) is skipped. Name inspection only;
+        the check itself can never raise (a name that does not parse is
+        simply not minted)."""
+        try:
+            name = path.name
+            prefix, suffix = "relay-", ".jsonl"
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                return False
+            return name[len(prefix) : -len(suffix)] in self._minted_dispatch_ids
+        except Exception:  # noqa: BLE001 - the skip decision must never raise
+            return False
+
     def _refresh_governor(self) -> None:
         """Fold the new relay-feed lines into the persistent governor state.
+
+        Feed-name gate first: a candidate feed file is folded only when its
+        name is ``relay-<dispatch_id>.jsonl`` for a dispatch id this run
+        minted; every other candidate is skipped WHOLESALE (no line of it
+        reaches the governor state) and logged exactly once as a
+        module-logger warning naming the file.
 
         Offset-based per feed file (only appended bytes are read, ever);
         merging is latest-record-wins per provider. Never raises: the
@@ -937,6 +978,12 @@ class Daemon:
         if not paths:
             return
         for path in paths:
+            if not self._is_minted_relay_feed(path):
+                _logger.warning(
+                    "skipping relay feed file named for a dispatch id this run did not mint: %s",
+                    path,
+                )
+                continue
             key = str(path)
             governor, next_offset = read_feed(path, self._feed_offsets.get(key, 0))
             self._feed_offsets[key] = next_offset

@@ -33,7 +33,7 @@ from stigmergy.critic import Critic, CriticInfraError
 from stigmergy.daemon import Daemon
 from stigmergy.intake import eligible
 from stigmergy.rangereport import RangeCritic
-from stigmergy.records import RecordPlane
+from stigmergy.records import RecordPlane, make_event
 from stigmergy.rig import create_rig, resolve_rig
 from stigmergy.steering import derive_steering
 
@@ -552,6 +552,14 @@ def _seed_filed(rigs_root: Path, filed_id: str = "filed-dispatch-1-1") -> None:
             discovered_from="dispatch-1@workspace-e2uh.8",
             proposal_hash="proposalhash",
         )
+    finally:
+        resolved.store.close()
+
+
+def _triage_filed(rigs_root: Path, filed_id: str) -> None:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        resolved.store.mark_filed_ticket_triaged(filed_id, outcome="promoted")
     finally:
         resolved.store.close()
 
@@ -1353,7 +1361,12 @@ def test_51_subscription_model_absent_usage_stays_declared_zero(tmp_path, monkey
     assert events[0]["computed_usd"] == 0.0  # declared subscription $0, not unbudgetable
 
 
-# --- filed: list untriaged filed proposals ---
+# --- filed: list filed proposals with stable key=value columns ---
+
+
+def _filed_lines(out: str) -> list[list[str]]:
+    """Tokenize `filed` output into per-line token lists for positional asserts."""
+    return [line.split() for line in out.strip().splitlines()]
 
 
 def test_filed_with_populated_untriaged_pool(tmp_path: Path, capsys) -> None:
@@ -1365,16 +1378,56 @@ def test_filed_with_populated_untriaged_pool(tmp_path: Path, capsys) -> None:
     assert rc == 0
     out = capsys.readouterr().out
 
-    # Check that both filed proposals appear
-    assert "filed-1" in out
-    assert "filed-2" in out
-    assert "proposal" in out  # title field
+    # Both filed proposals appear, one line each, in insertion (created_at) order
+    lines = _filed_lines(out)
+    assert len(lines) == 2
 
-    # Check that provenance fields are rendered
-    assert "origin_role=worker" in out
-    assert "origin_worker=worker-1" in out
-    assert "origin_dispatch_id=dispatch-1" in out
-    assert "discovered_from=dispatch-1@workspace-e2uh.8" in out
+    for tokens, filed_id in zip(lines, ["filed-1", "filed-2"], strict=True):
+        # Fixed positional column layout: id, origin_role, parent_ticket,
+        # age_seconds (integer), triaged (0 or 1) — nothing else.
+        assert len(tokens) == 5
+        assert tokens[0] == filed_id
+        assert tokens[1] == "origin_role=worker"
+        assert tokens[2] == "parent_ticket=workspace-e2uh.8"
+        assert tokens[3].startswith("age_seconds=")
+        assert int(tokens[3].split("=", 1)[1]) >= 0
+        assert tokens[4] == "triaged=0"
+
+
+def test_filed_untriaged_only_filters_to_untriaged_rows(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-untriaged")
+    _seed_filed(rigs_root, "filed-triaged")
+    _triage_filed(rigs_root, "filed-triaged")
+
+    rc = main(["filed", "--untriaged-only", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    lines = _filed_lines(out)
+    assert [line[0] for line in lines] == ["filed-untriaged"]
+    assert lines[0][4] == "triaged=0"
+
+
+def test_filed_default_listing_includes_triaged_rows(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_filed(rigs_root, "filed-untriaged")
+    _seed_filed(rigs_root, "filed-triaged")
+    _triage_filed(rigs_root, "filed-triaged")
+
+    # Without --untriaged-only, both rows are listed; triage state per row.
+    rc = main(["filed", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    by_id = {line[0]: line for line in _filed_lines(out)}
+    assert set(by_id) == {"filed-untriaged", "filed-triaged"}
+    assert by_id["filed-untriaged"][4] == "triaged=0"
+    assert by_id["filed-triaged"][4] == "triaged=1"
+    # triaged=1 row still carries the full stable column layout
+    assert by_id["filed-triaged"][1] == "origin_role=worker"
+    assert by_id["filed-triaged"][2] == "parent_ticket=workspace-e2uh.8"
+    assert by_id["filed-triaged"][3].startswith("age_seconds=")
 
 
 def test_filed_with_empty_pool(tmp_path: Path, capsys) -> None:
@@ -2076,3 +2129,108 @@ def test_build_daemon_wires_driver_registry(tmp_path: Path) -> None:
         }
     finally:
         daemon._store.close()
+
+
+# --- recover subcommand (read-only drift report) -----------------------------
+
+
+def _recover_event(event_type: str, *, ticket: str, dispatch_id: str, **overrides):
+    """One valid SPEC §8-shaped event for the recover drift fixtures."""
+    base: dict = {
+        "rig": RIG,
+        "ticket": ticket,
+        "dispatch_id": dispatch_id,
+        "attempt": 1,
+        "attempt_kind": "initial",
+        "rung": "cheap",
+        "worker": "w-1",
+        "charter_hash": "c-h",
+        "approval_hash": "a-h",
+        "image_digest": "sha256:d",
+        "model": "haiku",
+        "model_version": "h-1",
+        "price_table_version": "p-1",
+        "tokens": {"in": 0, "cached": 0, "out": 0, "reasoning": 0},
+        "computed_usd": 0.0,
+        "wall_time_seconds": 0.0,
+    }
+    base.update(overrides)
+    if event_type == "dispatch":
+        base.setdefault("prompt_artifact_hash", "code01-h")
+    return make_event(event_type, **base)
+
+
+def _append_events(rigs_root: Path, *events) -> None:
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        plane = RecordPlane(resolved.rig_paths["records_dir"])
+        for ev in events:
+            plane.append(ev)
+    finally:
+        resolved.store.close()
+
+
+def _recover_fixture(rigs_root: Path) -> None:
+    """Seed a drifting ticket (store says parked, log says landed) and an
+    agreeing one (store says in_flight, log says open dispatch)."""
+    _seed_ticket(rigs_root, "t-drift", state="parked")
+    _seed_ticket(rigs_root, "t-agree", state="in_flight")
+    _append_events(
+        rigs_root,
+        _recover_event("dispatch", ticket="t-drift", dispatch_id="d-drift"),
+        _recover_event(
+            "disposition", ticket="t-drift", dispatch_id="d-drift", disposition="landed"
+        ),
+        _recover_event("dispatch", ticket="t-agree", dispatch_id="d-agree"),
+    )
+
+
+def test_recover_verb_reports_drift_and_mutates_nothing(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _recover_fixture(rigs_root)
+
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        rows_before = resolved.store.list_tickets()
+        events_before = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+
+    rc = main(["recover", "--rig", RIG, "--rigs-root", str(rigs_root), "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # One line for the drifting ticket: id + store state + projected state.
+    assert "t-drift" in out and "parked" in out and "landed" in out
+    # The agreeing ticket is not reported.
+    assert "t-agree" not in out
+
+    # Read-only: ticket rows and the event log are byte-identical after.
+    resolved = resolve_rig(RIG, rigs_root=rigs_root)
+    try:
+        rows_after = resolved.store.list_tickets()
+        events_after = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+    assert rows_after == rows_before
+    assert len(events_after) == len(events_before)
+    assert events_after == events_before
+
+
+def test_recover_verb_no_drift_exits_0(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    _seed_ticket(rigs_root, "t-fine", state="pool")
+    # No events at all -> nothing projected -> nothing to disagree with.
+    rc = main(["recover", "--rig", RIG, "--rigs-root", str(rigs_root)])
+    assert rc == 0
+    assert "no drift" in capsys.readouterr().out
+
+
+def test_recover_verb_no_drift_with_matching_log_exits_0(tmp_path: Path, capsys) -> None:
+    rigs_root = scaffold_rig(tmp_path)
+    # Store and log agree (open dispatch, ticket in_flight) -> no drift line.
+    _seed_ticket(rigs_root, "t-match", state="in_flight")
+    _append_events(rigs_root, _recover_event("dispatch", ticket="t-match", dispatch_id="d-m"))
+
+    rc = main(["recover", "--rig", RIG, "--rigs-root", str(rigs_root), "--dry-run"])
+    assert rc == 0
+    assert "no drift" in capsys.readouterr().out

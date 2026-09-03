@@ -517,6 +517,55 @@ def test_classify_done_above_output_ceiling_is_failed_output_tokens(tmp_path):
     assert result.ceiling_trip == "output_tokens"
 
 
+def test_classify_done_truncated_max_tokens_is_failed_output_tokens(tmp_path):
+    # A done result whose final turn ended on a truncated completion is
+    # NEVER read as a success: FAILED with the output_tokens ceiling, even
+    # with usage far under budget (a provider can cut the turn early).
+    usage = {"in": 1, "cached": 0, "out": 10, "reasoning": 0}  # << 1000 budget
+    result = _classify_spawn(
+        tmp_path, _exec_json(status="done", stop_reason="max_tokens", usage=usage)
+    )
+    assert result.status is DispatchStatus.FAILED
+    assert result.status is not DispatchStatus.DONE
+    assert result.ceiling_trip == "output_tokens"
+    # The offending stop_reason value rides the detail provenance channel
+    # (the same channel as the 'relay-deny:<reason>' details).
+    assert "max_tokens" in result.detail
+
+
+def test_classify_done_truncated_length_is_failed_output_tokens(tmp_path):
+    # The OpenAI-surface truncation form: same classification.
+    usage = {"in": 1, "cached": 0, "out": 10, "reasoning": 0}  # << 1000 budget
+    result = _classify_spawn(
+        tmp_path, _exec_json(status="done", stop_reason="length", usage=usage)
+    )
+    assert result.status is DispatchStatus.FAILED
+    assert result.status is not DispatchStatus.DONE
+    assert result.ceiling_trip == "output_tokens"
+    assert "length" in result.detail
+
+
+def test_classify_done_truncated_ignores_usage_at_ceiling(tmp_path):
+    # The truncation row is read regardless of the usage values — usage at
+    # the ceiling does not change the classification (still FAILED with the
+    # output_tokens ceiling, stop_reason named in detail).
+    usage = {"in": 1, "cached": 0, "out": 1000, "reasoning": 0}
+    result = _classify_spawn(
+        tmp_path, _exec_json(status="done", stop_reason="max_tokens", usage=usage)
+    )
+    assert result.status is DispatchStatus.FAILED
+    assert result.ceiling_trip == "output_tokens"
+    assert "max_tokens" in result.detail
+
+
+def test_classify_done_non_truncation_stop_reason_is_done(tmp_path):
+    # A non-truncation stop_reason at done (usage under budget) still
+    # classifies DONE — only max_tokens/length are truncation signals.
+    result = _classify_spawn(tmp_path, _exec_json(status="done", stop_reason="end_turn"))
+    assert result.status is DispatchStatus.DONE
+    assert result.ceiling_trip is None
+
+
 def test_classify_quota_calls_deny_is_failed_driver_turns(tmp_path):
     # spec §2 design decision 2: a quota-calls deny is Stigmergy's OWN
     # per-dispatch budget speaking — a ceiling trip (DEGENERATE rung attempt),

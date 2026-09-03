@@ -23,12 +23,21 @@ physics, not a filter that can regress. This module never inserts into
   (`<worktree>/.stigmergy/filed-tickets.json`), reads + parses it, then
   delegates to :func:`file_proposals` with `origin_role="worker"`.
 
+The transport file is parsed as the append-friendly JSONL stream the
+`file_ticket` tool actually emits — one proposal object per line — with a
+backward-compat exception: a file whose WHOLE content is a single JSON
+array (the legacy shape) is still read as that proposal list. A line that
+fails JSON parsing or is not an object is a PER-LINE `bad-shape`
+rejection (never a whole-harvest rejection) and does not count against
+the filing count-cap.
+
 **Never raises into the dispatch teardown path.** `harvest_worker_filings`
 runs post-container-kill, inside the daemon's per-dispatch teardown
 (SPEC amendment A). Every failure mode — missing file (silent no-op, by
-design), unreadable/unsafe path, malformed JSON, non-list top level, bad
-proposal shape, oversize proposal, too many proposals — is captured as a
-:class:`FilingResult` with a `rejected` entry and/or a `ticket-filed`
+design), unreadable/unsafe path, undecodable (non-UTF-8) bytes
+(`malformed-json`), unparseable or non-object line (per-line `bad-shape`),
+bad proposal shape, oversize proposal, too many proposals — is captured as
+a :class:`FilingResult` with a `rejected` entry and/or a `ticket-filed`
 rejection event; none of them propagate an exception to the caller.
 
 **Honest zeros, not double-counted spend.** The harvest itself is a
@@ -383,10 +392,25 @@ def harvest_worker_filings(
     `<worktree>/.stigmergy/filed-tickets.json` (host-side, post-kill) and
     delegate to :func:`file_proposals` with `origin_role="worker"`.
 
+    The file is accepted in either shape:
+
+    - **JSONL (the shape the `file_ticket` tool emits):** one proposal
+      object per line, appended. Blank lines (including the trailing
+      newline) carry no proposal. Each non-blank line is validated
+      independently: a line that fails JSON parsing or is not an object
+      is a PER-LINE `bad-shape` rejection (one `ticket-filed` rejection
+      event + one `FilingResult.rejected` entry) while well-formed lines
+      from the same file are still filed — a corrupt tail line never
+      rejects the whole harvest, and a corrupt/non-object line does not
+      count against the filing count-cap.
+    - **Legacy whole-file JSON array:** a file whose entire content
+      parses as one JSON list is still read as that proposal list
+      (backward compatibility), unchanged in semantics.
+
     MUST NEVER RAISE — this runs in the dispatch teardown path (SPEC
     amendment A). Every failure mode is captured in the returned
-    `FilingResult` (and, except for the missing-file case, in exactly one
-    `ticket-filed` rejection event).
+    `FilingResult` (and, except for the missing-file case, in one
+    `ticket-filed` rejection event per failure).
     """
     worktree_path = Path(worktree)
 
@@ -443,8 +467,8 @@ def harvest_worker_filings(
         )
 
     try:
-        parsed = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
         return _reject_whole_harvest(
             record_plane=record_plane,
             ctx=ctx,
@@ -454,15 +478,61 @@ def harvest_worker_filings(
             raw_bytes=raw_bytes,
         )
 
-    if not isinstance(parsed, list):
-        return _reject_whole_harvest(
-            record_plane=record_plane,
-            ctx=ctx,
-            attempt_kind=attempt_kind,
-            origin_role="worker",
-            reason="not-a-list",
-            raw_bytes=raw_bytes,
-        )
+    # The file is either one whole JSON value (the legacy array shape, or a
+    # single-line JSONL file whose content is one object/scalar) or not —
+    # in which case it is read line-by-line as the JSONL stream.
+    try:
+        whole = json.loads(text)
+    except json.JSONDecodeError:
+        whole = None
+
+    line_rejected: list[dict[str, Any]] = []
+    if isinstance(whole, list):
+        # Legacy backward-compat shape: one whole-file JSON array of
+        # proposals, handled exactly as before.
+        candidates: list[Any] = whole
+    else:
+        # JSONL: one proposal object per line. When the whole-file parse
+        # succeeded (a dict or scalar), the entire content is that ONE
+        # line; otherwise the file is not a single JSON value and is split
+        # into lines.
+        lines = [text] if whole is not None else text.splitlines()
+        candidates = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # Blank lines (e.g. the trailing newline of an appended
+                # stream) carry no proposal — never a rejection.
+                continue
+            try:
+                obj: Any = json.loads(stripped)
+            except json.JSONDecodeError:
+                obj = stripped  # unparseable line — per-line rejection below
+            if isinstance(obj, dict):
+                candidates.append(obj)
+                continue
+            # A line that fails JSON parsing or is not an object is a
+            # PER-LINE bad-shape rejection: well-formed lines from the same
+            # file are still filed (no whole-harvest rejection for a
+            # corrupt tail line), and the line does not count against the
+            # filing count-cap (which file_proposals enforces on
+            # `candidates` only).
+            _emit(
+                record_plane=record_plane,
+                ctx=ctx,
+                attempt_kind=attempt_kind,
+                origin={
+                    "role": "worker",
+                    "worker": ctx["worker"],
+                    "dispatch_id": ctx["dispatch_id"],
+                    "parent_ticket": ctx["ticket"],
+                },
+                proposal_hash_value=_whole_filing_hash(obj),
+                outcome="rejected",
+                reason="bad-shape",
+                filed_ticket_id=None,
+            )
+            line_rejected.append({"reason": "bad-shape", "title": None})
 
     # Scan for the first dict with blocks_ticket=True to surface as escape.
     # This is purely additive: the escape object is ALSO still filed as a
@@ -470,7 +540,7 @@ def harvest_worker_filings(
     # filed_tickets for triage) — we do NOT exclude it from filing.
     escape_dict: dict[str, Any] | None = None
     try:
-        for obj in parsed:
+        for obj in candidates:
             if isinstance(obj, dict) and obj.get("blocks_ticket") is True:
                 # Found the first escape object. Build the escape dict.
                 reason = obj.get("reason")
@@ -488,7 +558,7 @@ def harvest_worker_filings(
         escape_dict = None
 
     result = file_proposals(
-        parsed,
+        candidates,
         store=store,
         record_plane=record_plane,
         ctx=ctx,
@@ -498,6 +568,8 @@ def harvest_worker_filings(
         max_bytes=max_bytes,
         now=now,
     )
+    if line_rejected:
+        result = replace(result, rejected=line_rejected + result.rejected)
     if escape_dict is not None:
         return replace(result, escape=escape_dict)
     return result

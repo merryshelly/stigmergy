@@ -75,8 +75,11 @@ STATES: frozenset[str] = frozenset(
 TERMINAL_STATES: frozenset[str] = frozenset({LANDED, DONE})
 
 # The four lease columns (RigStore schema, ticket .15) — cleared together
-# whenever a ticket re-enters `pool` (recover/retry re-entry never leaves a
-# stale lease pinned to a ticket that is once again claimable).
+# whenever :func:`transition` moves a ticket to ANY state other than
+# `claimed`/`in_flight`: a parked, gated, failed, escalated, landed, or
+# otherwise-settled row never retains a stale lease (recover/retry
+# re-entry into `pool` is just the original case of this rule — a claimable
+# ticket holds no lease). Only the two lease-holding states keep them.
 _LEASE_FIELDS: tuple[str, ...] = (
     "lease_owner",
     "lease_dispatch_id",
@@ -172,9 +175,14 @@ def transition(
     even when ``to_state`` would otherwise be a legal destination from the
     ticket's *actual* current state.
 
-    When ``to_state == POOL``, all four lease fields are cleared to `None`
-    (recover/retry re-entry: a ticket back in the pool holds no stale lease).
-    Counters (`attempts_used`, `integration_failures`, `current_rung`) are
+    Whenever ``to_state`` is any state other than ``CLAIMED``/``IN_FLIGHT``,
+    all four lease fields are cleared to `None` (a parked, gated, failed,
+    escalated, landed, or otherwise-settled row never retains a stale lease;
+    pool re-entry — the recover/retry case — is subsumed by this rule). The
+    ``CLAIMED``/``IN_FLIGHT`` states are the only two a held lease
+    legitimately survives in: the ``claimed`` -> ``in_flight`` move leaves
+    the dispatch identity channel untouched. Counters
+    (`attempts_used`, `integration_failures`, `current_rung`) are
     NEVER touched here — this is the happy-path state setter only;
     :func:`apply_decision` is where a retry decision's counter effects land.
 
@@ -204,7 +212,10 @@ def transition(
         )
 
     fields: dict[str, Any] = {"state": to_state}
-    if to_state == POOL:
+    if to_state not in (CLAIMED, IN_FLIGHT):
+        # Every non-lease-holding destination (pool, tier1_green, parked,
+        # gated, landed, rejected, failed, escalated, done) clears the four
+        # lease columns; only claimed/in_flight keep a live lease.
         fields.update(dict.fromkeys(_LEASE_FIELDS))
     store.update_ticket(ticket_id, **fields)
 

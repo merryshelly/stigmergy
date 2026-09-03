@@ -247,6 +247,37 @@ def test_ingest_manifest_error_messages_are_exact(store: RigStore) -> None:
     assert ids == {"t-store"}
 
 
+def test_ingest_manifest_scale_1000_unique_ids_all_insert(store: RigStore) -> None:
+    """At 1000-entry scale, an all-unique-id manifest inserts every ticket
+    with no errors — alongside the pre-existing two-entry duplicate case
+    above, this pins the duplicate check's behavior at manifest scale."""
+    manifest = [_entry(f"t-scale-{i}") for i in range(1000)]
+    assert len(manifest) == 1000
+    inserted, errors = ingest_manifest(store, manifest)
+    assert errors == []
+    assert inserted == [f"t-scale-{i}" for i in range(1000)]
+    for i in range(1000):
+        assert store.get_ticket(f"t-scale-{i}") is not None
+
+
+def test_ingest_manifest_scale_1000_first_last_duplicate_rejected(
+    store: RigStore,
+) -> None:
+    """A 1000-entry manifest whose first and last entries share an id is
+    rejected wholesale by the precomputed id_counts counting pass with the
+    exact duplicate message naming that id (the duplicate is reported at
+    the first occurrence) and zero tickets inserted."""
+    dup_id = "t-scale-dup"
+    manifest = [_entry(dup_id)]
+    manifest += [_entry(f"t-scale-{i}") for i in range(1, 999)]
+    manifest.append(_entry(dup_id))
+    assert len(manifest) == 1000
+    inserted, errors = ingest_manifest(store, manifest)
+    assert inserted == []
+    assert errors == [f"manifest entry 0 ({dup_id}) has duplicate id"]
+    assert store.list_tickets() == []
+
+
 def test_cli_intake_delegates_and_stays_byte_identical(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

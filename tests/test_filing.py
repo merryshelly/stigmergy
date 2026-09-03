@@ -302,10 +302,18 @@ def test_malformed_json_rejected_without_corruption_or_raise(tmp_path, store, pl
 
 def test_non_list_top_level_rejected(tmp_path, store, plane):
     worktree = tmp_path / "work"
-    seed_filings_file(worktree, {"title": "not", "description": "a list"})
+    # A top-level JSON scalar is neither the legacy array shape nor a
+    # proposal object: under JSONL semantics the whole content is ONE line
+    # that parses to a non-object -> a per-line bad-shape rejection, and
+    # nothing files (the not-list top-level outcome is unchanged).
+    seed_filings_file(worktree, "just a string")
     result = harvest(worktree, store, plane)
     assert result.accepted_ids == []
     assert store.list_filed_tickets() == []
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+    events = filed_events(plane)
+    assert len(events) == 1 and events[0]["outcome"] == "rejected"
 
 
 def test_proposal_missing_required_key_rejected(tmp_path, store, plane):
@@ -468,6 +476,175 @@ def test_missing_filings_file_is_a_silent_noop(tmp_path, store, plane):
     assert result.accepted_ids == []
     assert result.rejected == []
     assert filed_events(plane) == []  # no file -> no event at all
+
+
+# === JSONL transport shape (one proposal object per line) =================
+# The file_ticket tool APPENDS one JSON object per line to the transport
+# file; the harvest must accept that stream with per-line validation while
+# still honoring the legacy whole-file JSON array shape (backward compat).
+
+
+def seed_jsonl(worktree: Path, lines: list[str]) -> None:
+    """Write the transport file as a JSONL stream (one object per line,
+    trailing newline — exactly the shape an append-only tool leaves)."""
+    dest = worktree / FILED_TICKETS_REL
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(lines) + "\n")
+
+
+def test_jsonl_multiple_lines_all_filed(tmp_path, store, plane):
+    worktree = tmp_path / "work"
+    lines = [json.dumps(valid_proposal(i)) for i in (1, 2, 3)]
+    seed_jsonl(worktree, lines)
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 3
+    assert result.rejected == []
+    assert result.accepted_ids == [f"filed-worker-{DISPATCH_ID}-{n}" for n in (1, 2, 3)]
+    rows = store.list_filed_tickets()
+    assert {r["title"] for r in rows} == {valid_proposal(i)["title"] for i in (1, 2, 3)}
+    assert all(r["origin_role"] == "worker" for r in rows)
+    # one accepted ticket-filed event per line.
+    acc_events = [e for e in filed_events(plane) if e["outcome"] == "accepted"]
+    assert len(acc_events) == 3
+
+
+def test_jsonl_single_object_line_filed(tmp_path, store, plane):
+    # The N=1 case: the file content is a single valid JSON object (which
+    # also parses as a whole file) — one line, one filing.
+    worktree = tmp_path / "work"
+    seed_jsonl(worktree, [json.dumps(valid_proposal(1))])
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert result.rejected == []
+    assert store.list_filed_tickets()[0]["title"] == valid_proposal(1)["title"]
+
+
+def test_jsonl_corrupt_tail_line_is_per_line_rejection(tmp_path, store, plane):
+    # A corrupt TAIL line rejects ONLY itself (per-line bad-shape): the
+    # well-formed lines from the same file are still filed — no whole-
+    # harvest rejection.
+    worktree = tmp_path / "work"
+    seed_jsonl(
+        worktree,
+        [json.dumps(valid_proposal(1)), json.dumps(valid_proposal(2)), "{ truncated json oops"],
+    )
+
+    result = harvest(worktree, store, plane)  # must NOT raise
+
+    assert len(result.accepted_ids) == 2
+    assert {r["title"] for r in store.list_filed_tickets()} == {
+        valid_proposal(1)["title"],
+        valid_proposal(2)["title"],
+    }
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "bad-shape"
+    assert result.rejected[0]["title"] is None
+    rej_events = [e for e in filed_events(plane) if e["outcome"] == "rejected"]
+    assert len(rej_events) == 1
+    assert rej_events[0]["reason"] == "bad-shape"
+    assert rej_events[0]["filed_ticket_id"] is None
+
+
+def test_jsonl_non_object_line_rejected_bad_shape(tmp_path, store, plane):
+    # A line that parses as JSON but is not an object is a per-line
+    # bad-shape rejection; the well-formed sibling still files.
+    worktree = tmp_path / "work"
+    seed_jsonl(worktree, [json.dumps(valid_proposal(1)), "42"])
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 1
+    assert result.rejected == [{"reason": "bad-shape", "title": None}]
+    rej_events = [e for e in filed_events(plane) if e["outcome"] == "rejected"]
+    assert [e["reason"] for e in rej_events] == ["bad-shape"]
+
+
+def test_jsonl_corrupt_lines_do_not_count_toward_count_cap(tmp_path, store, plane):
+    # The count-cap applies to the well-formed proposal lines only: at
+    # cap with a corrupt tail line present, the valid lines still file —
+    # the corrupt line must not push the harvest into count-cap-exceeded
+    # (which would reject the whole harvest).
+    worktree = tmp_path / "work"
+    seed_jsonl(
+        worktree,
+        [json.dumps(valid_proposal(1)), json.dumps(valid_proposal(2)), "not json at all"],
+    )
+
+    result = harvest(worktree, store, plane, max_filings=2)
+
+    assert len(result.accepted_ids) == 2
+    assert [r["reason"] for r in result.rejected] == ["bad-shape"]
+    # no count-cap-exceeded event anywhere.
+    assert all(e["reason"] != "count-cap-exceeded" for e in filed_events(plane))
+
+
+def test_jsonl_blank_lines_are_not_proposals(tmp_path, store, plane):
+    # Blank lines (including the trailing newline of an appended stream)
+    # carry no proposal and are never rejections.
+    worktree = tmp_path / "work"
+    seed_jsonl(worktree, [json.dumps(valid_proposal(1)), "", json.dumps(valid_proposal(2))])
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 2
+    assert result.rejected == []
+
+
+def test_jsonl_escape_line_surfaces_and_files(tmp_path, store, plane):
+    # Escape routing works on the JSONL stream: a well-typed
+    # blocks_ticket=true line surfaces via FilingResult.escape AND is
+    # filed as a normal proposal, like the legacy array shape.
+    worktree = tmp_path / "work"
+    escape_line = json.dumps(
+        valid_proposal(1, blocks_ticket=True, reason="blocked",
+                      suspected_out_of_scope_paths=["other.py"])
+    )
+    seed_jsonl(worktree, [escape_line, json.dumps(valid_proposal(2))])
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 2
+    assert result.escape is not None
+    assert result.escape["reason"] == "blocked"
+    assert result.escape["suspected_out_of_scope_paths"] == ["other.py"]
+
+
+def test_jsonl_non_utf8_bytes_reject_whole_harvest(tmp_path, store, plane):
+    # Undecodable bytes are still a whole-harvest rejection (the file is
+    # not even a UTF-8 stream), unchanged from before.
+    worktree = tmp_path / "work"
+    dest = worktree / FILED_TICKETS_REL
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"\xff\xfe\x00garbage")
+
+    result = harvest(worktree, store, plane)  # must NOT raise
+
+    assert result.accepted_ids == []
+    assert store.list_filed_tickets() == []
+    assert len(result.rejected) == 1
+    events = filed_events(plane)
+    assert len(events) == 1 and events[0]["outcome"] == "rejected"
+    assert events[0]["reason"] == "malformed-json"
+
+
+def test_legacy_whole_file_array_still_honored(tmp_path, store, plane):
+    # Backward compatibility: a single whole-file JSON array (here
+    # pretty-printed across several lines, so it could NOT be read as
+    # JSONL line-by-line) is still parsed as the proposal list it always
+    # was.
+    worktree = tmp_path / "work"
+    props = [valid_proposal(i) for i in (1, 2)]
+    seed_filings_file(worktree, json.dumps(props, indent=2))
+
+    result = harvest(worktree, store, plane)
+
+    assert len(result.accepted_ids) == 2
+    assert result.rejected == []
+    assert {r["title"] for r in store.list_filed_tickets()} == {p["title"] for p in props}
 
 
 # === case 7: ticket-filed event shape + honest zeros + no secret ============

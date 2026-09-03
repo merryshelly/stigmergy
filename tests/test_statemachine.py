@@ -31,6 +31,7 @@ from stigmergy.statemachine import (
     POOL,
     REJECTED,
     STATES,
+    TERMINAL_STATES,
     TIER1_GREEN,
     AttemptDecision,
     CriticInfraDecision,
@@ -218,6 +219,112 @@ def test_transition_to_pool_clears_lease(store: RigStore) -> None:
     assert row_after["attempts_used"] == 2
     assert row_after["integration_failures"] == 1
     assert row_after["current_rung"] == "default"
+
+
+# --- 4b. store-level lease invariants ----------------------------------------
+
+
+_LEASE_COLUMNS: tuple[str, ...] = (
+    "lease_owner",
+    "lease_dispatch_id",
+    "lease_expires_at",
+    "lease_heartbeat_at",
+)
+
+
+def _assert_lease_cleared(store: RigStore, ticket_id: str, state: str) -> None:
+    row = store.get_ticket(ticket_id)
+    assert row is not None
+    assert row["state"] == state
+    for column in _LEASE_COLUMNS:
+        assert row[column] is None, (
+            f"{ticket_id!r} in state {state!r} retains stale {column}={row[column]!r}"
+        )
+
+
+def test_lease_cleared_in_every_settled_state_and_terminal_invariant(store: RigStore) -> None:
+    """Store-level invariant: a ticket moving to ANY state other than
+    ``claimed``/``in_flight`` must hold ``None`` in all four lease columns —
+    no parked, gated, failed, escalated, or landed row retains a stale
+    lease.
+
+    Drives one ticket through claim -> in_flight -> tier1_green -> parked
+    -> gated -> landed and a second through the escalation path claim ->
+    in_flight -> failed -> escalated, asserting the lease columns at every
+    stop. The held lease survives exactly one move — ``claimed`` ->
+    ``in_flight`` (the live dispatch identity channel) — and is cleared at
+    the first settled state. Finally, sweeps the whole store: every row in
+    a terminal state holds ``None`` in all four lease columns.
+    """
+    # --- settle-to-landed path ---
+    store.add_ticket(id="t-happy", title="Happy")
+    assert store.atomic_claim_ticket(
+        "t-happy",
+        owner="worker-1",
+        dispatch_id="dispatch-1",
+        lease_expires_at=1000.0,
+        lease_heartbeat_at=999.0,
+    )
+
+    row = store.get_ticket("t-happy")
+    assert row["state"] == CLAIMED
+    assert row["lease_owner"] == "worker-1"
+    assert row["lease_dispatch_id"] == "dispatch-1"
+    assert row["lease_expires_at"] == 1000.0
+    assert row["lease_heartbeat_at"] == 999.0
+
+    # claimed -> in_flight: the ONLY move a held lease legitimately makes;
+    # the dispatch identity channel survives it untouched.
+    transition(store, "t-happy", IN_FLIGHT, expected_from=CLAIMED)
+    row = store.get_ticket("t-happy")
+    assert row["state"] == IN_FLIGHT
+    assert row["lease_owner"] == "worker-1"
+    assert row["lease_dispatch_id"] == "dispatch-1"
+    assert row["lease_expires_at"] == 1000.0
+    assert row["lease_heartbeat_at"] == 999.0
+
+    # Every subsequent settled state clears all four lease columns.
+    transition(store, "t-happy", TIER1_GREEN, expected_from=IN_FLIGHT)
+    _assert_lease_cleared(store, "t-happy", TIER1_GREEN)
+    transition(store, "t-happy", PARKED, expected_from=TIER1_GREEN)
+    _assert_lease_cleared(store, "t-happy", PARKED)
+    transition(store, "t-happy", GATED, expected_from=PARKED)
+    _assert_lease_cleared(store, "t-happy", GATED)
+    transition(store, "t-happy", LANDED, expected_from=GATED)
+    _assert_lease_cleared(store, "t-happy", LANDED)
+
+    # --- escalation path ---
+    store.add_ticket(id="t-esc", title="Escalated")
+    assert store.atomic_claim_ticket(
+        "t-esc",
+        owner="worker-2",
+        dispatch_id="dispatch-2",
+        lease_expires_at=2000.0,
+        lease_heartbeat_at=1999.0,
+    )
+    row = store.get_ticket("t-esc")
+    assert row["state"] == CLAIMED
+    assert row["lease_owner"] == "worker-2"
+
+    transition(store, "t-esc", IN_FLIGHT, expected_from=CLAIMED)
+    row = store.get_ticket("t-esc")
+    assert row["state"] == IN_FLIGHT
+    assert row["lease_owner"] == "worker-2"  # survives claimed -> in_flight
+
+    transition(store, "t-esc", FAILED, expected_from=IN_FLIGHT)
+    _assert_lease_cleared(store, "t-esc", FAILED)
+    transition(store, "t-esc", ESCALATED, expected_from=FAILED)
+    _assert_lease_cleared(store, "t-esc", ESCALATED)
+
+    # --- terminal-state sweep: the invariant that matters for the store ---
+    terminal_rows = [row for row in store.list_tickets() if row["state"] in TERMINAL_STATES]
+    assert terminal_rows, "test fixture bug: no ticket reached a terminal state"
+    for row in terminal_rows:
+        for column in _LEASE_COLUMNS:
+            assert row[column] is None, (
+                f"terminal ticket {row['id']!r} ({row['state']!r}) retains "
+                f"stale {column}={row[column]!r}"
+            )
 
 
 # --- 5. test_transition_missing_ticket_raises -------------------------------

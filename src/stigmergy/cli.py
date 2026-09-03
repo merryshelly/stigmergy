@@ -16,7 +16,8 @@ Top-level argparse dispatcher. v0 subcommand tree:
     stigmergy status       --rig <name> [--rigs-root <path>]
     stigmergy monitor      --rig <name> [--rigs-root <path>] [--tail N]
     stigmergy tickets      --rig <name> [--rigs-root <path>]
-    stigmergy filed        --rig <name> [--rigs-root <path>]
+    stigmergy recover      --rig <name> [--rigs-root <path>] [--dry-run]
+    stigmergy filed        --rig <name> [--rigs-root <path>] [--untriaged-only]
     stigmergy ticket <id>  --rig <name> [--rigs-root <path>]
     stigmergy range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]
 
@@ -69,6 +70,7 @@ from stigmergy.rangereport import (
     compute_range_report,
 )
 from stigmergy.records import EventType, RecordPlane, make_event
+from stigmergy.recover import project_ticket_states
 from stigmergy.registry import PricingClass, Registry, UnbudgetableError
 from stigmergy.relay import (
     DEFAULT_RELAY_PROFILE,
@@ -113,7 +115,8 @@ _USAGE = (
     "  status --rig <name> [--rigs-root <path>]\n"
     "  monitor --rig <name> [--rigs-root <path>] [--tail N]\n"
     "  tickets --rig <name> [--rigs-root <path>]\n"
-    "  filed --rig <name> [--rigs-root <path>]\n"
+    "  recover --rig <name> [--rigs-root <path>] [--dry-run]\n"
+    "  filed --rig <name> [--rigs-root <path>] [--untriaged-only]\n"
     "  ticket <id> --rig <name> [--rigs-root <path>]\n"
     "  range-report --rig <name> [--rigs-root <path>] [--base-ref <ref>] [--critic]\n"
     "  decompose --rig <name> [--rigs-root <path>] --spec <path>"
@@ -218,8 +221,25 @@ def _build_parser() -> argparse.ArgumentParser:
     tickets_parser = subparsers.add_parser("tickets", help="List all tickets.")
     add_rig_args(tickets_parser)
 
-    filed_parser = subparsers.add_parser("filed", help="List untriaged filed proposals.")
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Report ticket-table vs event-log state drift (read-only).",
+    )
+    add_rig_args(recover_parser)
+    recover_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Accepted for familiarity; the verb is read-only by "
+        "construction and --dry-run changes nothing.",
+    )
+
+    filed_parser = subparsers.add_parser("filed", help="List filed proposals.")
     add_rig_args(filed_parser)
+    filed_parser.add_argument(
+        "--untriaged-only",
+        action="store_true",
+        help="List only untriaged filed proposals (default lists all).",
+    )
 
     ticket_parser = subparsers.add_parser("ticket", help="Show one ticket's full detail.")
     ticket_parser.add_argument("ticket_id", help="Ticket id to show.")
@@ -1122,22 +1142,61 @@ def _cmd_tickets(args: argparse.Namespace) -> int:
         resolved.store.close()
 
 
-def _render_filed_list(store: Any) -> str:
-    """One-line-per-proposal rendering of untriaged filed proposals with provenance."""
-    filed = store.list_filed_tickets(triaged=False)
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Report per-ticket drift between the ticket table and the event-log
+    projection (mid-recovery operator surface). Read-only by construction:
+    the store is only READ (`list_tickets`) and the record plane is only
+    read — nothing is ever written, and the mutating `recover.recover()`
+    daemon sequence is deliberately NOT called. `--dry-run` is accepted
+    (operator familiarity with the other verbs) and is a no-op. Exits 0
+    in both the drift and the no-drift case; drift is a report, not an
+    error."""
+    del args.dry_run  # no-op: this verb mutates nothing with or without it
+    resolved, rc = _resolve_rig_or_none(args)
+    if resolved is None:
+        return rc  # type: ignore[return-value]
+    try:
+        record_plane = RecordPlane(resolved.rig_paths["records_dir"])
+        projection = project_ticket_states(record_plane.read_events())
+        drifted = [
+            (row["id"], row["state"], projected)
+            for row in resolved.store.list_tickets()
+            if (projected := projection.get(row["id"])) is not None
+            and row["state"] != projected
+        ]
+        if not drifted:
+            print("no drift: every ticket agrees with its event-log projection")
+        for ticket_id, store_state, projected_state in drifted:
+            print(
+                f"drift: {ticket_id} store_state={store_state} "
+                f"projected_state={projected_state}"
+            )
+        return 0
+    finally:
+        resolved.store.close()
+
+
+def _render_filed_list(store: Any, *, untriaged_only: bool = False) -> str:
+    """One line per filed proposal with machine-readable stable columns.
+
+    Column order is fixed and positional: id, then ``origin_role=``,
+    ``parent_ticket=``, ``age_seconds=`` (integer), ``triaged=`` (0 or 1).
+    Selection (all rows vs. untriaged only) is driven by the store's
+    ``triaged`` filter parameter, never by post-hoc string filtering.
+    """
+    filed = store.list_filed_tickets(triaged=(False if untriaged_only else None))
     if not filed:
         return "(no filed proposals)"
 
     lines: list[str] = []
     for f in filed:
         origin_role = f.get("origin_role") or "-"
-        origin_worker = f.get("origin_worker") or "-"
-        origin_dispatch_id = f.get("origin_dispatch_id") or "-"
-        discovered_from = f.get("discovered_from") or "-"
+        parent_ticket = f.get("origin_parent_ticket") or "-"
+        age_seconds = max(0, int(time.time() - f["created_at"]))
+        triaged = 1 if f.get("triaged") else 0
         lines.append(
-            f"{f['id']}  {f['title']}  origin_role={origin_role}  "
-            f"origin_worker={origin_worker}  origin_dispatch_id={origin_dispatch_id}  "
-            f"discovered_from={discovered_from}"
+            f"{f['id']}  origin_role={origin_role}  parent_ticket={parent_ticket}  "
+            f"age_seconds={age_seconds}  triaged={triaged}"
         )
     return "\n".join(lines)
 
@@ -1147,7 +1206,7 @@ def _cmd_filed(args: argparse.Namespace) -> int:
     if resolved is None:
         return rc  # type: ignore[return-value]
     try:
-        print(_render_filed_list(resolved.store))
+        print(_render_filed_list(resolved.store, untriaged_only=args.untriaged_only))
         return 0
     finally:
         resolved.store.close()
@@ -1570,6 +1629,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_monitor(args)
     if args.command == "tickets":
         return _cmd_tickets(args)
+    if args.command == "recover":
+        return _cmd_recover(args)
     if args.command == "filed":
         return _cmd_filed(args)
     if args.command == "ticket":

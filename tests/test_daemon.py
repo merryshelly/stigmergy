@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+import stigmergy.daemon as daemon_module
 from stigmergy.approval import approve
 from stigmergy.charter import load_charter
 from stigmergy.checks import CheckOutcome, CheckResources, CheckResult
@@ -2429,6 +2430,39 @@ SUB_PROVIDER = "anthropic"
 SUB_MODEL = "claude-max-sub"
 SUB_LANE_LABEL = "sub-ok"
 
+# The fixed dispatch id the governor tests mint: the governor's feed-name
+# gate folds a relay feed file only when its name is
+# `relay-<dispatch_id>.jsonl` for an id the daemon minted THIS run. With the
+# daemon's mint stubbed to this constant (see `fixed_mint`), a feed file
+# named `relay-<MINTED_TEST_DISPATCH_ID>.jsonl` is a minted-id feed, and any
+# differently-named file is a forged one the gate must skip.
+MINTED_TEST_DISPATCH_ID = "worker-claude-max-sub-code01-test-test-test"
+
+
+def fixed_mint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the daemon's dispatch-id mint (`generate_worker_name`) to return
+    `MINTED_TEST_DISPATCH_ID`, so a relay feed file can be named for the id
+    the daemon mints this run. The gate under test (name-vs-minted-set, and
+    the mint populating that set at the real mint point in
+    `_claim_and_prepare`) is fully exercised; only the id string is made
+    deterministic. (`generate_worker_name`'s own non-determinism — three
+    BIP39 nonce words per mint — is what makes feed files pre-nameable.)"""
+
+    calls = 0
+
+    def _mint(store, role, model, prompt):
+        nonlocal calls
+        calls += 1
+        # The FIRST dispatch mints exactly `MINTED_TEST_DISPATCH_ID` (the id
+        # the tests name feed files for); later dispatches in the same test
+        # mint a `-<n>`-suffixed variant so their per-dispatch work-clone
+        # paths (clones/<worker_name>/work) stay unique. The base id stays
+        # in the daemon's minted set either way, so a feed file named for it
+        # keeps folding for the rest of the run.
+        return MINTED_TEST_DISPATCH_ID if calls == 1 else f"{MINTED_TEST_DISPATCH_ID}-{calls}"
+
+    monkeypatch.setattr(daemon_module, "generate_worker_name", _mint)
+
 
 class ManualClock:
     """A deterministic clock the test moves explicitly between polls."""
@@ -2456,9 +2490,16 @@ def add_subscription_lane(env: Env) -> None:
 
 def configure_feed(env: Env) -> Path:
     """Point `loop.governor.relay_feed` at an exact relative feed file under
-    the clones root and return its absolute path."""
-    env.charter.raw["loop"]["governor"]["relay_feed"] = "feeds/relay.jsonl"
-    return env.clones_root / "feeds" / "relay.jsonl"
+    the clones root and return its absolute path.
+
+    The file is named `relay-<MINTED_TEST_DISPATCH_ID>.jsonl` — i.e., for
+    the dispatch id the mint-stubbed daemon (`fixed_mint`) mints this run —
+    because the governor's feed-name gate only folds a relay feed file
+    whose name matches a minted dispatch id."""
+    env.charter.raw["loop"]["governor"]["relay_feed"] = (
+        f"feeds/relay-{MINTED_TEST_DISPATCH_ID}.jsonl"
+    )
+    return env.clones_root / "feeds" / f"relay-{MINTED_TEST_DISPATCH_ID}.jsonl"
 
 
 def append_feed_line(env: Env, feed_path: Path, record: dict[str, Any]) -> None:
@@ -2529,50 +2570,104 @@ def test_governor_no_feed_no_records_is_inert_subscription_lane_dispatches(env: 
     assert park_intents(env) == []
 
 
-def test_governor_deny_only_feed_never_parks(env: Env) -> None:
+def test_governor_deny_only_feed_never_parks(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     """A feed carrying ONLY a relay capability-deny record (the bead .147
-    marker) is policy evidence, never quota-exhaustion evidence: the
-    subscription lane still dispatches normally."""
+    marker), folded from a MINTED-ID feed file, is policy evidence, never
+    quota-exhaustion evidence: the subscription lane still dispatches
+    normally. (New shape for the feed-name gate: the warm-up poll mints the
+    id the feed names — before that, the file is skipped, so the deny
+    record genuinely enters the governor state on the second poll.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     feed = configure_feed(env)
-    append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
     add_dispatchable_ticket(env, "t-sub-deny", lane_hint=SUB_LANE_LABEL)
-    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle")])
+    spawn = ScriptedSpawn(
+        [
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle"),
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle"),
+        ]
+    )
     daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
         [pass_result("lint"), pass_result("pytest")]
     ))
+
+    # Warm-up poll: the feed (empty for now) names an id not minted yet ->
+    # the governor is empty, the ticket dispatches normally, and the mint
+    # makes the feed name valid for this run.
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == {"t-sub-deny"}
+    assert env.store.get_ticket("t-sub-deny")["state"] == PARKED
+
+    # The MINTED feed then carries only the deny record: the governor folds
+    # it (the provider appears in the state) but never parks on it.
+    append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
+    env.store.update_ticket("t-sub-deny", state=POOL, lease_expires_at=None)
 
     summary = daemon.poll_once()
 
     assert summary.dispatched_tickets == {"t-sub-deny"}
     assert env.store.get_ticket("t-sub-deny")["state"] == PARKED
+    assert len(spawn.calls) == 2
+    # The deny record reached the governor state (folded from the minted-id
+    # feed) but is policy evidence only: no exhausted-evidence flags set.
+    deny_state = daemon._governor.providers.get(SUB_PROVIDER)
+    assert deny_state is not None
+    assert deny_state.last_deny_reason == "quota-calls"
+    assert deny_state.limited is False
+    assert deny_state.last_429_at is None
     assert park_intents(env) == []
 
 
-def test_governor_parks_subscription_lane_at_claim_other_lanes_dispatch(env: Env) -> None:
+def test_governor_parks_subscription_lane_at_claim_other_lanes_dispatch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC (claim filter): with upstream quota-exhaustion evidence for the
-    subscription provider in the feed, the subscription-priced ticket is
-    skipped for the poll (never claimed, no dispatch, no disposition) while
-    a metered-lane ticket on the SAME provider dispatches normally — the
-    filter is keyed on the lane's pricing class."""
+    subscription provider in a MINTED-ID feed, the subscription-priced
+    ticket is skipped for the poll (never claimed, no dispatch, no
+    disposition) while a metered-lane ticket on the SAME provider dispatches
+    normally — the filter is keyed on the lane's pricing class. (New shape
+    for the feed-name gate: the evidence pre-writes to the feed named for
+    the id the daemon mints on the warm-up poll; only once the id is minted
+    does the governor fold the evidence and park at claim.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     feed = configure_feed(env)
     append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
     add_dispatchable_ticket(env, "t-sub-park", lane_hint=SUB_LANE_LABEL)
-    add_dispatchable_ticket(env, "t-metered")  # default lane -> sonnet (metered)
-    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/m.bundle")])
+    spawn = ScriptedSpawn(
+        [
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/sub.bundle"),
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/m.bundle"),
+        ]
+    )
     daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
         [pass_result("lint"), pass_result("pytest")]
     ))
+
+    # Warm-up poll: the feed names an id not minted yet -> the governor is
+    # empty, the subscription ticket dispatches, and the mint makes the
+    # feed name valid for this run.
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == {"t-sub-park"}
+    assert env.store.get_ticket("t-sub-park")["state"] == PARKED
+
+    # Back to the pool, with a metered-lane ticket on the SAME provider:
+    # the evidence in the (now-minted) feed parks the subscription lane at
+    # the claim filter while the metered ticket dispatches.
+    env.store.update_ticket("t-sub-park", state=POOL, lease_expires_at=None)
+    add_dispatchable_ticket(env, "t-metered")  # default lane -> sonnet (metered)
 
     summary = daemon.poll_once()
 
     # The metered ticket dispatched; the subscription ticket was skipped.
     assert summary.dispatched_tickets == {"t-metered"}
-    assert len(spawn.calls) == 1
+    assert len(spawn.calls) == 2
     assert env.store.get_ticket("t-metered")["state"] == PARKED
     assert env.store.get_ticket("t-sub-park")["state"] == POOL
-    assert [e for e in disposition_events(env, "t-sub-park")] == []
+    # The warm-up dispatch's "parked" disposition exists, but the claim-time
+    # PARK adds NONE (no "quota-parked", no ladder movement) — the lane is
+    # skipped at the claim filter.
+    assert [d["disposition"] for d in disposition_events(env, "t-sub-park")] == ["parked"]
     assert summary.should_halt is False
     assert summary.consecutive_infra_trips == 0
     # Parked under the ceiling: no escalation intent yet.
@@ -2580,13 +2675,16 @@ def test_governor_parks_subscription_lane_at_claim_other_lanes_dispatch(env: Env
 
 
 def test_governor_infra_outcome_on_exhausted_subscription_lane_parks_never_trips(
-    env: Env,
+    env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC (park branch): an INFRA result on a subscription lane whose
     governor state (re-read at outcome time) shows quota exhaustion takes
     the park branch — same IN_FLIGHT->POOL transition and lease handling as
     the INFRA fast path, but the disposition is the distinct park value and
-    the infra-trip counter is never bumped."""
+    the infra-trip counter is never bumped. (Feed-name gate: the evidence
+    lands in the feed named for THIS dispatch's minted id — the mint
+    happens before spawn, so the outcome-time re-read folds it.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     feed = configure_feed(env)
     add_dispatchable_ticket(env, "t-sub-infra", lane_hint=SUB_LANE_LABEL)
@@ -2613,11 +2711,16 @@ def test_governor_infra_outcome_on_exhausted_subscription_lane_parks_never_trips
     assert summary.should_halt is False
 
 
-def test_governor_relay_deny_keeps_old_infra_fast_path(env: Env) -> None:
+def test_governor_relay_deny_keeps_old_infra_fast_path(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An INFRA result correlated only with a relay capability-deny marker
     (not upstream quota evidence) keeps the OLD INFRA disposition
     ("infra-retry") and still bumps the trip counter — deny records never
-    enter the park branch."""
+    enter the park branch. (Feed-name gate: the deny record sits in the
+    feed named for THIS dispatch's minted id, so the outcome-time re-read
+    folds it as policy evidence and still takes the INFRA fast path.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     feed = configure_feed(env)
     append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
@@ -2632,17 +2735,30 @@ def test_governor_relay_deny_keeps_old_infra_fast_path(env: Env) -> None:
     ]
     assert summary.consecutive_infra_trips == 1
     assert env.store.get_ticket("t-sub-deny-infra")["state"] == POOL
+    # The deny record reached the governor state via the minted-id feed
+    # (policy evidence only — the lane was NOT parked).
+    deny_state = daemon._governor.providers.get(SUB_PROVIDER)
+    assert deny_state is not None
+    assert deny_state.last_deny_reason == "quota-calls"
+    assert deny_state.limited is False
 
 
-def test_governor_failed_result_with_deny_keeps_failed_handling(env: Env) -> None:
+def test_governor_failed_result_with_deny_keeps_failed_handling(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A FAILED result on a subscription lane with only deny evidence in the
     feed keeps the existing FAILED/retry-ladder handling untouched — the
-    ticket re-enters the pool via pool-reentry, never the park branch."""
+    ticket re-enters the pool via pool-reentry, never the park branch.
+    (Feed-name gate: the deny evidence sits in the feed named for the id
+    the first dispatch mints; the second poll's claim filter folds it —
+    policy evidence only — and the ticket is dispatched again and fails
+    the same way, still via the retry ladder.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     feed = configure_feed(env)
     append_feed_line(env, feed, relay_deny_record(ts=1_000_000.0))
     add_dispatchable_ticket(env, "t-sub-deny-fail", lane_hint=SUB_LANE_LABEL)
-    spawn = ScriptedSpawn([make_result(DispatchStatus.FAILED)])
+    spawn = ScriptedSpawn([make_result(DispatchStatus.FAILED), make_result(DispatchStatus.FAILED)])
     daemon = make_daemon(env, spawn_fn=spawn)
 
     daemon.poll_once()
@@ -2652,24 +2768,59 @@ def test_governor_failed_result_with_deny_keeps_failed_handling(env: Env) -> Non
     ]
     assert env.store.get_ticket("t-sub-deny-fail")["state"] == POOL
     assert env.store.get_ticket("t-sub-deny-fail")["attempts_used"] == 1
+
+    # Second poll: the claim filter now folds the deny record from the
+    # minted-id feed; being policy evidence it must NOT park the lane —
+    # the ticket is dispatched again and re-enters via the ladder.
+    summary = daemon.poll_once()
+
+    assert summary.dispatched_tickets == {"t-sub-deny-fail"}
+    assert [d["disposition"] for d in disposition_events(env, "t-sub-deny-fail")] == [
+        "pool-reentry",
+        "pool-reentry",
+    ]
+    assert env.store.get_ticket("t-sub-deny-fail")["state"] == POOL
+    assert env.store.get_ticket("t-sub-deny-fail")["attempts_used"] == 2
+    # The deny record reached the governor state but never parked.
+    deny_state = daemon._governor.providers.get(SUB_PROVIDER)
+    assert deny_state is not None
+    assert deny_state.last_deny_reason == "quota-calls"
     assert park_intents(env, "t-sub-deny-fail") == []
 
 
-def test_governor_park_escalation_exactly_once_per_episode(env: Env) -> None:
+def test_governor_park_escalation_exactly_once_per_episode(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC (escalation notification): a park crossing the charter-configured
     escalation ceiling records exactly ONE new notification intent (kind
     'park-escalation', distinct from halt/escalation) per park episode;
     advancing the clock past the ceiling produces it once, repeated polls
     never duplicate it while the ticket stays parked, and a NEW episode
-    (release + re-park) may notify once more."""
+    (release + re-park) may notify once more. (New shape for the feed-name
+    gate: a warm-up poll mints the id the pre-written evidence feed names;
+    parking at the claim filter starts at poll 1.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     env.charter.raw["loop"]["timers"]["park_escalation_seconds"] = 600
     feed = configure_feed(env)
     append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
     add_dispatchable_ticket(env, "t-sub-esc", lane_hint=SUB_LANE_LABEL)
     clock = ManualClock()
-    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/esc.bundle")])
+    spawn = ScriptedSpawn(
+        [
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/esc.bundle"),
+            make_result(DispatchStatus.DONE, bundle_ref="/tmp/esc.bundle"),
+        ]
+    )
     daemon = make_daemon(env, spawn_fn=spawn, now_fn=clock)
+
+    # Warm-up poll: the feed names an id not minted yet -> the governor is
+    # empty, the ticket dispatches (consuming the first scripted result),
+    # and the mint makes the feed name valid for this run.
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == {"t-sub-esc"}
+    assert env.store.get_ticket("t-sub-esc")["state"] == PARKED
+    env.store.update_ticket("t-sub-esc", state=POOL, lease_expires_at=None)
 
     # Poll 1: parked; episode starts now (t=1_000_000); under the ceiling.
     daemon.poll_once()
@@ -2731,28 +2882,44 @@ def test_governor_park_escalation_exactly_once_per_episode(env: Env) -> None:
 
 
 def test_governor_exhaustion_across_many_polls_never_halts_and_other_lane_dispatches(
-    env: Env,
+    env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC (daemon-integration, the spec's core behavior): repeated
     quota-exhaustion evidence on a subscription lane across more than
     _CIRCUIT_BREAKER_THRESHOLD (5) polls never trips the breaker —
     should_halt stays False and the consecutive-infra-trip count stays 0 —
     while a ticket on a non-parked (metered) lane is still dispatched in
-    those same polls."""
+    those same polls. (New shape for the feed-name gate: a warm-up poll
+    dispatches the metered ticket, which mints the id the pre-written
+    evidence feed names; the subscription lane then parks from poll 1 on,
+    without ever being dispatched.)"""
+    fixed_mint(monkeypatch)
     add_subscription_lane(env)
     env.charter.raw["loop"]["retries"]["attempts_per_rung"] = 20
     feed = configure_feed(env)
     append_feed_line(env, feed, limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0))
-    add_dispatchable_ticket(env, "t-sub-storm", lane_hint=SUB_LANE_LABEL)
     add_dispatchable_ticket(env, "t-metered-storm")  # default lane -> sonnet (metered)
     spawn = ScriptedSpawn(
-        [make_result(DispatchStatus.DONE) for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 2)]
+        [make_result(DispatchStatus.DONE) for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 3)]
     )
     daemon = make_daemon(
         env,
         spawn_fn=spawn,
         run_checks_fn=ScriptedChecks([fail_result("lint")]),  # keeps the metered ticket in POOL
     )
+
+    # Warm-up poll: the feed names an id not minted yet -> the governor is
+    # empty, the metered ticket dispatches (lint-fails -> pool-reentry,
+    # stays in POOL), and the mint makes the feed name valid for this run.
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == {"t-metered-storm"}
+    assert summary.should_halt is False
+    assert env.store.get_ticket("t-metered-storm")["state"] == POOL
+
+    # The subscription ticket enters the pool AFTER the mint: every poll
+    # from here on, the governor folds the evidence and parks it at the
+    # claim filter while the metered ticket keeps dispatching.
+    add_dispatchable_ticket(env, "t-sub-storm", lane_hint=SUB_LANE_LABEL)
 
     for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 2):
         summary = daemon.poll_once()
@@ -2763,7 +2930,8 @@ def test_governor_exhaustion_across_many_polls_never_halts_and_other_lane_dispat
         assert "t-sub-storm" not in summary.dispatched_tickets
         assert "t-metered-storm" in summary.dispatched_tickets
 
-    assert len(spawn.calls) == _CIRCUIT_BREAKER_THRESHOLD + 2
+    # 1 warm-up dispatch + one metered dispatch per storm poll.
+    assert len(spawn.calls) == _CIRCUIT_BREAKER_THRESHOLD + 3
     assert daemon._consecutive_infra_trips == 0
     assert env.store.get_ticket("t-sub-storm")["state"] == POOL
     assert env.store.get_ticket("t-sub-storm")["attempts_used"] == 0
@@ -2812,3 +2980,79 @@ def test_governor_learned_feed_cell_path_used_when_charter_key_absent(env: Env) 
     assert summary.dispatched_tickets == frozenset()
     assert env.store.get_ticket("t-sub-cell")["state"] == POOL
     assert len(spawn.calls) == 1
+
+
+def test_governor_forged_feed_file_parks_nothing_minted_feed_still_parks(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC (feed-name gate, forged file): under the configured feed path a
+    FORGED relay JSONL file (a name matching no dispatch id minted this run)
+    carrying a limited-true record for its own provider sits beside the
+    minted-id feed. The forged file parks nothing — not one of its lines
+    reaches the governor state — and each skip is visible as exactly one
+    module-logger warning naming the file; the minted-id feed beside it
+    still folds and still parks the subscription lane on its quota
+    evidence."""
+    fixed_mint(monkeypatch)
+    add_subscription_lane(env)
+    # A glob feed key: both files below sit under the configured feed path.
+    env.charter.raw["loop"]["governor"]["relay_feed"] = "feeds/relay-*.jsonl"
+    forged_name = "relay-forged-dispatch-12345.jsonl"
+    forged = env.clones_root / "feeds" / forged_name
+    minted = env.clones_root / "feeds" / f"relay-{MINTED_TEST_DISPATCH_ID}.jsonl"
+    # The forged feed's limited-true record names its OWN provider: if it
+    # were ever folded, that provider would appear in the governor state.
+    append_feed_line(
+        env,
+        forged,
+        limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0, provider="forged-provider"),
+    )
+    append_feed_line(
+        env,
+        minted,
+        limited_quota_record(ts=1_000_000.0, next_tick_at=1_003_600.0),
+    )
+    add_dispatchable_ticket(env, "t-sub-forged", lane_hint=SUB_LANE_LABEL)
+    spawn = ScriptedSpawn([make_result(DispatchStatus.DONE, bundle_ref="/tmp/forged.bundle")])
+    daemon = make_daemon(env, spawn_fn=spawn, run_checks_fn=ScriptedChecks(
+        [pass_result("lint"), pass_result("pytest")]
+    ))
+
+    # Warm-up poll: nothing minted yet -> BOTH feeds are skipped (the
+    # minted-id feed included), the ticket dispatches, and the mint makes
+    # the minted feed's name valid for this run.
+    summary = daemon.poll_once()
+    assert summary.dispatched_tickets == {"t-sub-forged"}
+    assert env.store.get_ticket("t-sub-forged")["state"] == PARKED
+    assert "forged-provider" not in daemon._governor.providers
+    env.store.update_ticket("t-sub-forged", state=POOL, lease_expires_at=None)
+
+    # The gated poll: the minted feed folds and parks; the forged feed is
+    # skipped wholesale, with exactly one warning naming it.
+    caplog.clear()  # the warm-up poll's own (pre-mint) skip warnings are out of scope
+    with caplog.at_level(logging.WARNING, logger="stigmergy.daemon"):
+        summary = daemon.poll_once()
+
+    # The minted file still parks: nothing dispatched, the lane parked at
+    # the claim filter on the minted feed's quota evidence.
+    assert summary.dispatched_tickets == frozenset()
+    assert env.store.get_ticket("t-sub-forged")["state"] == POOL
+    assert daemon._governor.providers[SUB_PROVIDER].limited is True
+    assert len(spawn.calls) == 1
+    # The forged file parked nothing: its provider never entered the
+    # governor state, and no warning was logged for the (folded) minted
+    # feed.
+    assert "forged-provider" not in daemon._governor.providers
+    assert not [
+        r for r in caplog.records if f"relay-{MINTED_TEST_DISPATCH_ID}.jsonl" in r.getMessage()
+    ]
+    # The forged skip is visible as exactly ONE module-logger warning
+    # naming the skipped file.
+    forged_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and forged_name in r.getMessage()
+    ]
+    assert len(forged_warnings) == 1

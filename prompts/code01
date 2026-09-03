@@ -88,8 +88,8 @@ $prior_check_output
     The tool validates each filing when you call it: a rejected call tells
     you what was wrong — fix it and call again; nothing is lost. If your
     toolset has no file_ticket, write the same objects to
-    /work/.stigmergy/filed-tickets.json (a JSON array) instead. Then
-    return to your ticket.
+    /work/.stigmergy/filed-tickets.json instead — one JSON object per line
+    (one line per filing, appended). Then return to your ticket.
   Do not merely mention discovered work in your final message: a sentence
   there is not actionable and disappears when this dispatch ends; only a
   filed ticket survives. Filing does not widen your scope — you still
