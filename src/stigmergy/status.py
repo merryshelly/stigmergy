@@ -427,6 +427,13 @@ def render_event_tail(events: list[dict[str, Any]], n: int) -> str:
             result_part = f" outcome={outcome}"
         elif disposition is not None:
             result_part = f" disposition={disposition}"
+        elif isinstance(ev.get("tickets"), list):
+            # decompose-intake emission (bead .174): the count + D17 outcome.
+            approved = ev.get("approved")
+            result_part = (
+                f" tickets={len(ev['tickets'])}"
+                f" approved={'yes' if approved else 'no'}"
+            )
 
         lines.append(f"{ts_str}  {event_type}  {ticket}{result_part}")
 

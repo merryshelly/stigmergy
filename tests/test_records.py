@@ -593,7 +593,7 @@ def _triage_fields(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_D1r_triage_event_types_exist_and_enum_has_thirteen_members() -> None:
+def test_D1r_triage_event_types_exist_and_enum_has_fourteen_members() -> None:
     assert EventType.APPROVAL.value == "approval"
     assert EventType.UNAPPROVAL.value == "unapproval"
     assert EventType.TRIAGE_REJECTED.value == "triage-rejected"
@@ -601,7 +601,9 @@ def test_D1r_triage_event_types_exist_and_enum_has_thirteen_members() -> None:
     # bead .152 (Decision 17): DECOMPOSE joins as the 13th member — the
     # decomposer band's LLM invocations (rig-level, no ticket, same
     # precedent as REPORT/TICKET_FILED).
-    assert len(list(EventType)) == 13
+    # bead .174: DECOMPOSE_INTAKE joins as the 14th member — the decomposer
+    # band's EMISSION (mechanism-only, ticket-filed precedent).
+    assert len(list(EventType)) == 14
 
 
 @pytest.mark.parametrize(
@@ -720,9 +722,9 @@ def _decompose_fields(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def test_D152_decompose_event_type_is_the_thirteenth_member() -> None:
+def test_D152_decompose_event_type_exists() -> None:
     assert EventType.DECOMPOSE.value == "decompose"
-    assert len(list(EventType)) == 13
+    assert len(list(EventType)) == 14
     # DECOMPOSE is an LLM-invocation event (SPEC §4 prompt-artifact invariant).
     from stigmergy.records import _LLM_INVOCATION_TYPES
 
@@ -765,3 +767,141 @@ def test_D152_decompose_does_not_require_decoding_params() -> None:
     gate_fields = common_fields(prompt_artifact_hash="critic01-hashdef")
     with pytest.raises(RecordError):
         make_event(EventType.GATE, **gate_fields)
+
+
+# --- bead .174: emission event (EventType.DECOMPOSE_INTAKE) ----------------
+# The moment the decompose driver seeds tickets into the store: how many,
+# which, and whether D17 auto-approved them. Mechanism-only — NOT an LLM
+# invocation (no prompt, no tokens, no cost), the same precedent as
+# TICKET_FILED. Exempt from the dispatch-shaped common-field set, validating
+# against its own required set (the emission IS the payload).
+
+
+def _decompose_intake_fields(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid decompose-intake emission field set."""
+    base: dict[str, Any] = {
+        "rig": "shipyard",
+        "dispatch_id": "decompose-0001",
+        "tickets": ["alpha", "beta"],
+        "approved": True,
+        "acting_agent": "merry",
+        "operator_session": "decompose-0001",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_D174_decompose_intake_event_type_is_the_fourteenth_member() -> None:
+    assert EventType.DECOMPOSE_INTAKE.value == "decompose-intake"
+    assert len(list(EventType)) == 14
+    # NOT an LLM-invocation event: no prompt-artifact requirement.
+    from stigmergy.records import _LLM_INVOCATION_TYPES
+
+    assert EventType.DECOMPOSE_INTAKE not in _LLM_INVOCATION_TYPES
+
+
+def test_D174_valid_decompose_intake_event_validates_and_round_trips(
+    plane: RecordPlane,
+) -> None:
+    ev = make_event(EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields())
+    plane.append(ev)
+    read = plane.read_events()
+    assert len(read) == 1
+    assert read[0]["event_type"] == "decompose-intake"
+    assert read[0]["tickets"] == ["alpha", "beta"]
+    assert read[0]["approved"] is True
+    assert read[0]["acting_agent"] == "merry"
+    assert read[0]["operator_session"] == "decompose-0001"
+    # exempt from the dispatch-shaped schema
+    assert "computed_usd" not in read[0]
+    assert "tokens" not in read[0]
+    assert "attempt_kind" not in read[0]
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["rig", "dispatch_id", "acting_agent", "operator_session", "tickets", "approved"],
+)
+def test_D174_decompose_intake_missing_required_field_raises(missing: str) -> None:
+    fields = _decompose_intake_fields()
+    del fields[missing]
+    with pytest.raises(RecordError):
+        make_event(EventType.DECOMPOSE_INTAKE, **fields)
+
+
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_D174_decompose_intake_empty_attribution_rejected(empty: str) -> None:
+    """A forgeable-by-omission emission line is not acceptable (D1's
+    standard, applied to the machine band)."""
+    with pytest.raises(RecordError):
+        make_event(
+            EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields(operator_session=empty)
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "alpha",  # not a list
+        ["alpha", 42],  # non-str member
+        ["alpha", "  "],  # blank member
+        ["alpha", None],
+        None,
+    ],
+)
+def test_D174_decompose_intake_bad_tickets_rejected(bad: Any) -> None:
+    with pytest.raises(RecordError):
+        make_event(EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields(tickets=bad))
+
+
+@pytest.mark.parametrize("bad", [1, 0, "true", None])
+def test_D174_decompose_intake_nonbool_approved_rejected(bad: Any) -> None:
+    """`approved` is the D17 auto-approve OUTCOME — a truthy int/str is a
+    different fact, not a bool."""
+    with pytest.raises(RecordError):
+        make_event(EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields(approved=bad))
+
+
+def test_D174_decompose_intake_empty_tickets_list_valid() -> None:
+    """An empty emission is a driver defect, but the event stays truthful —
+    validation does not manufacture a lie to hide it."""
+    ev = make_event(
+        EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields(tickets=[], approved=False)
+    )
+    assert ev.payload["tickets"] == []
+    assert ev.payload["approved"] is False
+
+
+def test_D174_decompose_intake_does_not_pollute_spend_or_cv(plane: RecordPlane) -> None:
+    """No computed_usd/tokens -> 0 spend, no dispatch/gate counts. The shared
+    run dispatch_id joins the decompose band's CV group harmlessly (the
+    intake event carries no tokens/usd/disposition to aggregate)."""
+    from stigmergy.status import reconstruct_spend
+
+    plane.append(
+        make_event(
+            EventType.DECOMPOSE,
+            **_decompose_fields(
+                computed_usd=0.0,
+                tokens={"in": 0, "cached": 0, "out": 0, "reasoning": 0},
+            ),
+        )
+    )
+    plane.append(make_event(EventType.DECOMPOSE_INTAKE, **_decompose_intake_fields()))
+    plane.rebuild_cv()
+
+    cv_lines = [ln for ln in plane.cv_path.read_text().splitlines() if ln.strip()]
+    rows = [json.loads(ln) for ln in cv_lines]
+    assert len(rows) == 1  # one row for the shared run dispatch_id
+    row = rows[0]
+    assert row["computed_usd_total"] == 0.0
+    assert row["tokens"] == {"in": 0, "cached": 0, "out": 0, "reasoning": 0}
+    assert row["disposition"] is None
+    assert row["event_count"] == 2
+    # provisional summary: the last on-disk event for the dispatch
+    assert row["final_outcome"] == "decompose-intake"
+
+    spend = reconstruct_spend(plane, usd_cap=25.0, dispatches_cap=50, gate_calls_cap=30)
+    assert spend["metered_spent"] == 0.0
+    assert spend["dispatches_used"] == 0
+    assert spend["gate_calls_used"] == 0

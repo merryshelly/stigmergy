@@ -77,7 +77,7 @@ class RecordError(Exception):
 class EventType(enum.Enum):
     """Event-plane discriminant (SPEC.md §8).
 
-    Thirteen members. `dispatch`, `check`, `gate`, `integration`,
+    Fourteen members. `dispatch`, `check`, `gate`, `integration`,
     `disposition`, `notify` are SPEC §8's prose list; `report` is added
     per SPEC §4 (prompt-artifact invariant: "every LLM-invoked role... the
     prompt hash is logged in every event that invocation produces") and
@@ -92,7 +92,13 @@ class EventType(enum.Enum):
     decomposer band's LLM-invocation event — rig-level, no ticket (same
     precedent as `report`/`ticket-filed`); it carries a hash-bearing
     `prompt_artifact_hash` (SPEC §4) but is NOT a gate event (no
-    `decoding_params`).
+    `decoding_params`). `decompose-intake` (bead .174) is the decomposer
+    band's EMISSION event — the moment the decompose driver seeds tickets
+    into the store; mechanism-only like `ticket-filed` (NOT an LLM
+    invocation: no prompt, no tokens, no cost), carrying the emitted
+    ticket-id list and the D17 auto-approve outcome, exempt from the
+    dispatch-shaped common-field set (see
+    `_REQUIRED_DECOMPOSE_INTAKE_FIELDS` and `_validate_payload`).
     """
 
     DISPATCH = "dispatch"
@@ -122,6 +128,13 @@ class EventType(enum.Enum):
     # (carries a hash-bearing prompt_artifact_hash, SPEC §4) but is NOT a gate
     # event (no decoding_params).
     DECOMPOSE = "decompose"
+    # The decomposer band's EMISSION event (bead .174): the moment the
+    # decompose driver seeds tickets into the store. Mechanism-only — NOT
+    # an LLM invocation (no prompt, no tokens, no cost), the same precedent
+    # as TICKET_FILED. Carries the emitted ticket-id list and the D17
+    # auto-approve outcome; validates against its own required set
+    # (`_REQUIRED_DECOMPOSE_INTAKE_FIELDS`, see `_validate_payload`).
+    DECOMPOSE_INTAKE = "decompose-intake"
 
 
 # LLM-invocation events (SPEC §4 prompt-artifact invariant): must carry the
@@ -259,6 +272,20 @@ _REQUIRED_TRIAGE_FIELDS: tuple[str, ...] = (
     "operator_session",
 )
 
+# The decomposer band's emission event (bead .174): same exemption posture
+# as the triage events (a mechanism, not a dispatch — no worker, model,
+# tokens, or cost), but its own required set: the emission IS the payload
+# (the ticket-id list + the D17 auto-approve outcome). `dispatch_id` is
+# the decompose RUN id — the emission belongs to the run, not to any
+# single LLM invocation.
+_DECOMPOSE_INTAKE_TYPES = frozenset({EventType.DECOMPOSE_INTAKE})
+_REQUIRED_DECOMPOSE_INTAKE_FIELDS: tuple[str, ...] = (
+    "rig",
+    "dispatch_id",
+    "acting_agent",
+    "operator_session",
+)
+
 
 @dataclass(frozen=True)
 class Event:
@@ -326,6 +353,10 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         _validate_triage_payload(payload)
         return
 
+    if event_type in _DECOMPOSE_INTAKE_TYPES:
+        _validate_decompose_intake_payload(payload)
+        return
+
     missing = [f for f in _REQUIRED_COMMON_FIELDS if f not in payload]
     if missing:
         raise RecordError(f"event missing required common field(s): {missing}")
@@ -372,6 +403,34 @@ def _validate_payload(payload: dict[str, Any]) -> None:
                 "logged provenance — 'no sampling params sent; model defaults + forced "
                 "tool_choice'. Only a missing field or non-dict is rejected."
             )
+
+
+def _validate_decompose_intake_payload(payload: dict[str, Any]) -> None:
+    """Validate a decompose-intake emission event (bead .174). The four
+    attribution strings must be non-empty (an unattributed emission line is
+    a forgeable audit gap — D1's standard); `tickets` must be a list of
+    non-empty ticket-id strings (the emission itself); `approved` must be
+    a real bool (the D17 auto-approve outcome)."""
+    for field in _REQUIRED_DECOMPOSE_INTAKE_FIELDS:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RecordError(
+                f"decompose-intake event field {field!r} must be a non-empty string "
+                f"(got {value!r})"
+            )
+    tickets = payload.get("tickets")
+    if not isinstance(tickets, list) or not all(
+        isinstance(t, str) and t.strip() for t in tickets
+    ):
+        raise RecordError(
+            f"decompose-intake event field 'tickets' must be a list of non-empty "
+            f"ticket-id strings (got {tickets!r})"
+        )
+    approved = payload.get("approved")
+    if not isinstance(approved, bool):
+        raise RecordError(
+            f"decompose-intake event field 'approved' must be a bool (got {approved!r})"
+        )
 
 
 def _validate_triage_payload(payload: dict[str, Any]) -> None:

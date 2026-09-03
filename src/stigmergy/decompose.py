@@ -1907,7 +1907,10 @@ class _DecomposeDriver:
         Decision 17: machine-validated tickets enter the pool, no human
         triage; the approval event is the audit line). ``--no-approve``
         leaves the tickets unapproved/pool. ``dry_run`` intakes nothing (it
-        prints the would-be-seeded ids). Returns the inserted ticket ids.
+        prints the would-be-seeded ids). Records ONE DECOMPOSE_INTAKE
+        emission event per seeded batch (bead .174) — only once the batch
+        is fully in its final state (all seeded / all approved). Returns
+        the inserted ticket ids.
         """
         if self.dry_run:
             for entry in manifest:
@@ -1924,6 +1927,7 @@ class _DecomposeDriver:
             )
         self.seeded.extend(inserted)
         if self.no_approve:
+            self._record_intake_event(inserted, approved=False)
             return inserted
         for tid in inserted:
             ticket = self.resolved.store.get_ticket(tid)
@@ -1946,7 +1950,28 @@ class _DecomposeDriver:
                 approval_hash=approval_hash,
             )
             self.approved.append(tid)
+        self._record_intake_event(inserted, approved=True)
         return inserted
+
+    def _record_intake_event(self, inserted: list[str], *, approved: bool) -> None:
+        """Record ONE DECOMPOSE_INTAKE emission event for a seeded batch
+        (bead .174): the moment the decomposer emitted tickets into the
+        store — how many, which, and whether D17 auto-approved them.
+        Rig-level and mechanism-only (not an LLM invocation, no prompt,
+        no tokens, no cost). The per-ticket APPROVAL events are the
+        attribution audit lines; this event is the emission record the
+        operator's dashboard surfaces. ``dry_run`` never reaches here
+        (it seeds nothing)."""
+        event = make_event(
+            EventType.DECOMPOSE_INTAKE,
+            rig=self._rig_name(),
+            dispatch_id=f"decompose-{self.run_id}",
+            tickets=list(inserted),
+            approved=approved,
+            acting_agent=_APPROVE_AGENT,
+            operator_session=f"decompose-{self.run_id}",
+        )
+        self.record_plane.append(event)
 
     # -- the run --------------------------------------------------------------
 

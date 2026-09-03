@@ -522,6 +522,44 @@ def test_render_event_tail_includes_warning_content() -> None:
     assert "t-warning" in result
 
 
+def test_render_event_tail_decompose_intake_shows_count() -> None:
+    """A decompose-intake emission line (bead .174) renders the ticket count
+    and the D17 auto-approve outcome — no outcome/disposition field, so the
+    tickets-list branch must fire."""
+    from stigmergy.status import render_event_tail
+
+    events = [
+        {
+            "event_type": "decompose-intake",
+            "ts": 1000.0,
+            "tickets": ["a", "b", "c"],
+            "approved": True,
+        },
+    ]
+
+    result = render_event_tail(events, 25)
+    assert "decompose-intake" in result
+    assert "tickets=3" in result
+    assert "approved=yes" in result
+
+
+def test_render_event_tail_decompose_intake_unapproved_shows_no() -> None:
+    from stigmergy.status import render_event_tail
+
+    events = [
+        {
+            "event_type": "decompose-intake",
+            "ts": 1000.0,
+            "tickets": ["a"],
+            "approved": False,
+        },
+    ]
+
+    result = render_event_tail(events, 25)
+    assert "tickets=1" in result
+    assert "approved=no" in result
+
+
 def test_render_daemon_liveness_no_pidfile(tmp_path: Path) -> None:
     from stigmergy.status import render_daemon_liveness
 
