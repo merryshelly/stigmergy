@@ -2588,3 +2588,218 @@ def test_cli_decompose_passes_nothing_critic_related(monkeypatch) -> None:
     assert seen["decomposer_model"] == "some/model"
     assert seen["decomposer_effort"] == "medium"
     assert seen["dry_run"] is True
+
+
+# === spec-vs-manifest tier1_checks divergence surfacing (bead kdsn.325) ======
+#
+# contexthandoff01 evidence: the spec pinned `tier1_checks.ruff =
+# "cd /work && ruff check ."` but the decomposer seeded `"ruff check src"` —
+# arguably correct (the full-tree gate is unpassable: 374 pre-existing ruff
+# errors on the clean base) but SILENT, and the decompose-critic (with repo
+# access) missed it. The worker caught it and the broken filing channel
+# dropped the report. Contract: the driver surfaces every divergence —
+# value deviation, spec-stated key dropped from the manifest, manifest key
+# not stated in the spec — in summary.md AND as an additive
+# `tier1_divergences` field on the DECOMPOSE_INTAKE event; the critic prompt
+# gains an explicit divergence check item. No divergence -> quiet.
+
+_T1_SPEC_ADDENDUM = (
+    "\n\n**tier1_checks (OA rig):** dict-of-commands — `lint`: "
+    "`cd /work && ruff check src`; `pytest`: `pytest -x -q`.\n"
+)
+# Aligned variant: states EXACTLY the fixture charter's gates (manifest is
+# charter-verbatim -> validator-clean AND divergence-free).
+_T1_SPEC_ADDENDUM_ALIGNED = (
+    "\n\n**tier1_checks (OA rig):** dict-of-commands — `lint`: "
+    "`ruff check .`; `pytest`: `pytest -x -q`.\n"
+)
+# NOTE (bead kdsn.325): the manifest's tier1_checks must stay VERBATIM vs the
+# fixture charter (validator R5 — test_manifest_validate.py pins "no
+# 'improved' commands"), so the divergence exercised here is SPEC-stated vs
+# CHARTER/manifest-seeded — the exact contexthandoff01 shape (that rig's
+# charter carried `ruff check src` while its spec pinned `ruff check .`;
+# same structure, deviation on the spec side of the pair).
+
+
+def test_spec_stated_tier1_checks_parses_stated_gates() -> None:
+    spec = (
+        "## 4 Checks\n"
+        "**tier1_checks (OA rig):** dict-of-commands — `ruff`: "
+        "`cd /work && ruff check .`; `tests`: `cd /work && pytest -q`.\n"
+    )
+    assert decompose.spec_stated_tier1_checks(spec) == {
+        "ruff": "cd /work && ruff check .",
+        "tests": "cd /work && pytest -q",
+    }
+
+
+def test_spec_stated_tier1_checks_absent_yields_empty() -> None:
+    assert decompose.spec_stated_tier1_checks("no gates stated here") == {}
+
+
+def test_tier1_divergences_value_deviation() -> None:
+    spec_checks = {"ruff": "cd /work && ruff check .", "tests": "pytest -q"}
+    manifest = [
+        {
+            "id": "t1",
+            "tier1_checks": {
+                "ruff": "cd /work && ruff check src",  # silent narrowing
+                "tests": "pytest -q",
+            },
+        },
+        {
+            "id": "t2",
+            "tier1_checks": {"ruff": "cd /work && ruff check .", "tests": "pytest -q"},
+        },
+    ]
+    assert decompose.tier1_divergences(spec_checks, manifest) == [
+        {
+            "ticket_id": "t1",
+            "key": "ruff",
+            "spec_value": "cd /work && ruff check .",
+            "manifest_value": "cd /work && ruff check src",
+        }
+    ]
+
+
+def test_tier1_divergences_dropped_and_unstated_keys() -> None:
+    spec_checks = {"ruff": "ruff check .", "tests": "pytest -q"}
+    manifest = [
+        # spec-stated key silently DROPPED from the manifest dict
+        {"id": "t1", "tier1_checks": {"ruff": "ruff check ."}},
+        # manifest key NOT stated in the spec
+        {"id": "t2", "tier1_checks": {"ruff": "ruff check .", "mypy": "mypy src"}},
+        # tier1_checks key entirely absent -> the gates do not apply to this
+        # entry; NOT a divergence (a spec anchor is the dict, not its absence)
+        {"id": "t3"},
+    ]
+    divs = decompose.tier1_divergences(spec_checks, manifest)
+    assert {
+        "ticket_id": "t1",
+        "key": "tests",
+        "spec_value": "pytest -q",
+        "manifest_value": None,
+    } in divs
+    assert {
+        "ticket_id": "t2",
+        "key": "mypy",
+        "spec_value": None,
+        "manifest_value": "mypy src",
+    } in divs
+    assert not [d for d in divs if d["ticket_id"] == "t3"]
+
+
+def test_tier1_divergences_no_spec_anchor_is_quiet() -> None:
+    # No stated gates in the spec -> nothing to diverge FROM.
+    assert decompose.tier1_divergences({}, [{"id": "t", "tier1_checks": {"x": "y"}}]) == []
+
+
+def test_tier1_divergences_aligned_manifest_is_empty() -> None:
+    spec_checks = {"lint": "ruff check ."}
+    manifest = [{"id": "t", "tier1_checks": {"lint": "ruff check ."}}]
+    assert decompose.tier1_divergences(spec_checks, manifest) == []
+
+
+def test_decompose_surfaces_divergence_in_summary_and_intake_event(
+    tmp_path, monkeypatch
+) -> None:
+    """Integration: a manifest that silently narrows the spec's stated gate
+    is surfaced in summary.md AND on the DECOMPOSE_INTAKE event."""
+    rigs_root = scaffold_rig(tmp_path)
+    spec = _write_spec(tmp_path, SPEC_TEXT + _T1_SPEC_ADDENDUM)
+    entry = _ticket_entry("t-div")  # tier1_checks verbatim == fixture charter
+    _fake_exec(monkeypatch, [{"manifest": [entry], "notes": "n"}])
+    _critic_exec(monkeypatch, [_critic_exec_result()])
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    decompose_root = tmp_path / "decompose-root"
+
+    rc = decompose.run_decompose(
+        rig_name=RIG,
+        spec_path=spec,
+        decompose_root=decompose_root,
+        rigs_root=rigs_root,
+    )
+    assert rc == 0
+
+    run_dir = list((decompose_root / "decompose").iterdir())[0]
+    summary = (run_dir / "summary.md").read_text()
+    assert "tier1_checks divergences" in summary
+    assert "t-div" in summary
+    assert "lint" in summary
+    assert "cd /work && ruff check src" in summary  # the spec's stated gate
+    assert "ruff check ." in summary  # what the manifest actually seeded
+
+    resolved = _resolve(rigs_root)
+    try:
+        from stigmergy.records import RecordPlane
+
+        events = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+    i_events = [e for e in events if e.get("event_type") == "decompose-intake"]
+    assert len(i_events) == 1
+    assert i_events[0]["tier1_divergences"] == [
+        {
+            "ticket_id": "t-div",
+            "key": "lint",
+            "spec_value": "cd /work && ruff check src",
+            "manifest_value": "ruff check .",
+        }
+    ]
+
+
+def test_decompose_aligned_manifest_intake_event_carries_empty_divergences(
+    tmp_path, monkeypatch
+) -> None:
+    """Additive field is ALWAYS present on new decompose-intake events
+    ([] when aligned); the summary stays quiet (no divergence section)."""
+    rigs_root = scaffold_rig(tmp_path)
+    spec = _write_spec(tmp_path, SPEC_TEXT + _T1_SPEC_ADDENDUM_ALIGNED)
+    entry = _ticket_entry("t-ok")  # tier1_checks verbatim == the stated gates
+    _fake_exec(monkeypatch, [{"manifest": [entry], "notes": "n"}])
+    _critic_exec(monkeypatch, [_critic_exec_result()])
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text("[agent]\nname = 'stigmergy-decomposer'\n", encoding="utf-8")
+    monkeypatch.setattr(decompose, "_DECOMP_AGENT_TOML", agent_toml)
+    decompose_root = tmp_path / "decompose-root"
+
+    rc = decompose.run_decompose(
+        rig_name=RIG,
+        spec_path=spec,
+        decompose_root=decompose_root,
+        rigs_root=rigs_root,
+    )
+    assert rc == 0
+
+    run_dir = list((decompose_root / "decompose").iterdir())[0]
+    summary = (run_dir / "summary.md").read_text()
+    assert "tier1_checks divergences" not in summary
+
+    resolved = _resolve(rigs_root)
+    try:
+        from stigmergy.records import RecordPlane
+
+        events = RecordPlane(resolved.rig_paths["records_dir"]).read_events()
+    finally:
+        resolved.store.close()
+    i_events = [e for e in events if e.get("event_type") == "decompose-intake"]
+    assert len(i_events) == 1
+    assert i_events[0]["tier1_divergences"] == []
+
+
+def test_decomposecritic_prompt_carries_tier1_divergence_check() -> None:
+    """Prompt-artifact invariant (SPEC §4): the decompose-critic gains an
+    explicit check item — a silent tier1_checks deviation is a finding.
+    (The prompt hash is computed from bytes, so the artifact bump carries
+    the hash bump per house convention.) The prompt already mentioned
+    'tier1_checks' (validator context) and 'divergence' (dishonest-sizing
+    context) BEFORE .325 — so pin the MANDATED check-item wording, not the
+    mere tokens."""
+    prompt = (
+        Path(__file__).resolve().parents[1] / "prompts" / "decomposecritic01"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(prompt.split()).lower()
+    assert "tier1_checks" in normalized
+    assert "deviation is a finding" in normalized

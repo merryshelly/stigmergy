@@ -85,7 +85,12 @@ DEFAULT_CHARTER: dict[str, Any] = {
         "dispatch_limits": {
             "output_tokens": 200000,
             "driver_turns": 100,
-            "filed_tickets": 5,
+            # SB ruling 2026-09-03 (contexthandoff01 T0 postmortem): 5 -> 20.
+            # A polluted transport (harness bug, not worker spam) plus the
+            # harvest's dedup-tolerant salvage needs headroom: 20 = 4x the
+            # old default. `filed_ticket_bytes` is a different cap and
+            # stays put.
+            "filed_tickets": 20,
             "filed_ticket_bytes": 16384,
         },
         # bead .107: `critic_infra` (default 3) MUST stay strictly below

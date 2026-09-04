@@ -86,7 +86,10 @@ finding states WHICH dimension it belongs to.
    the diff critic's judgment entirely). Spec non-goals must not appear
    as ticket work. Where the notes record a resolved ambiguity, the
    resolution must be the smallest reasonable interpretation and the
-   tickets must implement that resolution, not a different one.
+   tickets must implement that resolution, not a different one. Does
+   the manifest's tier1_checks match the spec's stated gates (e.g. the
+   spec pins `ruff check .` but the manifest seeds `ruff check src`)?
+   A silent deviation is a finding.
 
 2. COVERAGE. Every deliverable the spec names lands in EXACTLY ONE
    ticket — no capability silently dropped, none split so two tickets

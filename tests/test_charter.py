@@ -589,9 +589,12 @@ def test_dispatch_limits_filed_keys_load(tmp_path: Path) -> None:
 def test_dispatch_limits_filed_keys_default_when_absent() -> None:
     # the base fixture declares no filed_* keys -> in-code defaults fill them
     # (deep-merge over DEFAULT_CHARTER).
+    # SB ruling 2026-09-03 (contexthandoff01 T0 postmortem): the default cap
+    # was 5 — too low. A polluted transport (harness bug, not worker spam)
+    # plus dedup-tolerant salvage needs headroom: 20 = 4x the old default.
     charter = load_charter(VALID_CHARTER_PATH, env={})
     dl = charter.raw["loop"]["dispatch_limits"]
-    assert dl["filed_tickets"] == 5
+    assert dl["filed_tickets"] == 20
     assert dl["filed_ticket_bytes"] == 16384
 
 

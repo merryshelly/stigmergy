@@ -60,6 +60,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1377,6 +1378,113 @@ def _mint_run_id(spec_text: str) -> str:
     return f"{_compact_utc_timestamp()}-{_sha256_text(spec_text)[:8]}"
 
 
+# --- spec-vs-manifest tier1_checks divergence (bead kdsn.325) --------------
+#
+# The deterministic validator owns tier1_checks MECHANICS (a dict matching
+# the charter's [gates]-named checks verbatim); it cannot see whether the
+# seeded gates match what the SPEC stated. contexthandoff01 evidence: the
+# spec pinned `tier1_checks.ruff = "cd /work && ruff check ."` but the
+# decomposer seeded "ruff check src" — arguably correct (the full-tree
+# gate is unpassable on the dirty base) but SILENT, and the
+# decompose-critic (with repo access) missed it. These helpers compute
+# the divergence set the driver surfaces on the DECOMPOSE_INTAKE event
+# and in summary.md; the decomposecritic01 prompt carries the matching
+# judgment check. Surfacing, not enforcement: seeding a defensibly
+# different gate with an honest note is legitimate engineering the loop
+# must not mechanically veto — the judgment is the critic's.
+
+_TIER1_GATE_RE = re.compile(r"`([^`]+)`\s*:\s*`([^`]+)`")
+
+
+def spec_stated_tier1_checks(spec_text: str) -> dict[str, str]:
+    """The gates the spec itself STATES as its tier1_checks (bead
+    kdsn.325).
+
+    The real spec states them on one line, e.g.:
+
+        **tier1_checks (OA rig):** dict-of-commands — `ruff`: `cmd`; `tests`: `cmd2`.
+
+    For each LINE containing `tier1_checks`, every backtick-quoted
+    `` `key`: `value` `` pair is extracted (the value is any command
+    string). Pairs are merged across lines, FIRST occurrence of a key
+    wins (a spec restating a gate is not a new gate). Returns ``{}``
+    when the spec states no gates at all — the "no spec anchor" posture
+    under which :func:`tier1_divergences` stays quiet.
+
+    This is a SPEC-reading aid, not a validator: the deterministic
+    validator's charter-verbatim tier1_checks check is a different
+    authority (mechanics vs. fidelity), and the two coexist.
+    """
+    stated: dict[str, str] = {}
+    for line in spec_text.splitlines():
+        if "tier1_checks" not in line:
+            continue
+        for match in _TIER1_GATE_RE.finditer(line):
+            stated.setdefault(match.group(1), match.group(2))
+    return stated
+
+
+def tier1_divergences(spec_checks: dict[str, str], manifest: list) -> list[dict]:
+    """Every spec-vs-manifest tier1_checks divergence, in manifest order
+    (bead kdsn.325).
+
+    For each manifest entry (in order) that HAS a `tier1_checks` DICT:
+
+    - a spec-stated key MISSING from the entry's dict (silently dropped)
+      -> ``{"ticket_id", "key", "spec_value", "manifest_value": None}``;
+    - a common key whose VALUE differs (a silent narrowing — the spec
+      pins `ruff check .` but the manifest seeds `ruff check src`) ->
+      both values filled;
+    - an entry key NOT stated in the spec ->
+      ``{"ticket_id", "key", "spec_value": None, "manifest_value"}``.
+
+    An entry WITHOUT a `tier1_checks` key (or with a non-dict one) is
+    NOT a divergence: the gates do not apply to it — the spec anchor is
+    the dict, not its absence. An EMPTY `spec_checks` (the spec stated
+    no gates) yields ``[]`` always: there is nothing to diverge FROM.
+    """
+    if not spec_checks:
+        return []
+    divergences: list[dict[str, Any]] = []
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            continue
+        entry_checks = entry.get("tier1_checks")
+        if not isinstance(entry_checks, dict):
+            continue
+        ticket_id = entry.get("id")
+        for key, spec_value in spec_checks.items():
+            if key not in entry_checks:
+                divergences.append(
+                    {
+                        "ticket_id": ticket_id,
+                        "key": key,
+                        "spec_value": spec_value,
+                        "manifest_value": None,
+                    }
+                )
+            elif entry_checks[key] != spec_value:
+                divergences.append(
+                    {
+                        "ticket_id": ticket_id,
+                        "key": key,
+                        "spec_value": spec_value,
+                        "manifest_value": entry_checks[key],
+                    }
+                )
+        for key, manifest_value in entry_checks.items():
+            if key not in spec_checks:
+                divergences.append(
+                    {
+                        "ticket_id": ticket_id,
+                        "key": key,
+                        "spec_value": None,
+                        "manifest_value": manifest_value,
+                    }
+                )
+    return divergences
+
+
 @dataclass
 class _Subject:
     """One decompose subject: the whole manifest (``phase`` is None, spec =
@@ -1463,6 +1571,11 @@ class _DecomposeDriver:
         self.findings_history: list[dict[str, Any]] = []
         self.seeded: list[str] = []
         self.approved: list[str] = []
+        # bead kdsn.325: the spec-vs-manifest tier1_checks divergences
+        # accumulated over every intaked batch (per-subject in a phase
+        # fan-out) — each DECOMPOSE_INTAKE event carries its OWN batch's
+        # list; the summary carries the accumulated one.
+        self.tier1_divergences: list[dict[str, Any]] = []
         self.escape_diagnosis: str | None = None
 
     # -- names / artifacts --------------------------------------------------
@@ -1956,9 +2069,20 @@ class _DecomposeDriver:
             raise DecomposeError(
                 f"intake failed for subject {subject.id!r}: {errors[0]}"
             )
+        # bead kdsn.325: the spec's stated tier1_checks gates vs what the
+        # FINAL manifest actually seeded — computed at intake, when the
+        # batch is in its final state (post repair loop). The validator
+        # owns the charter-verbatim mechanics; whether the seeded gates
+        # match the SPEC is a fidelity surface that used to be silent.
+        batch_divergences = tier1_divergences(
+            spec_stated_tier1_checks(self.spec_text), manifest
+        )
+        self.tier1_divergences.extend(batch_divergences)
         self.seeded.extend(inserted)
         if self.no_approve:
-            self._record_intake_event(inserted, approved=False)
+            self._record_intake_event(
+                inserted, approved=False, tier1_divergences=batch_divergences
+            )
             return inserted
         for tid in inserted:
             ticket = self.resolved.store.get_ticket(tid)
@@ -1981,10 +2105,18 @@ class _DecomposeDriver:
                 approval_hash=approval_hash,
             )
             self.approved.append(tid)
-        self._record_intake_event(inserted, approved=True)
+        self._record_intake_event(
+            inserted, approved=True, tier1_divergences=batch_divergences
+        )
         return inserted
 
-    def _record_intake_event(self, inserted: list[str], *, approved: bool) -> None:
+    def _record_intake_event(
+        self,
+        inserted: list[str],
+        *,
+        approved: bool,
+        tier1_divergences: list[dict[str, Any]],
+    ) -> None:
         """Record ONE DECOMPOSE_INTAKE emission event for a seeded batch
         (bead .174): the moment the decomposer emitted tickets into the
         store — how many, which, and whether D17 auto-approved them.
@@ -1992,7 +2124,13 @@ class _DecomposeDriver:
         no tokens, no cost). The per-ticket APPROVAL events are the
         attribution audit lines; this event is the emission record the
         operator's dashboard surfaces. ``dry_run`` never reaches here
-        (it seeds nothing)."""
+        (it seeds nothing).
+
+        ``tier1_divergences`` (bead kdsn.325) is ALWAYS present on new
+        events — this batch's spec-vs-manifest tier1_checks divergences
+        (``[]`` when aligned). Additive field: the payload validator
+        tolerates extras (same mechanism as the other additive
+        decompose-event fields), so no records.py change is required."""
         event = make_event(
             EventType.DECOMPOSE_INTAKE,
             rig=self._rig_name(),
@@ -2001,6 +2139,7 @@ class _DecomposeDriver:
             approved=approved,
             acting_agent=_APPROVE_AGENT,
             operator_session=f"decompose-{self.run_id}",
+            tier1_divergences=list(tier1_divergences),
         )
         self.record_plane.append(event)
 
@@ -2166,6 +2305,18 @@ class _DecomposeDriver:
             lines.append("")
             lines.append("## Escape diagnosis")
             lines.append(self.escape_diagnosis.rstrip("\n"))
+        if self.tier1_divergences:
+            # bead kdsn.325: surfaced, not enforced — one line per
+            # spec-vs-manifest tier1_checks divergence (the ticket id, the
+            # key, and both values). Quiet when aligned: an empty list
+            # writes nothing.
+            lines.append("")
+            lines.append("## tier1_checks divergences")
+            for d in self.tier1_divergences:
+                lines.append(
+                    f"- ticket={d['ticket_id']} key={d['key']} "
+                    f"spec={d['spec_value']!r} manifest={d['manifest_value']!r}"
+                )
         lines.append("")
         lines.append("## Artifacts")
         try:
@@ -2359,4 +2510,6 @@ __all__ = [
     "render_task",
     "run_decomposer",
     "run_decompose",
+    "spec_stated_tier1_checks",
+    "tier1_divergences",
 ]

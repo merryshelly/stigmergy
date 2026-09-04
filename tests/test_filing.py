@@ -8,7 +8,10 @@ This is the FROZEN CONTRACT (AC14). Case numbering matches bead .38's case-list:
      each with full origin + loop-stamped `discovered_from` + a `proposal_hash`.
 2  — un-claimable by construction: a filed proposal id is NEVER returned by
      `intake.claim()`/`eligible()` over N polls, and is never a `tickets` row.
-3  — count-cap excess rejects the WHOLE filing + logs (reject-whole, per amendment D).
+3  — count-cap: on the WORKER harvest path, excess over the cap is truncated
+     with earlier-filings-stand semantics (bead .188); on the DIRECT
+     file_proposals path (station/range-report callers), excess still rejects
+     the WHOLE filing (amendment D, unchanged).
 4  — per-proposal size-cap rejects only the oversized proposal; others unaffected.
 5  — malformed / bad-shape / non-list / path-traversal filing rejected WITHOUT pool
      corruption and WITHOUT raising into the dispatch teardown path.
@@ -22,6 +25,7 @@ the daemon harvest-hook wiring is exercised in test_daemon.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 from pathlib import Path
@@ -230,23 +234,36 @@ def test_prove_can_fail_a_tickets_row_WOULD_be_claimable(store):
 # === case 3: count-cap excess rejects the WHOLE filing ======================
 
 
-def test_count_cap_exceeded_rejects_whole_filing(tmp_path, store, plane):
+def test_harvest_count_cap_earlier_filings_stand(tmp_path, store, plane):
+    # bead workspace-e2uh.188: the worker channel's harvest semantics are
+    # "earlier filings stand" (mirroring the OA tool's call-time cap) —
+    # NOT amendment-D whole-batch rejection. The tool's call-time cap already
+    # bounds what one worker run can emit, so an over-cap TRANSPORT only
+    # arises from harness pollution/duplication; dropping the whole file
+    # there punished the harness's own bug by losing real diagnostics
+    # (contexthandoff01 T0: 5 attempts' worth of precise filings, 0 rows).
+    # cap is 3; seed 4 distinct valid -> first 3 land, 4th rejected.
     worktree = tmp_path / "work"
-    # cap is 3; seed 4 -> reject ALL 4 (reject-whole, amendment D).
     props = [valid_proposal(i) for i in (1, 2, 3, 4)]
     seed_filings_file(worktree, props)
 
     result = harvest(worktree, store, plane, max_filings=3)
 
-    assert result.accepted_ids == []
-    assert store.list_filed_tickets() == []
+    assert len(result.accepted_ids) == 3
+    titles = {r["title"] for r in store.list_filed_tickets()}
+    assert titles == {"Flaky test #1", "Flaky test #2", "Flaky test #3"}
     assert len(result.rejected) == 1
     assert result.rejected[0]["reason"] == "count-cap-exceeded"
+    assert result.rejected[0]["title"] == "Flaky test #4"
 
+    # ONE aggregate count-cap event for the excess (event volume bounded),
+    # same reason vocabulary as before so event consumers don't break.
     events = filed_events(plane)
-    assert len(events) == 1
-    assert events[0]["outcome"] == "rejected"
-    assert events[0]["reason"] == "count-cap-exceeded"
+    cap_events = [
+        e for e in events if e.get("reason") == "count-cap-exceeded"
+    ]
+    assert len(cap_events) == 1
+    assert cap_events[0]["outcome"] == "rejected"
 
 
 def test_count_at_cap_is_accepted(tmp_path, store, plane):
@@ -943,3 +960,286 @@ def test_list_filed_tickets_filter_and_count(store, plane):
     assert store.count_untriaged_filings() == 2
     assert len(store.list_filed_tickets(triaged=False)) == 2
     assert store.list_filed_tickets(triaged=True) == []
+
+
+# === pollution salvage contract (bead workspace-e2uh.188) ====================
+#
+# contexthandoff01 T0 evidence: a transport file may contain a byte-identical
+# fixture junk block repeated N times (the OA suite's in-cage pytest runs
+# polluting the production transport — the OA-side half of the bead) with the
+# worker's REAL diagnostics buried at the TAIL (positions 22-48 of ~60).
+# The junk entries are schema-VALID dicts ({"title": "T", "description": "D"})
+# — shape validation cannot distinguish them from real filings.
+#
+# Contract pinned here (harvest path ONLY — file_proposals' own amendment-D
+# semantics stay untouched for the station/range-report callers):
+#   1. exact-duplicate entries collapse to ONE candidate; ONE aggregate
+#      `duplicate` event records how many were collapsed (operator
+#      legibility — 5x-repeated filings are a signal, not noise to hide);
+#      collapsed duplicates are NOT in FilingResult.rejected (they were
+#      filed, not rejected);
+#   2. bad-shape / size-cap rejects stay PER-ENTRY and do not consume cap
+#      slots;
+#   3. the count cap counts UNIQUE INSERTABLE candidates (post-dedup,
+#      post-shape, post-size) with earlier-filings-stand semantics; the
+#      excess gets ONE aggregate count-cap event + per-entry rejected
+#      entries in FilingResult;
+#   4. the escape routes as today (first blocks_ticket=true surfaces) and
+#      does NOT suppress inserts — insert-then-tombstone is the house
+#      pattern (execdogfood01 precedent); post-escape entries still process;
+#   5. no file content may raise (dispatch-teardown contract, SPEC
+#      amendment A);
+#   6. the legacy whole-file JSON-array shape follows the SAME rules;
+#   7. FilingResult gains `duplicates_collapsed: int` (default 0).
+
+
+def _junk_entry(i: int) -> dict[str, Any]:
+    """Fixture-shaped junk — schema-valid, indistinguishable from real."""
+    return {"title": f"T{i}", "description": f"D{i}"}
+
+
+def _polluted_block() -> list[dict[str, Any]]:
+    """The byte-identical fixture block the OA file_ticket suite writes
+    in-cage (observed verbatim in the contexthandoff01 transport files)."""
+    block = [
+        {
+            "title": "Add regression test",
+            "description": "The empty-usage branch has no coverage.",
+            "evidence": "src/x.py:42",
+        }
+    ]
+    block += [_junk_entry(i) for i in range(10)]
+    return block
+
+
+def _seed_jsonl(worktree: Path, entries: list[Any]) -> None:
+    seed_filings_file(
+        worktree, "\n".join(json.dumps(e) for e in entries) + "\n"
+    )
+
+
+def test_harvest_salvages_real_filings_buried_under_duplicate_junk(
+    tmp_path, store, plane
+):
+    # The contexthandoff01 shape: 4x the junk block (44 entries, 11 unique)
+    # + 2 real filings at the tail. Cap 20 (SB 2026-09-03: 4x the old 5).
+    entries = list(itertools.chain(*[_polluted_block() for _ in range(4)]))
+    entries += [valid_proposal(1), valid_proposal(2)]
+    worktree = tmp_path / "work"
+    _seed_jsonl(worktree, entries)
+
+    result = harvest(worktree, store, plane, max_filings=20)
+
+    # dedup: 11 unique junk + 2 real = 13 unique <= cap -> ALL land.
+    assert len(result.accepted_ids) == 13
+    titles = {r["title"] for r in store.list_filed_tickets()}
+    assert {"Flaky test #1", "Flaky test #2"} <= titles
+    assert result.duplicates_collapsed == 46 - 13  # 33 collapsed
+
+    # ONE aggregate collapse event; NOT in result.rejected.
+    dup_events = [e for e in filed_events(plane) if e.get("reason") == "duplicate"]
+    assert len(dup_events) == 1
+    assert all(r.get("reason") != "duplicate" for r in result.rejected)
+
+
+def test_harvest_cap_counts_unique_not_raw_earlier_filings_stand(
+    tmp_path, store, plane
+):
+    # 25 duplicates of ONE junk entry + 5 distinct real filings; cap 5.
+    # Unique insertable = 1 junk + 5 real = 6 > cap -> first 5 unique land
+    # (1 junk + real #1-#4), real #5 rejected. Duplicates must NOT eat the
+    # cap: raw-count semantics would have landed only junk.
+    entries = [_junk_entry(0)] * 25 + [valid_proposal(i) for i in (1, 2, 3, 4, 5)]
+    worktree = tmp_path / "work"
+    _seed_jsonl(worktree, entries)
+
+    result = harvest(worktree, store, plane, max_filings=5)
+
+    assert len(result.accepted_ids) == 5
+    titles = {r["title"] for r in store.list_filed_tickets()}
+    assert "Flaky test #1" in titles and "Flaky test #4" in titles
+    assert "Flaky test #5" not in titles
+    assert [r["reason"] for r in result.rejected] == ["count-cap-exceeded"]
+    cap_events = [
+        e for e in filed_events(plane) if e.get("reason") == "count-cap-exceeded"
+    ]
+    assert len(cap_events) == 1  # ONE aggregate event for the excess
+    assert result.duplicates_collapsed == 24
+
+
+def test_harvest_bad_shape_and_oversize_do_not_consume_cap_slots(
+    tmp_path, store, plane
+):
+    # Junk that is NOT salvageable (unparseable line, schema-invalid dict,
+    # oversize dict) rejects PER-ENTRY and must not burn cap slots: 3 real
+    # filings land despite cap 3.
+    lines = [
+        "{not json",
+        json.dumps({"title": 123, "description": "D"}),
+        json.dumps({"title": "Big", "description": "x" * 20000}),
+        json.dumps(valid_proposal(1)),
+        json.dumps(valid_proposal(2)),
+        json.dumps(valid_proposal(3)),
+    ]
+    worktree = tmp_path / "work"
+    seed_filings_file(worktree, "\n".join(lines) + "\n")
+
+    result = harvest(worktree, store, plane, max_filings=3)
+
+    assert len(result.accepted_ids) == 3
+    assert {r["title"] for r in store.list_filed_tickets()} == {
+        "Flaky test #1",
+        "Flaky test #2",
+        "Flaky test #3",
+    }
+    # THREE offenders seeded (unparseable line, shape-invalid dict, oversize
+    # dict) -> exactly one rejection entry per offender, two distinct
+    # reasons. The multiset pins no-double-emission (a harvest-side
+    # pre-filter that ALSO let file_proposals reject would yield 6).
+    reasons = sorted(r["reason"] for r in result.rejected)
+    assert reasons == ["bad-shape", "bad-shape", "size-cap-exceeded"]
+    assert result.duplicates_collapsed == 0
+
+
+def test_harvest_escape_routes_and_post_escape_entry_still_inserts(
+    tmp_path, store, plane
+):
+    # vault-fame-curious shape: junk block, then the escape, then a real
+    # filing AFTER the escape. The escape surfaces; inserts still happen
+    # (insert-then-tombstone, execdogfood01 precedent); post-escape
+    # entries are processed.
+    entries = _polluted_block()
+    entries += [
+        {
+            "title": "Unblock context-handoff T0",
+            "description": "T0 in-scope work is complete but blocked.",
+            "blocks_ticket": True,
+            "suspected_out_of_scope_paths": ["tests/test_degraded_start.py"],
+            "reason": "pre-existing failures outside target scope",
+        },
+        valid_proposal(9),
+    ]
+    worktree = tmp_path / "work"
+    _seed_jsonl(worktree, entries)
+
+    result = harvest(worktree, store, plane, max_filings=20)
+
+    assert result.escape is not None
+    assert result.escape["reason"] == "pre-existing failures outside target scope"
+    assert result.escape["suspected_out_of_scope_paths"] == [
+        "tests/test_degraded_start.py"
+    ]
+    titles = {r["title"] for r in store.list_filed_tickets()}
+    assert "Flaky test #9" in titles  # post-escape entry processed
+    assert "Unblock context-handoff T0" in titles  # escape filed too
+
+
+def test_harvest_never_raises_on_hostile_file(tmp_path, store, plane):
+    # No file content may raise (SPEC amendment A): the dispatch teardown
+    # path calls this. Every hostile payload degrades to a sane result.
+    payloads = [
+        "",  # empty file
+        "   \n\n  \n",  # whitespace only
+        "[1, 2]",  # legacy-array shape with non-dict entries
+        '"a string"',  # whole-parse to non-list scalar -> one bad line
+        "42",
+        '{"title": ["a"], "description": {"b": 1}}',  # shape-invalid nesting
+        json.dumps({"title": "Deep", "description": "d", "evidence": None})
+        + "\n"
+        + json.dumps([{"nested": [{"deep": i} for i in range(50)]} for _ in range(3)])[0:100],
+        json.dumps({"title": "Huge", "description": "y" * 200000}),  # oversize
+    ]
+    for i, payload in enumerate(payloads):
+        s = RigStore.create(tmp_path / f"store-{i}.db")
+        p = RecordPlane(tmp_path / f"records-{i}")
+        worktree = tmp_path / f"work-{i}"
+        try:
+            seed_filings_file(worktree, payload)
+            result = harvest(worktree, s, p)  # must NOT raise
+            assert s.list_tickets() == []  # pool uncorrupted
+            assert isinstance(result.accepted_ids, list)
+            assert isinstance(result.rejected, list)
+        finally:
+            s.close()
+
+
+def test_harvest_dedup_is_exact_content_not_title(tmp_path, store, plane):
+    # Same title, different description = DIFFERENT filings (both land).
+    # Exact duplicate JSON objects (byte-equal after canonical dumps) = ONE.
+    a = {"title": "Same", "description": "first"}
+    a2 = {"title": "Same", "description": "first"}  # exact dup of a
+    b = {"title": "Same", "description": "second"}  # distinct
+    worktree = tmp_path / "work"
+    _seed_jsonl(worktree, [a, a2, b])
+
+    result = harvest(worktree, store, plane, max_filings=5)
+
+    assert len(result.accepted_ids) == 2
+    assert result.duplicates_collapsed == 1
+
+
+def test_harvest_pids_deterministic_across_reharvest(tmp_path, plane):
+    # The same file harvested into two fresh stores yields the same pid set
+    # and row content (dedup must not introduce order-dependent ordinals).
+    entries = _polluted_block() + [valid_proposal(1), valid_proposal(2)]
+    worktree = tmp_path / "work"
+    _seed_jsonl(worktree, entries)
+
+    s1 = RigStore.create(tmp_path / "s1.db")
+    r1 = harvest(worktree, s1, RecordPlane(tmp_path / "rec1"), max_filings=20)
+    s2 = RigStore.create(tmp_path / "s2.db")
+    r2 = harvest(worktree, s2, RecordPlane(tmp_path / "rec2"), max_filings=20)
+    try:
+        assert r1.accepted_ids == r2.accepted_ids
+        rows1 = sorted(r["id"] for r in s1.list_filed_tickets())
+        rows2 = sorted(r["id"] for r in s2.list_filed_tickets())
+        assert rows1 == rows2
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_harvest_legacy_array_shape_same_salvage_rules(tmp_path, store, plane):
+    # The legacy whole-file JSON-array shape follows the SAME dedup + cap
+    # rules (divergent handling between the two shapes is a footgun).
+    entries = _polluted_block() * 2 + [valid_proposal(1)]
+    worktree = tmp_path / "work"
+    seed_filings_file(worktree, entries)  # list payload -> whole-file array
+
+    result = harvest(worktree, store, plane, max_filings=20)
+
+    assert len(result.accepted_ids) == 12  # 11 unique junk + 1 real
+    titles = {r["title"] for r in store.list_filed_tickets()}
+    assert "Flaky test #1" in titles
+    assert result.duplicates_collapsed == 23 - 12
+
+
+def test_file_proposals_whole_batch_cap_still_pins_station_path(store, plane):
+    # file_proposals is shared with the station/range-report callers
+    # (.39/.41 reuse verbatim): its amendment-D whole-batch count-cap stays
+    # EXACTLY as-is. The salvage semantics live in harvest_worker_filings
+    # only — a direct file_proposals call with > cap rejects ALL.
+    props = [valid_proposal(i) for i in (1, 2, 3, 4)]
+
+    result = file_proposals(
+        props,
+        store=store,
+        record_plane=plane,
+        ctx=dispatch_ctx(),
+        attempt_kind="initial",
+        origin_role="critic",
+        max_filings=3,
+        max_bytes=DEFAULT_BYTES,
+    )
+
+    assert result.accepted_ids == []
+    assert store.list_filed_tickets() == []
+    assert len(result.rejected) == 1
+    assert result.rejected[0]["reason"] == "count-cap-exceeded"
+    events = [
+        e
+        for e in plane.read_events()
+        if e.get("event_type") == "ticket-filed"
+        and e.get("reason") == "count-cap-exceeded"
+    ]
+    assert len(events) == 1
